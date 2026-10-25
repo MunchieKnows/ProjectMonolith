@@ -2986,7 +2986,7 @@ namespace Hooking {
                     }
                 }
 
-                static const bool ENABLE_MATCHUP_PIN = true;
+                static const bool ENABLE_MATCHUP_PIN = false;
                 struct MatchupPin { EOrionTeam team; int role; const char* heroName; };
                 static const MatchupPin matchupPins[] = {
                     { EOrionTeam::TeamBlue, 0, "Sword" },
