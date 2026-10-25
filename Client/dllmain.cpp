@@ -796,4 +796,5 @@ BOOL APIENTRY DllMain(HMODULE hModule,
 
         t.detach();
     }
+    return TRUE;
 }
