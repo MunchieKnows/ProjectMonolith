@@ -5,12 +5,16 @@ provide it and does not link to it.
 
 ## 1. Build (once)
 
-1. Install **Visual Studio 2022** or the free **Build Tools for Visual Studio 2022**
+1. **Download the source code:** on the GitHub page of this project click the green
+   **Code** button → **Download ZIP**. **Extract** the ZIP into a folder of your choice
+   (right-click → *Extract All*), for example `C:\ProjectMonolith`. Do not run anything from
+   inside the ZIP. Developers can use `git clone` instead.
+2. Install **Visual Studio 2022** or the free **Build Tools for Visual Studio 2022**
    (https://visualstudio.microsoft.com/downloads/) with the workload
    **"Desktop development with C++"**. You only need to do this once.
-2. Double-click **`build.bat`**. It downloads the SDK headers (first time only), then builds
-   everything. Wait until it says **BUILD SUCCEEDED**.
-3. Afterwards the `x64\v45\` folder contains **`Server.dll`**, **`Client.dll`** and **`DXGI.dll`**.
+3. In the extracted folder, double-click **`build.bat`**. It downloads the SDK headers (first
+   time only), then builds everything. Wait until it says **BUILD SUCCEEDED**.
+4. Afterwards the `x64\v45\` folder contains **`Server.dll`**, **`Client.dll`** and **`DXGI.dll`**.
 
 If the build fails, scroll up in the window to the first error message and post it in the bug
 channel. (Alternative for developers: run `fetch_sdk.bat`, then build `ProjectMonolith.sln` in

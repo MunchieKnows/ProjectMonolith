@@ -50,7 +50,10 @@ Requirements: Windows and either **Visual Studio 2022** or the free **Build Tool
 Studio 2022** (https://visualstudio.microsoft.com/downloads/), each with the workload
 "Desktop development with C++" (toolset v143).
 
-**One click:** run **`build.bat`**. It
+**Get the code:** click **Code → Download ZIP** on this page and extract the ZIP into a folder
+(or `git clone` the repository). Don't run the scripts from inside the ZIP.
+
+**One click:** in the extracted folder, run **`build.bat`**. It
 
 1. downloads the generated SDK headers if they are missing (`fetch_sdk.bat`: from the base
    project ProjectLegacy at a fixed commit, see `NOTICE.md`, verified by checksum; needs internet
