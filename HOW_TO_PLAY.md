@@ -48,9 +48,9 @@ deckbuilder.bat
 There is no single-player mode: even alone you **host a server and join it yourself**,
 both on the same PC.
 
-1. Start **`server_launcher.bat`** and choose the bot settings. Wait until the server log shows
-   `IpNetDriver listening on port 7777` (the map loads automatically; details in "Host a game"
-   below).
+1. Start **`server_launcher.bat`** and choose the bot settings. Wait until the update error
+   message appears, then wait a few more seconds until the server log shows
+   `IpNetDriver listening on port 7777` (no key needed; details in "Host a game" below).
 2. Start **`client_launcher.bat`** and choose **`localhost`** as the server.
    The game starts and joins your own server.
 3. Once you are in, press **F1**. This fills all other slots with bots. **Wait about 15 seconds**
@@ -71,10 +71,9 @@ This is also the first part of playing alone against bots (see above).
    - optional bot move-speed boost.
 
    It saves the settings to `server.json` and starts the server automatically.
-2. **Wait.** The server loads its code and then the map automatically, right after the game's
-   update check (the update error message) has finished. You don't need to press anything.
-   (**F8** still works as a manual fallback if the map does not load on its own.)
-3. As soon as the log shows
+2. **Wait until the update error message appears** in the game window / log. You don't need to
+   press anything (F8 is no longer needed; it only works as a manual fallback).
+3. **Wait a few seconds** while the server prepares the match by itself. As soon as the log shows
 
    ```text
    LogNet: GameNetDriver IpNetDriver_0 IpNetDriver listening on port 7777
