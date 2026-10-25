@@ -2826,10 +2826,47 @@ namespace Hooking {
         static bool waitingForMatchInit = false;
         static float matchInitTimer = 0.0f;
 
-        if (GetAsyncKeyState(VK_F8) && !mapLoaded) {
+        static const bool ENABLE_AUTO_MAPLOAD = true;
+        static const float AUTO_MAPLOAD_DELAY = 3.0f;
+        static float autoMapPollTimer = 0.0f;
+        static float autoMapDelayTimer = -1.0f;
+        bool autoMapLoad = false;
+        if (ENABLE_AUTO_MAPLOAD && !mapLoaded) {
+            if (autoMapDelayTimer < 0.0f) {
+                autoMapPollTimer += deltatime;
+                if (autoMapPollTimer >= 1.0f) {
+                    autoMapPollTimer = 0.0f;
+                    for (UUpdateManager* um : SDKUtils::GetAllObjectsOfType<UUpdateManager>()) {
+                        if (!um || um->GetFullName().find("Default__") != std::string::npos) continue;
+                        const bool stateDone = um->CurrentUpdateState == EUpdateState::UpdateComplete;
+                        const bool resultSet = um->LastCompletionResult[0] != EUpdateCompletionStatus::UpdateUnknown
+                                            || um->LastCompletionResult[1] != EUpdateCompletionStatus::UpdateUnknown;
+                        if (stateDone || resultSet) {
+                            std::cout << "[HOST] AUTO-F8: Update-Pruefung abgeschlossen (State="
+                                      << static_cast<int>(um->CurrentUpdateState)
+                                      << " Result[0]=" << static_cast<int>(um->LastCompletionResult[0])
+                                      << " Result[1]=" << static_cast<int>(um->LastCompletionResult[1])
+                                      << ") - Map wird in " << AUTO_MAPLOAD_DELAY << " s automatisch geladen (F8 nicht noetig)"
+                                      << std::endl;
+                            autoMapDelayTimer = 0.0f;
+                            break;
+                        }
+                    }
+                }
+            }
+            else {
+                autoMapDelayTimer += deltatime;
+                if (autoMapDelayTimer >= AUTO_MAPLOAD_DELAY) autoMapLoad = true;
+            }
+        }
+
+        if ((GetAsyncKeyState(VK_F8) || autoMapLoad) && !mapLoaded) {
             mapLoaded = true;
             OnGameInit();
-            std::cout << "[HOST] F8 gedrueckt: Map laedt. Starte 20-Sekunden-Timer fuer MatchInit..." << std::endl;
+            if (autoMapLoad)
+                std::cout << "[HOST] AUTO-F8: Map laedt. Starte 20-Sekunden-Timer fuer MatchInit..." << std::endl;
+            else
+                std::cout << "[HOST] F8 gedrueckt: Map laedt. Starte 20-Sekunden-Timer fuer MatchInit..." << std::endl;
 
             waitingForMatchInit = true;
         }
@@ -14687,11 +14724,34 @@ void OnGameInit() {
 
 }
 
+static void WaitForEngineWorld() {
+    const ULONGLONG t0 = GetTickCount64();
+    ULONGLONG lastMsg = 0;
+    bool waited = false;
+    while (UWorld::GetWorld() == nullptr) {
+        const ULONGLONG now = GetTickCount64();
+        if (!waited || now - lastMsg >= 10000) {
+            std::cout << "[STARTUP] Engine noch im fruehen Start (kein UWorld) - warte vor dem Setzen der Hooks... ("
+                      << (now - t0) / 1000 << " s)" << std::endl;
+            lastMsg = now;
+            waited = true;
+        }
+        Sleep(250);
+    }
+    if (waited) {
+        Sleep(2000);
+    }
+    std::cout << "[STARTUP] UWorld vorhanden (" << (GetTickCount64() - t0) / 1000
+              << " s gewartet) - setze Hooks." << std::endl;
+}
+
 void Main() {
 
     InitConsole();
 
     Globals::ModuleBase = (uintptr_t)GetModuleHandleA("OrionClient-Win64-Shipping-Server.exe");
+
+    WaitForEngineWorld();
 
     Hooking::InitHooking();
 
