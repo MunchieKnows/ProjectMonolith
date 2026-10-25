@@ -76,6 +76,9 @@ game; it forwards the DirectX factory calls to the system `dxgi.dll` and then lo
 `Server.dll` or `Client.dll` into the game process. It does not touch any other process and does
 not modify files on disk. The server listens on UDP port 7777.
 
+Playing alone against bots also works this way: you host the server and join it yourself
+on the same PC (see "Playing solo against bots" in HOW_TO_PLAY.md).
+
 ## How the bot AI works
 
 `ai_documentation_EN.txt` describes the reconstructed bot macro brain in `Server/dllmain.cpp`:

@@ -43,9 +43,26 @@ client_launcher.bat
 deckbuilder.bat
 ```
 
+## Playing solo against bots
+
+There is no single-player mode: even alone you **host a server and join it yourself**,
+both on the same PC.
+
+1. Start **`server_launcher.bat`** and choose the bot settings. Wait for the update error
+   message, press **F8**, and wait until the log shows
+   `IpNetDriver listening on port 7777` (details in "Host a game" below).
+2. Start **`client_launcher.bat`** and choose **`localhost`** as the server.
+   The game starts and joins your own server.
+3. Once you are in, press **F1**. This fills all other slots with bots. **Wait about 15 seconds**
+   until the server log shows
+
+   `[HOST] 10 Sekunden vergangen: Smarte Lanes an ... Bots automatisch zugewiesen!`
+
+   (the bots now have their lanes). Only then press **F9** to start the match.
+
 ## 3. Host a game
 
-This is also how you play alone against bots.
+This is also the first part of playing alone against bots (see above).
 
 1. **Start `server_launcher.bat`.** It walks you through the settings:
    - bot difficulty per team (1-6),
@@ -75,11 +92,17 @@ This is also how you play alone against bots.
    ```
 
 4. **When all players have joined, press F1.** This fills all free slots with bots.
+   **Wait about 15 seconds** until the server log shows
+
+   `[HOST] 10 Sekunden vergangen: Smarte Lanes an ... Bots automatisch zugewiesen!`
+
+   (the bots now have their lanes).
 5. **Press F9 to start the match.** Loading the assets and the HUD takes a few seconds.
    If you want to play players vs. players without bots, skip step 4 and press F9 directly.
 
 **Important:**
-- Press F1 and F9 only **after all players have joined**.
+- Press F1 and F9 only **after all players have joined**, and press F9 only after the
+  "Smarte Lanes ... zugewiesen" message (the server does not check this for you).
 - About 50 seconds into the match the server loads the complete bot code. The server has high
   latency for a few seconds during this. That is normal.
 - Players connecting over the internet need UDP port **7777** to be reachable on the host
