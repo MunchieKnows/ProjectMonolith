@@ -21,6 +21,21 @@ engineering for interoperability.
 
 If anyone asks you for money in connection with this project, it is not from us.
 
+## Credits
+
+Project Monolith would not exist without **[ProjectLegacy](https://github.com/SyST3MDeV/ProjectLegacy)
+by SyST3MDeV**, the original listen-server for the v45 client. Hooking framework, listen-server
+setup, replication, login handling and most engine addresses come from ProjectLegacy (base
+commit `52a3e06`, AGPL-3.0). Project Monolith builds on it with the bot AI, match flow, boss
+tuning, deck filter, crash fixes, the new loader and the build tooling. Details per folder:
+`NOTICE.md` and the `ORIGIN.md` files.
+
+Also thanks to:
+- [Dumper-7](https://github.com/Encryqed/Dumper-7) by Encryqed, which generated the SDK headers
+- [UnrealContainers](https://github.com/Fischsalat/UnrealContainers) by Fischsalat
+- [MinHook](https://github.com/TsudaKageyu/minhook) by Tsuda Kageyu
+- [JsonCpp](https://github.com/open-source-parsers/jsoncpp) by Baptiste Lepilleur and the JsonCpp authors
+
 ## What this repository contains, and what it does not
 
 - **Contains:** source code (server DLL, client DLL, loader DLL), launch scripts, docs.

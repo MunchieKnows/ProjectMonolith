@@ -2,6 +2,7 @@
 
 Project Monolith
 Copyright (C) 2025-2026 Project Monolith contributors
+Portions Copyright (C) 2024 SyST3MDeV (ProjectLegacy)
 
 This program is free software: you can redistribute it and/or modify it under the terms of the
 GNU Affero General Public License version 3 as published by the Free Software Foundation
@@ -13,7 +14,9 @@ This project is a modified version of **ProjectLegacy** by SyST3MDeV:
 
 - Repository: https://github.com/SyST3MDeV/ProjectLegacy
 - Base commit: `52a3e0626f6207ff90ab51d94b597a31a56a38d1` (2024-11-08)
-- License: GNU Affero General Public License v3 (`LICENSE.txt`, unchanged)
+- License: GNU Affero General Public License v3 (`LICENSE.txt`, unchanged). The license file is
+  part of the base commit above (added in commit `fed8ee2`, 2024-10-25) and of the `dev` branch of
+  ProjectLegacy, as checked on 2026-10-25; the default branch of ProjectLegacy no longer contains it.
 
 Project Monolith changed and extended the base substantially (AGPL-3.0 §5a). The changes are
 listed per folder in the `ORIGIN.md` files, and in short below.
