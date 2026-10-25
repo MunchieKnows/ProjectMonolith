@@ -1,0 +1,14716 @@
+#include "dllmain.h"
+
+
+#include "SDKv45.hpp"
+#include "SDKv45/GameplayAbilities_parameters.hpp"
+#include "SDKv45/Engine_parameters.hpp"
+#include "SDKv45/AssetRegistry_parameters.hpp"
+
+#include "UnrealContainers.h"
+
+#include <thread>
+#include <iostream>
+#include <sstream>
+#include <iomanip>
+#include <format>
+#include <algorithm>
+#include <map>
+#include <set>
+#include <vector>
+#include <cmath>
+#include <string>
+#include <fstream>
+#include <Windows.h>
+#include <setjmp.h>
+
+#include "MinHook/include/MinHook.h"
+#include <execution>
+
+#include "json/json.h"
+
+namespace Hooking {
+    extern volatile long long g_diagTickCounter;
+}
+
+namespace ServerConfig {
+    bool  EnableBuffPatch          = true;
+    float EnemyBuffMultiplier      = 2.5f;
+    float FriendlyBuffMultiplier   = 2.0f;
+
+    bool  EnableBotSpeedBuff       = false;
+
+    std::string BlueTeamDifficulty = "veteran";
+    std::string RedTeamDifficulty  = "veteran";
+
+    bool  EnableBossMod            = true;
+    float BossMaxHpMult            = 0.9f;
+    float BossAttackMult           = 0.85f;
+    float BossRegenMult            = 0.5f;
+    float BossStatEpsilon          = 0.5f;
+    float BossPeriodicLogInterval  = 60.0f;
+
+    inline SDK::EAIBotDifficulty ParseDifficulty(const std::string& s) {
+        std::string lo; lo.reserve(s.size());
+        for (char c : s) lo.push_back((char)std::tolower((unsigned char)c));
+        if (lo == "introductory") return SDK::EAIBotDifficulty::Introductory;
+        if (lo == "easy")         return SDK::EAIBotDifficulty::Easy;
+        if (lo == "intermediate") return SDK::EAIBotDifficulty::Intermediate;
+        if (lo == "experienced")  return SDK::EAIBotDifficulty::Experienced;
+        if (lo == "veteran")      return SDK::EAIBotDifficulty::Veteran;
+        if (lo == "custom")       return SDK::EAIBotDifficulty::Custom;
+        std::cout << "[CONFIG] WARN unknown difficulty \"" << s
+                  << "\" - falling back to Veteran" << std::endl;
+        return SDK::EAIBotDifficulty::Veteran;
+    }
+
+    inline void LoadFromFile() {
+        std::ifstream ifs("server.json");
+        if (!ifs.good()) {
+            std::cout << "[CONFIG] server.json not found - using code defaults"
+                      << std::endl;
+            return;
+        }
+        std::stringstream ss; ss << ifs.rdbuf();
+        Json::Value root;
+        Json::Reader reader;
+        if (!reader.parse(ss.str(), root)) {
+            std::cout << "[CONFIG] server.json parse FAILED: "
+                      << reader.getFormattedErrorMessages()
+                      << " - using code defaults" << std::endl;
+            return;
+        }
+
+        auto readFloat = [&](const char* k, float& target, float lo, float hi) {
+            if (!root.isMember(k) || !root[k].isNumeric()) return;
+            float v = root[k].asFloat();
+            if (v < lo || v > hi) {
+                std::cout << "[CONFIG] WARN " << k << "=" << v
+                          << " out of [" << lo << ".." << hi << "] - ignored"
+                          << std::endl;
+                return;
+            }
+            target = v;
+        };
+        auto readBool = [&](const char* k, bool& target) {
+            if (root.isMember(k) && root[k].isBool()) target = root[k].asBool();
+        };
+        auto readString = [&](const char* k, std::string& target) {
+            if (root.isMember(k) && root[k].isString()) target = root[k].asString();
+        };
+
+        readBool  ("enable_buff_patch",              EnableBuffPatch);
+        readFloat ("enemy_buff_multiplier",          EnemyBuffMultiplier,      0.01f, 100.0f);
+        readFloat ("friendly_buff_multiplier",       FriendlyBuffMultiplier,   0.01f, 100.0f);
+        readBool  ("enable_bot_speed_buff",          EnableBotSpeedBuff);
+        readString("blue_team_difficulty",           BlueTeamDifficulty);
+        readString("red_team_difficulty",            RedTeamDifficulty);
+        readBool  ("enable_boss_mod",                EnableBossMod);
+        readFloat ("boss_regen_mult",                BossRegenMult,            0.01f, 0.59f);
+        readFloat ("boss_maxhp_mult",                BossMaxHpMult,            0.01f, 10.0f);
+        readFloat ("boss_attack_mult",               BossAttackMult,           0.01f, 10.0f);
+        readFloat ("boss_stat_epsilon",              BossStatEpsilon,          0.0f,  1000.0f);
+        readFloat ("boss_periodic_log_interval_sec", BossPeriodicLogInterval,  1.0f,  3600.0f);
+
+        std::cout << "[CONFIG] Loaded server.json:" << std::endl
+                  << "[CONFIG]   enable_buff_patch              = " << (EnableBuffPatch ? "true" : "false") << std::endl
+                  << "[CONFIG]   enemy_buff_multiplier          = " << EnemyBuffMultiplier << std::endl
+                  << "[CONFIG]   friendly_buff_multiplier       = " << FriendlyBuffMultiplier << std::endl
+                  << "[CONFIG]   enable_bot_speed_buff          = " << (EnableBotSpeedBuff ? "true" : "false") << std::endl
+                  << "[CONFIG]   blue_team_difficulty           = " << BlueTeamDifficulty << std::endl
+                  << "[CONFIG]   red_team_difficulty            = " << RedTeamDifficulty << std::endl
+                  << "[CONFIG]   enable_boss_mod                = " << (EnableBossMod ? "true" : "false") << std::endl
+                  << "[CONFIG]   boss_regen_mult                = " << BossRegenMult << std::endl
+                  << "[CONFIG]   boss_maxhp_mult                = " << BossMaxHpMult << std::endl
+                  << "[CONFIG]   boss_attack_mult               = " << BossAttackMult << std::endl
+                  << "[CONFIG]   boss_stat_epsilon              = " << BossStatEpsilon << std::endl
+                  << "[CONFIG]   boss_periodic_log_interval_sec = " << BossPeriodicLogInterval << std::endl;
+    }
+}
+
+#define F4_LOG_LEVEL 0
+
+#if F4_LOG_LEVEL >= 2
+#define F4_LOG_VERBOSE(x) do { std::cout << x; } while(0)
+#else
+#define F4_LOG_VERBOSE(x) do { } while(0)
+#endif
+
+#if F4_LOG_LEVEL >= 1
+#define F4_LOG_EVENT(x) do { std::cout << x; } while(0)
+#else
+#define F4_LOG_EVENT(x) do { } while(0)
+#endif
+
+#if F4_LOG_LEVEL >= 1
+static inline std::ostream& CardLog() { return std::cout; }
+#else
+struct CardNullSink {
+    template <class T> CardNullSink& operator<<(const T&) { return *this; }
+    CardNullSink& operator<<(std::ostream& (*)(std::ostream&)) { return *this; }
+    CardNullSink& operator<<(std::ios_base& (*)(std::ios_base&)) { return *this; }
+};
+static inline CardNullSink& CardLog() { static CardNullSink s; return s; }
+#endif
+
+#pragma comment(lib, "MinHook/lib/libMinHook-x64-v141-mt.lib")
+
+
+
+
+    using namespace SDK;
+
+namespace Settings {
+    const int NUM_PLAYERS_TO_START = 10;
+}
+
+namespace SDKUtils {
+    template <typename T>
+    std::vector<T*> GetAllObjectsOfType() {
+        return UObject::FindObjects<T>();
+    }
+
+    template <typename T>
+    T* GetLastOfType() {
+        return UObject::FindObjects<T>().back();
+    }
+
+}
+
+
+static const float H_ADV_ENTER_HP    = 60.0f;
+static const float H_ADV_ENTER_LEAD  = 15.0f;
+static const float H_ADV_KEEP_HP     = 50.0f;
+static const float H_ADV_KEEP_LEAD   = 5.0f;
+static const float H_KILL_PRESS_HP   = 35.0f;
+static const float H_KILL_MIN_BOTHP  = 40.0f;
+static const float H_KILL_KEEP_HP    = 40.0f;
+static const float H_KILL_KEEP_BOTHP = 35.0f;
+static inline bool H1AdvEnter(float botHP, int heroHP, bool heroOutnum, bool heavyDef) {
+    if (heroOutnum || heroHP < 0 || botHP < 0.0f) return false;
+    return (botHP >= H_ADV_ENTER_HP && (float)heroHP <= botHP - H_ADV_ENTER_LEAD) || (!heavyDef && (float)heroHP <= H_KILL_PRESS_HP && botHP >= H_KILL_MIN_BOTHP);
+}
+static inline bool H1AdvKeep(float botHP, int heroHP, bool heroOutnum, bool heavyDef) {
+    if (heroOutnum || heroHP < 0 || botHP < 0.0f) return false;
+    return (botHP >= H_ADV_KEEP_HP && (float)heroHP <= botHP - H_ADV_KEEP_LEAD) || (!heavyDef && (float)heroHP <= H_KILL_KEEP_HP && botHP >= H_KILL_KEEP_BOTHP);
+}
+static inline bool RIsMeleeHeroName(const std::string& n) {
+    static const char* const kMelee[] = { "Steel", "WarDrum", "Chains", "Kwang", "Grux", "Tomahawk", "FallenAngel", "Rampage", "Vamp",
+                                          "Justice", "Kurohane", "Sword", "Crunch", "Mudang", "Hammer", "Wukong", "Ice", "Femme", "ArcBlade" };
+    for (const char* k : kMelee) if (n.find(k) != std::string::npos) return true;
+    return false;
+}
+static const float RKILL_HERO_HP     = 35.0f;
+static const float RKILL_DIST_SQ     = 1500.0f * 1500.0f;
+static const float RKILL_HERO_TWR_SQ = 1600.0f * 1600.0f;
+static inline bool RKillLage(const std::vector<AOrionDamageableObjective_Base*>& towers, AOrionChar* hero,
+                             int heroHP, float botHP, bool heroOutnum, float heroDistSq) {
+    if (!hero || heroHP < 0 || (float)heroHP > RKILL_HERO_HP || botHP < (float)heroHP || heroOutnum || heroDistSq > RKILL_DIST_SQ) return false;
+    FVector hl = hero->K2_GetActorLocation();
+    for (AOrionDamageableObjective_Base* t : towers) {
+        if (!t || t->TeamNum != hero->TeamNum || t->GetHealth() <= 0.0f) continue;
+        if (t->GetFullName().find("Default__") != std::string::npos) continue;
+        FVector tl = t->K2_GetActorLocation();
+        float dx = tl.X - hl.X, dy = tl.Y - hl.Y;
+        if (dx * dx + dy * dy <= RKILL_HERO_TWR_SQ) return false;
+    }
+    return true;
+}
+static inline bool ROwnHeroUe(int frHOthers, int enH) {
+    return (enH == 0) ? (frHOthers >= 1) : (frHOthers >= enH);
+}
+static inline float RHeroOwnTowerSq(const std::vector<AOrionDamageableObjective_Base*>& towers, AOrionChar* hero) {
+    if (!hero) return 1e18f;
+    FVector hl = hero->K2_GetActorLocation();
+    float best = 1e18f;
+    for (AOrionDamageableObjective_Base* t : towers) {
+        if (!t || t->TeamNum != hero->TeamNum || t->GetHealth() <= 0.0f) continue;
+        if (t->GetFullName().find("Default__") != std::string::npos) continue;
+        FVector tl = t->K2_GetActorLocation();
+        float dx = tl.X - hl.X, dy = tl.Y - hl.Y;
+        float d = dx * dx + dy * dy;
+        if (d < best) best = d;
+    }
+    return best;
+}
+bool IsValidUE4Object(void* Ptr) {
+    if (!Ptr) return false;
+
+    uintptr_t Addr = reinterpret_cast<uintptr_t>(Ptr);
+    if (Addr < 0x10000ULL || Addr > 0x00007FFFFFFFFFFFULL) return false;
+
+    if (IsBadReadPtr(Ptr, 0x10)) return false;
+
+    return true;
+}
+
+namespace PLOffsets {
+
+    static const uintptr_t MALLOC = 0xBD2AE0;
+    static const uintptr_t FREE = 0xBC7030;
+
+
+    static const uintptr_t GET_DAMAGE_STATICS = 0x56BF00;
+    static const uintptr_t CALCULATE_CAPTURED_ATTRIBUTE_MAGNITUDE = 0x3134DE0;
+    static const uintptr_t GET_INSTIGATOR_ASC = 0x392290;
+
+    static const uintptr_t FIND_ABILITY_SPEC_FROM_HANDLE = 0x316CBA0;
+    static const uintptr_t CLIENT_ACTIVATE_ABILITY_FAILED = 0x3160650;
+    static const uintptr_t CONSUME_REPLICATED_TARGET_DATA = 0x3162420;
+    static const uintptr_t CONSTRUCT_SCOPED_PREDICTION_WINDOW = 0x3133EF0;
+    static const uintptr_t INTERNAL_TRY_ACTIVATE_ABILITY = 0x3177E80;
+    static const uintptr_t MARK_ABILITY_SPEC_DIRTY = 0x317B660;
+
+    static const uintptr_t CREATE_NAMED_NET_DRIVER = 0x232D220;
+    static const uintptr_t INIT_LISTEN = 0x2E80770;
+    static const uintptr_t SET_WORLD = 0x202F360;
+    static const uintptr_t CALL_PRE_REPLICATION = 0x1B551E0;
+    static const uintptr_t CREATE_CHANNEL = 0x2017E30;
+    static const uintptr_t SET_CHANNEL_ACTOR = 0x1E15640;
+    static const uintptr_t REPLICATE_ACTOR = 0x1E0F390;
+    static const uintptr_t FORCE_NET_UPDATE = 0x1B5FF80;
+    static const uintptr_t IS_PENDING_KILL_PENDING = 0x3E9290;
+    static const uintptr_t SEND_CLIENT_ADJUSTMENT = 0x21854F0;
+    static const uintptr_t IS_NET_READY_PTR_PTR = 0x4463848;
+
+    static const uintptr_t PROCESSEVENT = 0xEA1BD0;
+    static const uintptr_t STATMANAGER_CRASH = 0x4B5410;
+    static const uintptr_t NETDRIVER_TICKFLUSH = 0x2030DF0;
+    static const uintptr_t GAMEMODE_MOBA_POSTLOGIN = 0x67A8A0;
+    static const uintptr_t NOTIFY_ACCEPTING_CONNECTION = 0x238D5F0;
+    static const uintptr_t NOTIFY_ACCEPTED_CONNECTION = 0x238D180;
+    static const uintptr_t NOTIFY_ACCEPTING_CHANNEL = 0x238D300;
+    static const uintptr_t NOTIFY_CONTROL_MESSAGE = 0x238DBD0;
+    static const uintptr_t CAN_RESTART_PLAYER = 0x8FA1F0;
+    static const uintptr_t COLLECT_GARBAGE = 0xE19000;
+    static const uintptr_t CONSUME_CLIENT_DATA = 0x3162420;
+    static const uintptr_t GAME_ENGINE_TICK = 0x1E7F340;
+    static const uintptr_t APPROVE_LOGIN = 0x1E8ED90;
+    static const uintptr_t STOP_DEMO = 0x1E4CB00;
+    static const uintptr_t DEMO_TICK_FLUSH = 0x1E50F80;
+    static const uintptr_t NEW_OBJECT_START_TARGETING = 0x3F4C60;
+    static const uintptr_t LOGIN = 0x672430;
+    static const uintptr_t UCHANNEL_CLEANUP = 0x1DEA6A0;
+    static const uintptr_t GAME_MODE_CAN_RESTART_PLAYER = 0x23F82B0;
+    static const uintptr_t OBJECT_CRASH_FUNC = 0x1E2B6C0;
+    static const uintptr_t AISYSTEM_SPAWN_BOT = 0x496DB0;
+    static const uintptr_t UWORLD_SPAWN_ACTOR = 0x1F813B0;
+
+    static const uintptr_t AIBOT_UPDATE_NEARBY_ALLY = 0x450950;
+    static const uintptr_t HAS_TEAM_BUILDER_INFO = 0x6AF5C0;
+    static const uintptr_t UWORLD_DESTROY_ACTOR = 0x1F5E910;
+}
+
+namespace Globals {
+    bool gameInit = false;
+
+    bool overrideTeamBuilderInfoCheck = false;
+
+    static bool shouldStartMatch = false;
+
+    uintptr_t ModuleBase = 0;
+
+    UWorld* GetGWorld() {
+
+        return UWorld::GetWorld();
+    }
+
+    UGameplayStatics* GetGameplayStatics() {
+        static UGameplayStatics* gameplayStatics = nullptr;
+
+        if (!gameplayStatics) {
+            gameplayStatics = UObject::FindObject<UGameplayStatics>();
+        }
+
+        return gameplayStatics;
+    }
+
+    UKismetStringLibrary* GetKismetStringLibrary() {
+        static UKismetStringLibrary* kismetStringLibrary = nullptr;
+
+        if (!kismetStringLibrary) {
+            kismetStringLibrary = UObject::FindObject<UKismetStringLibrary>();
+        }
+
+        return kismetStringLibrary;
+    }
+
+    UEngine* GetEngine() {
+        static UEngine* engine = nullptr;
+
+        if (!engine) {
+            engine = SDKUtils::GetLastOfType<UEngine>();
+        }
+
+        return engine;
+    }
+
+    template <typename T>
+    T* GetLocalPlayerController() {
+        return reinterpret_cast<T*>(GetGWorld()->OwningGameInstance->LocalPlayers[0]->PlayerController);
+    }
+
+    template <typename T>
+    T* GetLocalPlayerState() {
+        return reinterpret_cast<T*>(GetGWorld()->OwningGameInstance->LocalPlayers[0]->PlayerController->PlayerState);
+    }
+
+    template <typename T>
+    T* GetGameMode() {
+        return reinterpret_cast<T*>(GetGWorld()->AuthorityGameMode);
+    }
+
+    template <typename T>
+    T* GetGameState() {
+        return reinterpret_cast<T*>(GetGWorld()->AuthorityGameMode->GameState);
+    }
+}
+
+namespace EngineLogic {
+    void EnableGameConsole() {
+        UKismetStringLibrary* stringLibrary = UObject::FindObjects<UKismetStringLibrary>().back();
+        UEngine* engine = UObject::FindObjects<UEngine>().back();
+        UInputSettings* inputSettings = UObject::FindObjects<UInputSettings>().back();
+        UGameplayStatics* gameplayStatics = UObject::FindObjects<UGameplayStatics>().back();
+
+
+        inputSettings->ConsoleKeys[0].KeyName = stringLibrary->Conv_StringToName(L"F12");
+
+        UObject* NewObject = gameplayStatics->SpawnObject(engine->ConsoleClass, engine->GameViewport);
+
+        engine->GameViewport->ViewportConsole = reinterpret_cast<UConsole * >(NewObject);
+    }
+
+    void ExecuteConsoleCommand(const wchar_t* cmd) {
+        static UKismetSystemLibrary* systemLibrary = nullptr;
+
+        if (!systemLibrary) {
+            systemLibrary = UObject::FindObject<UKismetSystemLibrary>();
+        }
+
+
+        systemLibrary->ExecuteConsoleCommand(Globals::GetGWorld(), cmd, Globals::GetLocalPlayerController<APlayerController>());
+    }
+
+    void LoadMap(const wchar_t* map, const wchar_t* options) {
+        static UGameplayStatics* systemLibrary = nullptr;
+
+        if (!systemLibrary) {
+            systemLibrary = UObject::FindObject<UGameplayStatics>();
+        }
+
+        static UKismetStringLibrary* kismetStringLibrary = nullptr;
+
+        if (!kismetStringLibrary) {
+            kismetStringLibrary = UObject::FindObject<UKismetStringLibrary>();
+        }
+
+
+        systemLibrary->OpenLevel(Globals::GetGWorld(), kismetStringLibrary->Conv_StringToName(map), true, options);
+    }
+
+    void* Malloc(__int64 size, unsigned int alignment) {
+        return reinterpret_cast<void* (__thiscall*)(__int64 size, unsigned int alignment)>(Globals::ModuleBase + PLOffsets::MALLOC)(size, alignment);
+    }
+
+    __int64 Free(void* ptr) {
+        return reinterpret_cast<__int64 (__thiscall*)(void*)>(Globals::ModuleBase + PLOffsets::FREE)(ptr);
+    }
+
+    void LimitFramerateForServer() {
+
+        ExecuteConsoleCommand(L"t.maxfps 45");
+
+        EngineLogic::ExecuteConsoleCommand(L"t.HitchFrameTimeThreshold 200");
+
+        EngineLogic::ExecuteConsoleCommand(L"log Orion Warning");
+        EngineLogic::ExecuteConsoleCommand(L"log OrionGame Error");
+        EngineLogic::ExecuteConsoleCommand(L"log OrionStateChange Error");
+        EngineLogic::ExecuteConsoleCommand(L"log OrionAI Error");
+        EngineLogic::ExecuteConsoleCommand(L"log TimeGuard Error");
+    }
+}
+
+namespace GameLogic {
+    void SetupTeams() {
+        AOrionGameState_MOBA* gameState = Globals::GetGameState<AOrionGameState_MOBA>();
+
+        
+
+
+        gameState->Teams.Data = reinterpret_cast<AOrionTeamInfo**>(EngineLogic::Malloc(sizeof(AOrionTeamInfo*) * 4, 0));
+        gameState->Teams.NumElements = 4;
+        gameState->Teams.MaxElements = 4;
+
+        AOrionTeamInfo* redTeamInfo = reinterpret_cast<AOrionTeamInfo*>(Globals::GetGameplayStatics()->BeginSpawningActorFromClass(Globals::GetGWorld(), AOrionTeamInfo::StaticClass(), FTransform(), true, gameState));
+        AOrionTeamInfo* blueTeamInfo = reinterpret_cast<AOrionTeamInfo*>(Globals::GetGameplayStatics()->BeginSpawningActorFromClass(Globals::GetGWorld(), AOrionTeamInfo::StaticClass(), FTransform(), true, gameState));
+        AOrionTeamInfo* noTeamInfo = reinterpret_cast<AOrionTeamInfo*>(Globals::GetGameplayStatics()->BeginSpawningActorFromClass(Globals::GetGWorld(), AOrionTeamInfo::StaticClass(), FTransform(), true, gameState));
+        AOrionTeamInfo* teamCreepInfo = reinterpret_cast<AOrionTeamInfo*>(Globals::GetGameplayStatics()->BeginSpawningActorFromClass(Globals::GetGWorld(), AOrionTeamInfo::StaticClass(), FTransform(), true, gameState));
+
+        redTeamInfo->TeamName = Globals::GetKismetStringLibrary()->Conv_StringToName(L"RedTeam");
+        blueTeamInfo->TeamName = Globals::GetKismetStringLibrary()->Conv_StringToName(L"BlueTeam");
+        noTeamInfo->TeamName = Globals::GetKismetStringLibrary()->Conv_StringToName(L"RedTeam");
+        teamCreepInfo->TeamName = Globals::GetKismetStringLibrary()->Conv_StringToName(L"RedTeam");
+
+        redTeamInfo->TeamMembers.Data = reinterpret_cast<AController**>(EngineLogic::Malloc(sizeof(AController*) * 5, 0));
+        redTeamInfo->TeamMembers.NumElements = 0;
+        redTeamInfo->TeamMembers.MaxElements = 5;
+
+        blueTeamInfo->TeamMembers.Data = reinterpret_cast<AController**>(EngineLogic::Malloc(sizeof(AController*) * 5, 0));
+        blueTeamInfo->TeamMembers.NumElements = 0;
+        blueTeamInfo->TeamMembers.MaxElements = 5;
+
+        redTeamInfo->TeamIndex = EOrionTeam::TeamRed;
+        redTeamInfo->bPlayerTeam = true;
+        redTeamInfo->MaxPlayers = 5;
+
+        
+
+        blueTeamInfo->TeamIndex = EOrionTeam::TeamBlue;
+        blueTeamInfo->bPlayerTeam = true;
+        blueTeamInfo->MaxPlayers = 5;
+
+        
+
+        noTeamInfo->TeamIndex = EOrionTeam::NoTeam;
+        noTeamInfo->bPlayerTeam = true;
+        noTeamInfo->MaxPlayers = 5;
+
+        teamCreepInfo->TeamIndex = EOrionTeam::TeamCreep;
+        teamCreepInfo->bPlayerTeam = true;
+        teamCreepInfo->MaxPlayers = 0;
+
+        gameState->Teams[0] = redTeamInfo;
+        gameState->Teams[1] = blueTeamInfo;
+        gameState->Teams[2] = noTeamInfo;
+        gameState->Teams[3] = teamCreepInfo;
+    }
+
+    void SetupHUDForController(AOrionPlayerController_Game* controller) {
+        controller->ClientSetHUD(UObject::FindClass("Class OrionGame.OrionUI_Game"));
+    }
+
+    bool AddBotControllerToTeam(AOrionAIBot* controller, EOrionTeam team, bool noFail = true) {
+        AOrionGameState_MOBA* gameState = Globals::GetGameState<AOrionGameState_MOBA>();
+
+        for (int i = 0; i < gameState->Teams.Count(); i++) {
+            AOrionTeamInfo* teamInfo = gameState->Teams[i];
+
+            if (teamInfo->TeamIndex == team) {
+                if (teamInfo->TeamMembers.Count() < 5) {
+                    teamInfo->TeamMembers[teamInfo->TeamMembers.Count()] = controller;
+
+                    teamInfo->TeamMembers.NumElements = teamInfo->TeamMembers.NumElements + 1;
+                    reinterpret_cast<AOrionPlayerState_Game*>(controller->PlayerState)->TeamInfo = teamInfo;
+                    reinterpret_cast<AOrionPlayerState_Game*>(controller->PlayerState)->OnRep_Team(nullptr);
+
+                    reinterpret_cast<AOrionPlayerState_Game*>(controller->PlayerState)->bReadyToStartMatch = true;
+                    reinterpret_cast<AOrionPlayerState_Game*>(controller->PlayerState)->OnRep_bReadyToStartMatch();
+
+                    reinterpret_cast<AOrionPlayerState_Game*>(controller->PlayerState)->bIsSpectator = false;
+                    reinterpret_cast<AOrionPlayerState_Game*>(controller->PlayerState)->bOnlySpectator = false;
+
+                    reinterpret_cast<AOrionPlayerState_Game*>(controller->PlayerState)->TeamNum = team;
+                    Globals::GetGameMode<AOrionGameMode_Base>()->ChangeTeam(controller, team);
+
+                    return true;
+                }
+                else if (noFail) {
+                    if (team == EOrionTeam::TeamRed) {
+                        AddBotControllerToTeam(controller, EOrionTeam::TeamBlue, false);
+                    }
+                    else {
+                        AddBotControllerToTeam(controller, EOrionTeam::TeamRed, false);
+                    }
+                }
+            }
+        }
+
+        return false;
+    }
+
+    bool AddControllerToTeam(AOrionPlayerController_Game* controller, EOrionTeam team, bool noFail = true) {
+        AOrionGameState_MOBA* gameState = Globals::GetGameState<AOrionGameState_MOBA>();
+
+        for (int i = 0; i < gameState->Teams.Count(); i++) {
+            AOrionTeamInfo* teamInfo = gameState->Teams[i];
+
+            if (teamInfo->TeamIndex == team) {
+                if (teamInfo->TeamMembers.Count() < 5) {
+                    teamInfo->TeamMembers[teamInfo->TeamMembers.Count()] = controller;
+
+                    teamInfo->TeamMembers.NumElements = teamInfo->TeamMembers.NumElements + 1;
+                    controller->ServerChangeTeam(team);
+                    reinterpret_cast<AOrionPlayerState_Game*>(controller->PlayerState)->TeamInfo = teamInfo;
+                    reinterpret_cast<AOrionPlayerState_Game*>(controller->PlayerState)->OnRep_Team(nullptr);
+
+                    reinterpret_cast<AOrionPlayerState_Game*>(controller->PlayerState)->bReadyToStartMatch = true;
+                    reinterpret_cast<AOrionPlayerState_Game*>(controller->PlayerState)->OnRep_bReadyToStartMatch();
+
+                    reinterpret_cast<AOrionPlayerState_Game*>(controller->PlayerState)->bIsSpectator = false;
+                    reinterpret_cast<AOrionPlayerState_Game*>(controller->PlayerState)->bOnlySpectator = false;
+
+                    reinterpret_cast<AOrionPlayerState_Game*>(controller->PlayerState)->TeamNum = team;
+
+                    return true;
+                }
+                else if(noFail) {
+                    if (team == EOrionTeam::TeamRed) {
+                        AddControllerToTeam(controller, EOrionTeam::TeamBlue, false);
+                    }
+                    else {
+                        AddControllerToTeam(controller, EOrionTeam::TeamRed, false);
+                    }
+                }
+            }
+        }
+
+        return false;
+    }
+
+
+    void StartMatch() {   
+        Globals::GetLocalPlayerController<AOrionPlayerController_Game>()->ServerForceStartGame();
+    }
+
+    void SetControllerHeroData(AOrionPlayerController_Game* controller, UOrionHeroData* heroData,
+                               UOrionSkinItemDefinition* skinOverride = nullptr) {
+        FOrionHeroDataSpec spec = FOrionHeroDataSpec();
+
+        spec.HeroData = heroData;
+        spec.Skin = (skinOverride && IsValidUE4Object(skinOverride))
+                        ? skinOverride
+                        : heroData->DefaultSkin;
+
+        reinterpret_cast<AOrionPlayerState_Game*>(controller->PlayerState)->ServerSetPlayerHeroDataSpec(spec);
+
+
+        reinterpret_cast<AOrionPlayerState_Game*>(controller->PlayerState)->HeroDataSpec = spec;
+
+
+        reinterpret_cast<AOrionPlayerState_Game*>(controller->PlayerState)->OnRep_HeroDataSpec();
+    }
+
+    void RestartClient(AOrionPlayerController_Game* pc) {
+        pc->Possess(pc->Pawn);
+    }
+
+    void HideLoadingScreen() {
+        EngineLogic::ExecuteConsoleCommand(L"hideloadingscreen");
+    }
+}
+
+namespace DamageCalculations {
+    struct FAggregatorEvaluateParameters
+    {
+        FAggregatorEvaluateParameters()
+            : SourceTags(nullptr)
+            , TargetTags(nullptr)
+            , IncludePredictiveMods(false)
+        {}
+
+        const FGameplayTagContainer* SourceTags;
+        const FGameplayTagContainer* TargetTags;
+
+        TArray<FActiveGameplayEffectHandle> IgnoreHandles;
+
+        FGameplayTagContainer AppliedSourceTagFilter;
+
+        FGameplayTagContainer AppliedTargetTagFilter;
+
+        bool IncludePredictiveMods;
+    };
+
+    __int64 GetDamageStatics() {
+        return (reinterpret_cast<__int64 (*)()>(Globals::ModuleBase + PLOffsets::GET_DAMAGE_STATICS)());
+    }
+
+    float GetDamageCalcInput(__int64 offset, FGameplayEffectCustomExecutionParameters* params) {
+        float out = 0.0f;
+        FAggregatorEvaluateParameters secondParams = FAggregatorEvaluateParameters();
+        bool calcSucceeded = reinterpret_cast<bool(*)(FGameplayEffectCustomExecutionParameters*, FGameplayEffectAttributeCaptureDefinition*, FAggregatorEvaluateParameters*, float*)>(Globals::ModuleBase + PLOffsets::CALCULATE_CAPTURED_ATTRIBUTE_MAGNITUDE)(params, (FGameplayEffectAttributeCaptureDefinition*)(GetDamageStatics() + offset), &secondParams, &out);
+        return out;
+    }
+
+
+        float CalculateDamage(UOrionDamage * damageObject, SDK::Params::GameplayEffectExecutionCalculation_Execute * params) {
+        
+            float total = 0.0f;
+            
+            float BasePower = GetDamageCalcInput(0x38, &params->ExecutionParams);
+
+            float AttackRating = GetDamageCalcInput(0x68, &params->ExecutionParams);
+
+            float AoERating = GetDamageCalcInput(0x2D8, &params->ExecutionParams);
+
+            total = BasePower + AttackRating + AoERating;
+
+            constexpr bool ENABLE_MINION_DMG_FIX = true;
+            if (ENABLE_MINION_DMG_FIX
+                && BasePower > 0.0f
+                && fabs(BasePower - AttackRating) < 0.01f) {
+                AActor* dmgSrc = nullptr;
+                if (params->ExecutionParams.OwningSpec) {
+                    UOrionAbilitySystemComponent* sASC =
+                        reinterpret_cast<UOrionAbilitySystemComponent* (*)(FGameplayEffectContextHandle*)>(
+                            Globals::ModuleBase + PLOffsets::GET_INSTIGATOR_ASC)(
+                                &params->ExecutionParams.OwningSpec->EffectContext);
+                    if (sASC && IsValidUE4Object(sASC)) dmgSrc = sASC->AvatarActor;
+                }
+                if (dmgSrc && IsValidUE4Object(dmgSrc)) {
+                    std::string sn = dmgSrc->GetFullName();
+                    bool isMinionCreep =
+                          sn.find("Minion") != std::string::npos || sn.find("minion") != std::string::npos
+                       || sn.find("Creep")  != std::string::npos || sn.find("creep")  != std::string::npos;
+                    bool isHero = dmgSrc->IsA(AOrionCharHero::StaticClass());
+                    bool isBoss = sn.find("Dragon")     != std::string::npos || sn.find("dragon")     != std::string::npos
+                               || sn.find("PrimeHelix") != std::string::npos || sn.find("primehelix") != std::string::npos;
+                    if ((isMinionCreep || isBoss) && !isHero) {
+                        float corrected = BasePower + AoERating;
+                        total = corrected;
+                    }
+                }
+            }
+
+            return total;
+
+    }
+
+
+    void ApplyDamage(UOrionDamage * damageObject, SDK::Params::GameplayEffectExecutionCalculation_Execute * params, float damage) {
+        params->OutExecutionOutput.OutputModifiers = *(reinterpret_cast<TArray<FGameplayModifierEvaluatedData>*>(EngineLogic::Malloc(sizeof(TArray<FGameplayModifierEvaluatedData>), 0)));
+
+        FGameplayModifierEvaluatedData* evaluatedData = reinterpret_cast<FGameplayModifierEvaluatedData*>(EngineLogic::Malloc(sizeof(FGameplayModifierEvaluatedData), 0));
+
+        FGameplayEffectAttributeCaptureDefinition toCapture = FGameplayEffectAttributeCaptureDefinition();
+
+        toCapture = damageObject->RelevantAttributesToCapture[0];
+
+        if (toCapture.AttributeToCapture.Attribute && (uintptr_t)toCapture.AttributeToCapture.Attribute != 0xffffffff) {
+            FGameplayAttribute newAttr = *(reinterpret_cast<FGameplayAttribute*>(EngineLogic::Malloc(sizeof(FGameplayAttribute*), 0)));;
+
+            newAttr.Attribute = toCapture.AttributeToCapture.Attribute;
+            newAttr.AttributeName = FString();
+            void* str = EngineLogic::Malloc(sizeof(L"Health"), 0);
+            const wchar_t* my_str = L"Health";
+            memcpy_s(str, sizeof(L"Health"), my_str, sizeof(L"Health"));
+            
+            newAttr.AttributeOwner = toCapture.AttributeToCapture.AttributeOwner;
+
+            evaluatedData->Attribute = newAttr;
+
+            evaluatedData->IsValid = true;
+
+            evaluatedData->Handle = *(reinterpret_cast<FActiveGameplayEffectHandle*>(EngineLogic::Malloc(sizeof(FActiveGameplayEffectHandle), 0)));
+            evaluatedData->Magnitude = damage * -1.0;
+            evaluatedData->ModifierOp = EGameplayModOp::Additive;
+
+
+            newAttr.AttributeName.Data = (wchar_t*)str;
+            newAttr.AttributeName.NumElements = 6;
+            newAttr.AttributeName.MaxElements = 6;
+
+            ((SDK::Params::GameplayEffectExecutionCalculation_Execute*)params)->OutExecutionOutput.OutputModifiers.Data = evaluatedData;
+            ((SDK::Params::GameplayEffectExecutionCalculation_Execute*)params)->OutExecutionOutput.OutputModifiers.NumElements = 1;
+            ((SDK::Params::GameplayEffectExecutionCalculation_Execute*)params)->OutExecutionOutput.OutputModifiers.MaxElements = 1;
+            ((SDK::Params::GameplayEffectExecutionCalculation_Execute*)params)->OutExecutionOutput.bHandledGameplayCuesManually = false;
+            ((SDK::Params::GameplayEffectExecutionCalculation_Execute*)params)->OutExecutionOutput.bHandledStackCountManually = false;
+            ((SDK::Params::GameplayEffectExecutionCalculation_Execute*)params)->OutExecutionOutput.bTriggerConditionalGameplayEffects = true;
+        }
+    }
+
+
+        void ProcDamageSFX(SDK::Params::GameplayEffectExecutionCalculation_Execute * params, float damage) {
+
+
+        UGameplayCueNotify_Static* gc = nullptr;
+        FGameplayCueParameters cueParams = FGameplayCueParameters();
+
+        cueParams.NormalizedMagnitude = damage;
+        cueParams.RawMagnitude = damage;
+
+        cueParams.AbilityLevel = ((SDK::Params::GameplayEffectExecutionCalculation_Execute*)params)->ExecutionParams.OwningSpec->Level;
+        cueParams.EffectContext = params->ExecutionParams.OwningSpec->EffectContext;
+
+        UOrionAbilitySystemComponent* instigatorASC = reinterpret_cast<UOrionAbilitySystemComponent * (*)(FGameplayEffectContextHandle*)>(Globals::ModuleBase + PLOffsets::GET_INSTIGATOR_ASC)(&params->ExecutionParams.OwningSpec->EffectContext);
+
+        FGameplayTag tag = FGameplayTag();
+
+        FPredictionKey key = FPredictionKey();
+
+        if (instigatorASC) {
+            if (instigatorASC->AvatarActor && instigatorASC->AvatarActor->IsA(AOrionCharHero::StaticClass())) {
+                key.Base = INT16_MAX;
+                key.Current = INT16_MAX;
+            }
+            else {
+                key.Base = INT16_MAX - 1;
+                key.Current = INT16_MAX - 1;
+            }
+        }
+
+
+        params->ExecutionParams.TargetAbilitySystemComponent.Get()->NetMulticast_InvokeGameplayCueExecuted_WithParams(tag, key, cueParams);
+
+    }
+
+
+    void DoDamagePipeline(UOrionDamage * damageObject, SDK::Params::GameplayEffectExecutionCalculation_Execute * params) {
+        float damage = CalculateDamage(damageObject, params);
+
+        ApplyDamage(damageObject, params, damage);
+
+        ProcDamageSFX(params, damage);
+    }
+}
+
+    bool TaskBelongsToASC(UObject* task, UObject* asc) {
+        if (!task || !asc) return false;
+        UObject* current = task->Outer;
+        int depth = 0;
+        while (current && depth < 10) {
+            if (current == asc) return true;
+            current = current->Outer;
+            depth++;
+        }
+        return false;
+    }
+
+
+
+    namespace GameplayAbilities {
+
+        static std::vector<UOrionAbilityTask_StartTargeting*> targetingTasks = std::vector<UOrionAbilityTask_StartTargeting*>();
+        static std::vector<UOrionAbilityTask_StartTargeting*> instantConfirmTasks = std::vector<UOrionAbilityTask_StartTargeting*>();
+
+
+        static std::vector<UObject*> waitTargetDataTasks;
+
+        static std::vector<UObject*> waitInputPressTasks;
+
+        static std::vector<UObject*> waitInputReleaseTasks;
+        static constexpr long long PENDING_TTL_TICKS = 60;
+        struct PendingConfirmEntry {
+            UAbilitySystemComponent* asc;
+            long long pushTick;
+        };
+        static std::vector<PendingConfirmEntry> pendingConfirmASCs;
+        struct DeferredConfirm {
+            UOrionAbilityTask_StartTargeting* task;
+            int framesWaited;
+        };
+        static std::vector<DeferredConfirm> deferredConfirms;
+
+
+
+        static UFunction* cachedOnTargetDataReadyFunc = nullptr;
+        static UFunction* cachedOnPressCallbackFunc = nullptr;
+        static UFunction* cachedOnReleaseCallbackFunc = nullptr;
+
+        void EnsureCallbackFunctionsCached() {
+            if (!cachedOnTargetDataReadyFunc)
+                cachedOnTargetDataReadyFunc = UObject::FindObject<UFunction>(
+                    "Function GameplayAbilities.AbilityTask_WaitTargetData.OnTargetDataReadyCallback");
+
+            if (!cachedOnPressCallbackFunc)
+                cachedOnPressCallbackFunc = UObject::FindObject<UFunction>(
+                    "Function GameplayAbilities.AbilityTask_WaitInputPress.OnPressCallback");
+
+            if (!cachedOnReleaseCallbackFunc)
+                cachedOnReleaseCallbackFunc = UObject::FindObject<UFunction>(
+                    "Function GameplayAbilities.AbilityTask_WaitInputRelease.OnReleaseCallback");
+        }
+
+        void* g_nativeReceivedReplicatedTargetData = nullptr;
+
+        inline bool s13_NeedsForceDeliver(const std::string& abilityFullName) {
+            static const bool ENABLE_FORCE_DELIVER = false;
+            if (!ENABLE_FORCE_DELIVER || abilityFullName.empty()) return false;
+            static const char* kForceDeliverList[] = {
+                "GA_Revenant_Mark", "GA_Revenant_Ultimate", "GA_Phase_Link_V2",
+                "Vamp_BlinkStrike", "Ghost_TeleportTarget",
+            };
+            for (const char* s : kForceDeliverList)
+                if (s && *s && abilityFullName.find(s) != std::string::npos) return true;
+            return false;
+        }
+
+        inline bool s13_isWatchedHero(const std::string& abilityFullName) {
+            if (abilityFullName.empty()) return false;
+            static const char* kWatchedHeroes[] = {
+                "Phase",
+            };
+            for (const char* h : kWatchedHeroes)
+                if (abilityFullName.find(h) != std::string::npos) return true;
+            return false;
+        }
+
+        bool TriggerAbilities(UAbilitySystemComponent* asc) {
+            bool procdAnAbility = false;
+
+            std::vector<UOrionAbilityTask_StartTargeting*> snap;
+            for (auto it = targetingTasks.begin(); it != targetingTasks.end(); ) {
+                UOrionAbilityTask_StartTargeting* target = *it;
+
+                if (target && target->AbilitySystemComponent == asc) {
+                    snap.push_back(target);
+                    it = targetingTasks.erase(it);
+                }
+                else {
+                    ++it;
+                }
+            }
+
+            for (UOrionAbilityTask_StartTargeting* target : snap) {
+                if (!target) continue;
+                const std::string tn = target->GetFullName();
+                if (tn.find("Default") == std::string::npos) {
+                    std::string s13_ab;
+                    if (target->Ability) s13_ab = target->Ability->GetFullName();
+                    const bool s13_fd = s13_NeedsForceDeliver(s13_ab);
+                    if (g_nativeReceivedReplicatedTargetData && s13_fd) {
+                        reinterpret_cast<void(__fastcall*)(UOrionAbilityTask_StartTargeting*)>(
+                            g_nativeReceivedReplicatedTargetData)(target);
+                    }
+                    else {
+                        target->ConfirmOrWait();
+                    }
+                    procdAnAbility = true;
+                }
+            }
+
+            return procdAnAbility;
+        }
+
+        void ForwardTargetDataToWaitTasks(UAbilitySystemComponent* asc, void* origProcessEventPtr, FGameplayAbilityTargetDataHandle* targetDataHandle) {
+            EnsureCallbackFunctionsCached();
+            if (!cachedOnTargetDataReadyFunc || !targetDataHandle) return;
+
+            for (auto it = waitTargetDataTasks.begin(); it != waitTargetDataTasks.end(); ) {
+                UObject* task = *it;
+
+                if (!task || task->GetFullName().find("Default") != std::string::npos) {
+                    it = waitTargetDataTasks.erase(it);
+                    continue;
+                }
+
+                if (TaskBelongsToASC(task, reinterpret_cast<UObject*>(asc))) {
+
+                    struct {
+                        FGameplayAbilityTargetDataHandle Data;
+                    } callbackParams;
+                    callbackParams.Data = *targetDataHandle;
+
+                    reinterpret_cast<void* (__thiscall*)(UObject*, UFunction*, void*)>(origProcessEventPtr)(
+                        task, cachedOnTargetDataReadyFunc, &callbackParams);
+
+                    it = waitTargetDataTasks.erase(it);
+                }
+                else {
+                    ++it;
+                }
+            }
+        }
+
+        void ForwardInputPressToTasks(UAbilitySystemComponent* asc, void* origProcessEventPtr) {
+            EnsureCallbackFunctionsCached();
+            if (!cachedOnPressCallbackFunc) return;
+
+            for (auto it = waitInputPressTasks.begin(); it != waitInputPressTasks.end(); ) {
+                UObject* task = *it;
+
+                if (!task || task->GetFullName().find("Default") != std::string::npos) {
+                    it = waitInputPressTasks.erase(it);
+                    continue;
+                }
+
+                if (TaskBelongsToASC(task, reinterpret_cast<UObject*>(asc))) {
+
+                    reinterpret_cast<void* (__thiscall*)(UObject*, UFunction*, void*)>(origProcessEventPtr)(
+                        task, cachedOnPressCallbackFunc, nullptr);
+
+                    it = waitInputPressTasks.erase(it);
+                }
+                else {
+                    ++it;
+                }
+            }
+        }
+
+        void ForwardInputReleaseToTasks(UAbilitySystemComponent* asc, void* origProcessEventPtr) {
+            EnsureCallbackFunctionsCached();
+            if (!cachedOnReleaseCallbackFunc) return;
+
+            for (auto it = waitInputReleaseTasks.begin(); it != waitInputReleaseTasks.end(); ) {
+                UObject* task = *it;
+
+                if (!task || task->GetFullName().find("Default") != std::string::npos) {
+                    it = waitInputReleaseTasks.erase(it);
+                    continue;
+                }
+
+                if (TaskBelongsToASC(task, reinterpret_cast<UObject*>(asc))) {
+
+                    reinterpret_cast<void* (__thiscall*)(UObject*, UFunction*, void*)>(origProcessEventPtr)(
+                        task, cachedOnReleaseCallbackFunc, nullptr);
+
+                    it = waitInputReleaseTasks.erase(it);
+                }
+                else {
+                    ++it;
+                }
+            }
+        }
+
+        void InternalServerTryActiveAbility(UAbilitySystemComponent* component, FGameplayAbilitySpecHandle Handle, bool inputPressed, FPredictionKey& PredictionKey, FGameplayEventData* TriggerEventData) {
+            FGameplayAbilitySpec* spec = reinterpret_cast<FGameplayAbilitySpec * (*)(UAbilitySystemComponent*, FGameplayAbilitySpecHandle)>(Globals::ModuleBase + PLOffsets::FIND_ABILITY_SPEC_FROM_HANDLE)(component, Handle);
+
+            if (!spec) {
+                reinterpret_cast<FGameplayAbilitySpec* (*)(UAbilitySystemComponent*, FGameplayAbilitySpecHandle, uint16_t)>(Globals::ModuleBase + PLOffsets::CLIENT_ACTIVATE_ABILITY_FAILED)(component, Handle, PredictionKey.Current);
+                return;
+            }
+
+            reinterpret_cast<void(*)(UAbilitySystemComponent*, FGameplayAbilitySpecHandle, FPredictionKey*)>(Globals::ModuleBase + PLOffsets::CONSUME_REPLICATED_TARGET_DATA)(component, Handle, &PredictionKey);
+
+            void* ScopedPredictionWindow = EngineLogic::Malloc(0x100, 0);
+            ScopedPredictionWindow = reinterpret_cast<void* (*)(void*, UAbilitySystemComponent*, FPredictionKey*, bool)>(Globals::ModuleBase + PLOffsets::CONSTRUCT_SCOPED_PREDICTION_WINDOW)(ScopedPredictionWindow, component, &PredictionKey, true);
+
+            UGameplayAbility* InstancedAbility = nullptr;
+            spec->InputPressed = true;
+
+            if (reinterpret_cast<bool(*)(UAbilitySystemComponent*, FGameplayAbilitySpecHandle, FPredictionKey*, UGameplayAbility**, void*, FGameplayEventData*)>(Globals::ModuleBase + PLOffsets::INTERNAL_TRY_ACTIVATE_ABILITY)(component, Handle, &PredictionKey, &InstancedAbility, nullptr, TriggerEventData)) {
+            }
+            else {
+                reinterpret_cast<FGameplayAbilitySpec* (*)(UAbilitySystemComponent*, FGameplayAbilitySpecHandle, uint16_t)>(Globals::ModuleBase + PLOffsets::CLIENT_ACTIVATE_ABILITY_FAILED)(component, Handle, PredictionKey.Current);
+                spec->InputPressed = false;
+            }
+
+            reinterpret_cast<void(*)(UAbilitySystemComponent*, FGameplayAbilitySpec*)>(Globals::ModuleBase + PLOffsets::MARK_ABILITY_SPEC_DIRTY)(component, spec);
+        }
+
+    }
+
+
+
+namespace Networking {
+    void Listen() {
+        EngineLogic::LimitFramerateForServer();
+
+
+        reinterpret_cast<void(__thiscall*)(UEngine*, UWorld*, FName, FName)>(Globals::ModuleBase + PLOffsets::CREATE_NAMED_NET_DRIVER)(Globals::GetEngine(), Globals::GetGWorld(), Globals::GetKismetStringLibrary()->Conv_StringToName(L"GameNetDriver"), Globals::GetKismetStringLibrary()->Conv_StringToName(L"GameNetDriver"));
+
+
+        UIpNetDriver* NetDriver = SDKUtils::GetLastOfType<UIpNetDriver>();
+
+        Globals::GetGWorld()->NetDriver = NetDriver;
+
+        FURL* url = (FURL*)EngineLogic::Malloc(sizeof(FURL), 0);
+
+        url->Port = 7777;
+        url->Valid = 1;
+
+        FString* err = (FString*)EngineLogic::Malloc(sizeof(FString), 0);
+
+        for (int i = 0; i < Globals::GetGWorld()->LevelCollections.Count(); i++) {
+            Globals::GetGWorld()->LevelCollections[i].NetDriver = NetDriver;
+        }
+
+        reinterpret_cast<void(__thiscall*)(UIpNetDriver*, __int64, FURL*, bool, FString*)>(Globals::ModuleBase + PLOffsets::INIT_LISTEN)(NetDriver, reinterpret_cast<__int64>(Globals::GetGWorld()) + 0x28, url, false, err);
+
+        reinterpret_cast<void(__thiscall*)(UNetDriver*, UWorld*)>(Globals::ModuleBase + PLOffsets::SET_WORLD)(NetDriver, Globals::GetGWorld());
+    }
+
+    UNetDriver* GetNetDriver() {
+        if (!Globals::GetGWorld()->NetDriver)
+            Globals::GetGWorld()->NetDriver = SDKUtils::GetLastOfType<UIpNetDriver>();
+        return Globals::GetGWorld()->NetDriver;
+    }
+
+    enum EChannelType
+    {
+        CHTYPE_None = 0,
+        CHTYPE_Control = 1,
+        CHTYPE_Actor = 2,
+        CHTYPE_File = 3,
+        CHTYPE_Voice = 4,
+        CHTYPE_MAX = 8,
+    };
+
+    enum EConnectionState
+    {
+        USOCK_Invalid = 0,
+        USOCK_Closed = 1,
+        USOCK_Pending = 2,
+        USOCK_Open = 3,
+    };
+
+    struct FNetworkObjectInfo {
+        AActor* actor;
+        double NextUpdateTime;
+        double LastNetReplicateTime;
+        float OptimalNetUpdateDelta;
+    };
+
+    bool ServerReplicateActors_PrepConnections() {
+        bool bFoundReadyConnection = false;
+
+        for (int32_t ConnIdx = 0; ConnIdx < GetNetDriver()->ClientConnections.Count(); ConnIdx++) {
+            UNetConnection* Connection = GetNetDriver()->ClientConnections[ConnIdx];
+
+            AActor* OwningActor = Connection->OwningActor;
+
+
+            if (OwningActor != nullptr && (*(EConnectionState*)((__int64)Connection + 0x12C)) == USOCK_Open) {
+                bFoundReadyConnection = true;
+
+                Connection->ViewTarget = Connection->PlayerController ? Connection->PlayerController->GetViewTarget() : OwningActor;
+            }
+            else {
+                Connection->ViewTarget = nullptr;
+            }
+        }
+
+        return bFoundReadyConnection;
+    }
+
+
+    int* GetTickCountPtr(UNetConnection* connection) {
+
+        return (int*)((__int64)connection + 0x204);
+    }
+
+
+    struct ActorInfo {
+        AActor* actor;
+        UActorChannel* channel;
+    };
+
+    struct ConnectionChannels {
+        UNetConnection* connection;
+        std::vector<UActorChannel*>* channels;
+    };
+
+    static std::vector<ConnectionChannels> connectionChannels = std::vector<ConnectionChannels>();
+
+    std::vector<ActorInfo> ServerReplicateActors_PrioritizeActors(UNetConnection* connection, std::vector<FNetworkObjectInfo*> ConsiderList) {
+        std::vector<ActorInfo> out = std::vector<ActorInfo>();
+
+        static int NetTag = 0;
+
+        NetTag++;
+        (*GetTickCountPtr(connection))++;
+
+        int FinalSortedCount = 0;
+        int DeletedCount = 0;
+
+        const int MaxSortedActors = ConsiderList.size();
+
+        if (MaxSortedActors > 0) {
+
+            for (FNetworkObjectInfo* actorInfo : ConsiderList) {
+                AActor* Actor = actorInfo->actor;
+
+                UActorChannel* Channel = nullptr;
+
+
+                for (ConnectionChannels ccs : connectionChannels) {
+                    if (ccs.connection == connection) {
+                        for (UActorChannel* ch : *ccs.channels) {
+                            if (ch->Actor == Actor) {
+                                Channel = ch;
+                                break;
+                            }
+                        }
+                        break;
+                    }
+                }
+                
+
+                if (Actor->NetTag != NetTag) {
+                    Actor->NetTag = NetTag;
+                }
+
+
+                ActorInfo newActorInfo = ActorInfo();
+
+                newActorInfo.actor = Actor;
+                newActorInfo.channel = Channel;
+
+                out.push_back(newActorInfo);
+            }
+        }
+
+        return out;
+    }
+
+    int ServerReplicateActors_ProcessPrioritizedActors(UNetConnection* Connection, std::vector<ActorInfo> PriorityActors, int& OutUpdated) {
+
+        int ActorUpdatesThisConnection = 0;
+        int ActorUpdatesThisConnectionSent = 0;
+        int FinalRelevantCount = 0;
+
+        bool pcFound = false;
+
+        for (int j = 0; j < PriorityActors.size(); j++) {
+            UActorChannel* Channel = PriorityActors[j].channel;
+
+            if (!Channel || Channel->Actor) {
+                AActor* Actor = PriorityActors[j].actor;
+
+                static UClass* gamePC = nullptr;
+
+                if (!gamePC)
+                    gamePC = AOrionPlayerController_Game::StaticClass();
+
+                if (Actor != Connection->PlayerController && Actor->Class == gamePC) {
+                    continue;
+                }
+                
+                FinalRelevantCount++;
+
+                if (Channel == nullptr && Actor) {
+                    Channel = reinterpret_cast<UActorChannel * (*)(UNetConnection*, EChannelType, bool, int)>(Globals::ModuleBase + PLOffsets::CREATE_CHANNEL)(Connection, EChannelType::CHTYPE_Actor, true, -1);
+
+                    if (Channel) {
+                        reinterpret_cast<void(*)(UActorChannel*, AActor*)>(Globals::ModuleBase + PLOffsets::SET_CHANNEL_ACTOR)(Channel, Actor);
+
+                        bool found = false;
+                        for (ConnectionChannels ccs : connectionChannels) {
+                            if (ccs.connection == Connection) {
+                                found = true;
+                                ccs.channels->push_back(Channel);
+                            }
+                        }
+
+                        if (!found) {
+                            connectionChannels.push_back(ConnectionChannels());
+                            connectionChannels.back().channels = new std::vector<UActorChannel*>();
+                            connectionChannels.back().channels->push_back(Channel);
+                            connectionChannels.back().connection = Connection;
+                        }
+
+                    }
+                }
+
+                if (Channel && Channel->Actor) {
+
+                       if ((*reinterpret_cast<bool(**)(UNetConnection*, int)>(Globals::ModuleBase + PLOffsets::IS_NET_READY_PTR_PTR))(Connection, 0)){
+                        if (reinterpret_cast<bool(*)(UActorChannel*)>(Globals::ModuleBase + PLOffsets::REPLICATE_ACTOR)(Channel)) {
+                            
+                            ActorUpdatesThisConnectionSent++;
+
+                        }
+                        else {
+                        }
+
+                        ActorUpdatesThisConnection++;
+                        OutUpdated++;
+                    }
+                    else {
+                        reinterpret_cast<void(*)(AActor*)>(Globals::ModuleBase + PLOffsets::FORCE_NET_UPDATE)(Actor);
+                    }
+
+
+                    if (!(*reinterpret_cast<bool(**)(UNetConnection*, int)>(Globals::ModuleBase + PLOffsets::IS_NET_READY_PTR_PTR))(Connection, 0)) {
+                        std::cout << "Bailing on processing actors..." << std::endl;
+                        return j;
+                    }
+                }
+            }
+        }
+    }
+
+    void ServerReplicateActors() {
+        if (!GetNetDriver()) {
+            Globals::GetGWorld()->NetDriver = SDKUtils::GetLastOfType<UIpNetDriver>();
+        }
+
+        if (GetNetDriver()->ClientConnections.Count() == 0) {
+            return;
+        }
+
+
+        (*(__int64*)((__int64)GetNetDriver() + 0x2D8))++;
+
+        bool shouldTick = ServerReplicateActors_PrepConnections();
+
+        if (!shouldTick) {
+            return;
+        }
+
+        std::vector<FNetworkObjectInfo*> ConsiderList = std::vector<FNetworkObjectInfo*>();
+
+        TArray<AActor*>* actors = (TArray<AActor*>*)EngineLogic::Malloc(sizeof(TArray<AActor*>), 0);
+
+        Globals::GetGameplayStatics()->GetAllActorsOfClass(Globals::GetGWorld(), AActor::StaticClass(), actors);
+
+        for (int i = 0; i < actors->Count(); i++) {
+
+            AActor* actor = actors->Data[i];
+
+            if (!actor)
+                continue;
+
+            if (actor->RemoteRole == ENetRole::ROLE_None) {
+                continue;
+            }
+
+
+            if (reinterpret_cast<bool(*)(AActor*)>(Globals::ModuleBase + PLOffsets::IS_PENDING_KILL_PENDING)(actor))
+                continue;
+
+            FNetworkObjectInfo* newConsider = (FNetworkObjectInfo*)EngineLogic::Malloc(sizeof(FNetworkObjectInfo), 0);
+            newConsider->actor = actor;
+            newConsider->LastNetReplicateTime = 0;
+            newConsider->NextUpdateTime = 0;
+            newConsider->OptimalNetUpdateDelta = 1.0f;
+
+            reinterpret_cast<void(*)(AActor*, UNetDriver*)>(Globals::ModuleBase + PLOffsets::CALL_PRE_REPLICATION)(actor, GetNetDriver());
+
+            ConsiderList.push_back(newConsider);
+        }
+
+        
+
+        for (int i = 0; i < GetNetDriver()->ClientConnections.Count(); i++) {
+            UNetConnection* Connection = GetNetDriver()->ClientConnections[i];
+            
+
+            AActor* OwningActor = Connection->OwningActor;
+
+
+            if (!(OwningActor != nullptr && (*(EConnectionState*)((__int64)Connection + 0x12C)) == USOCK_Open && (Connection->Driver->Time - Connection->LastReceiveTime < 1.5f))) {
+                continue;
+            }
+
+            if (Connection->PlayerController) {
+                reinterpret_cast<void(*)(APlayerController*)>(Globals::ModuleBase + PLOffsets::SEND_CLIENT_ADJUSTMENT)(Connection->PlayerController);
+            }
+
+            
+
+            std::vector<ActorInfo> aInfos = ServerReplicateActors_PrioritizeActors(Connection, ConsiderList);
+
+            int Updated = 0;
+
+            int LastProcessedActor = ServerReplicateActors_ProcessPrioritizedActors(Connection, aInfos, Updated);
+
+        }
+        for (FNetworkObjectInfo* _ci : ConsiderList)
+            if (_ci) EngineLogic::Free(_ci);
+        ConsiderList.clear();
+        if (actors) {
+            if (actors->Data) EngineLogic::Free(actors->Data);
+            EngineLogic::Free(actors);
+        }
+    }
+}
+
+namespace Hooking {
+    bool procingCurrentFuncPtrs = false;
+
+    static std::vector<void*> FuncPtrsToProcInGameThread = std::vector<void*>();
+
+    void ProcInGameThread(void* ptr) {
+        FuncPtrsToProcInGameThread.push_back(ptr);
+    }
+
+
+
+    void* origProcessEvent = nullptr;
+
+    static const bool COMPARE_MATERIALIZED = false;
+
+
+    __int64 SafeGrantItemAbilities(void* card) {
+        __try {
+            return reinterpret_cast<__int64(*)(void*)>(Globals::ModuleBase + 0x6D49A0)(card);
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER) {
+            return 0;
+        }
+    }
+
+    bool SafeActDiag(void* object, int slot, uintptr_t* outCard, int* outHandles, int* outSlotNum, int* outCanAct) {
+        __try {
+            uintptr_t pc = reinterpret_cast<uintptr_t>(object);
+            uintptr_t v2 = *reinterpret_cast<uintptr_t*>(pc + 0x320);
+            if (!v2) return false;
+            uintptr_t comp = *reinterpret_cast<uintptr_t*>(v2 + 0xE58);
+            if (!comp) return false;
+            int slotNum = *reinterpret_cast<int*>(comp + 0x118);
+            uintptr_t slotsData = *reinterpret_cast<uintptr_t*>(comp + 0x110);
+            uintptr_t card = (slot >= 0 && slot < slotNum && slotsData)
+                ? *reinterpret_cast<uintptr_t*>(slotsData + 8 * slot) : 0;
+            *outCard = card;
+            *outHandles = card ? *reinterpret_cast<int*>(card + 0x30) : -1;
+            *outSlotNum = slotNum;
+            *outCanAct = (slot >= 0 && slot < slotNum)
+                ? (int)reinterpret_cast<char(*)(void*, int)>(Globals::ModuleBase + 0x6D2990)(reinterpret_cast<void*>(comp), slot)
+                : -1;
+            return true;
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER) {
+            return false;
+        }
+    }
+
+    int SafeActTrace(uintptr_t card, uintptr_t* outAbils, int* outLevels, int maxN, uintptr_t* outGrantedGA = nullptr, uintptr_t* outSourceObj = nullptr) {
+        __try {
+            int extra = (int)(unsigned char)reinterpret_cast<char(*)(void*)>(Globals::ModuleBase + 0x6E0160)(reinterpret_cast<void*>(card));
+            uintptr_t outer = *reinterpret_cast<uintptr_t*>(card + 0x20);
+            uintptr_t owner = outer ? reinterpret_cast<uintptr_t(*)(void*)>(Globals::ModuleBase + 0x6C8E00)(reinterpret_cast<void*>(outer)) : 0;
+            uintptr_t asc = 0;
+            if (owner) {
+                void** vt = *reinterpret_cast<void***>(owner);
+                asc = reinterpret_cast<uintptr_t(*)(void*)>(vt[236])(reinterpret_cast<void*>(owner));
+            }
+            int num = *reinterpret_cast<int*>(card + 0x30);
+            uintptr_t data = *reinterpret_cast<uintptr_t*>(card + 0x28);
+            int n = 0;
+            for (int i = 0; i < num && n < maxN; i++) {
+                int handle = *reinterpret_cast<int*>(data + 16 * i + 8);
+                uintptr_t spec = (asc && handle) ? reinterpret_cast<uintptr_t(*)(uintptr_t, int)>(Globals::ModuleBase + 0x316CBA0)(asc, handle) : 0;
+                uintptr_t v11 = spec ? reinterpret_cast<uintptr_t(*)(uintptr_t)>(Globals::ModuleBase + 0x310A650)(spec) : 0;
+                uintptr_t v12 = v11 ? reinterpret_cast<uintptr_t(*)(uintptr_t)>(Globals::ModuleBase + 0x6C9180)(v11) : 0;
+                int level = spec ? *reinterpret_cast<int*>(spec + 0x18) : -1;
+                int am = -1, e9 = -1, owv = -1;
+                if (v12) {
+                    owv = (int)(unsigned char)reinterpret_cast<char(*)(void*)>(Globals::ModuleBase + 0xEC9BC0)(reinterpret_cast<void*>(v12 + 0xB70));
+                    uintptr_t cfg = reinterpret_cast<uintptr_t(*)(void*)>(Globals::ModuleBase + 0x985F40)(reinterpret_cast<void*>(v12 + 0xB78));
+                    if (cfg) am = *reinterpret_cast<unsigned char*>(cfg + 112);
+                    e9 = (int)(unsigned char)reinterpret_cast<char(*)(void*)>(Globals::ModuleBase + 0x3E9210)(reinterpret_cast<void*>(v12));
+                }
+                if (v12) {
+                    uintptr_t itm = reinterpret_cast<uintptr_t(*)(void*)>(Globals::ModuleBase + 0xEC22F0)(reinterpret_cast<void*>(v12 + 0xB70));
+                    uintptr_t ge = itm ? reinterpret_cast<uintptr_t(*)(uintptr_t, void*, void*)>(Globals::ModuleBase + 0x6D5320)(itm, reinterpret_cast<void*>(v12 + 0xB78), reinterpret_cast<void*>(v12 + 0x578)) : 0;
+                    int gah = ge ? *reinterpret_cast<int*>(ge + 0xC) : -1;
+                    uintptr_t gSpec = (asc && gah > 0) ? reinterpret_cast<uintptr_t(*)(uintptr_t, int)>(Globals::ModuleBase + 0x316CBA0)(asc, gah) : 0;
+                    uintptr_t gGA = gSpec ? *reinterpret_cast<uintptr_t*>(gSpec + 0x10) : 0;
+                    uintptr_t v13asc = itm ? reinterpret_cast<uintptr_t(*)(uintptr_t)>(Globals::ModuleBase + 0x6DC7B0)(itm) : 0;
+                    uintptr_t specOnV13 = (v13asc && gah > 0) ? reinterpret_cast<uintptr_t(*)(uintptr_t, int)>(Globals::ModuleBase + 0x316CBA0)(v13asc, gah) : 0;
+                    if (gSpec) {
+                        if (outSourceObj) outSourceObj[n] = *reinterpret_cast<uintptr_t*>(gSpec + 0x20);
+                    }
+                    if (gGA && gah > 0) {
+                        uintptr_t actorInfo = *reinterpret_cast<uintptr_t*>(asc + 0xC80);
+                        void** gvt = *reinterpret_cast<void***>(gGA);
+                        unsigned char failTags[64] = { 0 };
+                        int canAct = (int)(unsigned char)reinterpret_cast<char(*)(void*, uint32_t, uintptr_t, void*, void*, void*)>(gvt[71])(
+                            reinterpret_cast<void*>(gGA), (uint32_t)gah, actorInfo, nullptr, nullptr, failTags);
+                        int failNum = *reinterpret_cast<int*>(failTags + 0x8);
+                        int gaCost = (int)(unsigned char)reinterpret_cast<char(*)(void*, uint32_t, uintptr_t, void*)>(gvt[117])(
+                            reinterpret_cast<void*>(gGA), (uint32_t)gah, actorInfo, nullptr);
+                        int gaCd = (int)(unsigned char)reinterpret_cast<char(*)(void*, uint32_t, uintptr_t, void*)>(gvt[119])(
+                            reinterpret_cast<void*>(gGA), (uint32_t)gah, actorInfo, nullptr);
+                        {
+                            int isLoc   = (int)(unsigned char)reinterpret_cast<char(*)(uintptr_t)>(Globals::ModuleBase + 0x3112DA0)(actorInfo);
+                            int pcValid = (int)(unsigned char)reinterpret_cast<char(*)(void*)>(Globals::ModuleBase + 0xEC9BC0)(reinterpret_cast<void*>(actorInfo + 0x18));
+                            int netAuth = (int)(unsigned char)reinterpret_cast<char(*)(uintptr_t)>(Globals::ModuleBase + 0x3112E60)(actorInfo);
+                            int netPol  = (int)*reinterpret_cast<uint8_t*>(gGA + 0x378);
+                        }
+                        if (!COMPARE_MATERIALIZED && canAct && v13asc) {
+                            char predKey[24] = { 0 };
+                            int actRet = (int)(unsigned char)reinterpret_cast<char(*)(uintptr_t, uint32_t, void*, void*, void*, void*)>(
+                                Globals::ModuleBase + 0x3177E80)(v13asc, (uint32_t)gah, predKey, nullptr, nullptr, nullptr);
+                        }
+                    }
+                    if (outGrantedGA) outGrantedGA[n] = gGA;
+                    int g2 = ge ? (int)(unsigned char)reinterpret_cast<char(*)(uintptr_t)>(Globals::ModuleBase + 0x3112C20)(ge) : -1;
+                    void** abilVt = *reinterpret_cast<void***>(v12);
+                    {
+                        uint32_t a2h = *reinterpret_cast<uint32_t*>(v12 + 0x578);
+                        uintptr_t a3ai = *reinterpret_cast<uintptr_t*>(v12 + 0x570);
+                        int costOk = (int)(unsigned char)reinterpret_cast<char(*)(void*, uint32_t, uintptr_t, void*)>(abilVt[117])(reinterpret_cast<void*>(v12), a2h, a3ai, nullptr);
+                        int cdOk = (int)(unsigned char)reinterpret_cast<char(*)(void*, uint32_t, uintptr_t, void*)>(abilVt[119])(reinterpret_cast<void*>(v12), a2h, a3ai, nullptr);
+                    }
+                }
+                outAbils[n] = v12; outLevels[n] = level; n++;
+            }
+            return n;
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER) {
+            return -1;
+        }
+    }
+
+    int SafeApplyBotGE(void* botChar, void* geClass, void* applyFn) {
+        __try {
+            if (!botChar || !geClass || !applyFn) return -999;
+            uintptr_t asc = *reinterpret_cast<uintptr_t*>(reinterpret_cast<uintptr_t>(botChar) + 0x0780);
+            if (!asc) return -997;
+            unsigned char params[0x40] = { 0 };
+            *reinterpret_cast<void**>(params + 0x0) = geClass;
+            *reinterpret_cast<float*>(params + 0x8) = 1.0f;
+            reinterpret_cast<void* (__thiscall*)(void*, void*, void*)>(origProcessEvent)(
+                reinterpret_cast<void*>(asc), applyFn, params);
+            return *reinterpret_cast<int*>(params + 0x28);
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER) { return -998; }
+    }
+
+    void SafeSetSpecLevels(uintptr_t card, int level) {
+        __try {
+            uintptr_t outer = *reinterpret_cast<uintptr_t*>(card + 0x20);
+            uintptr_t owner = outer ? reinterpret_cast<uintptr_t(*)(void*)>(Globals::ModuleBase + 0x6C8E00)(reinterpret_cast<void*>(outer)) : 0;
+            uintptr_t asc = 0;
+            if (owner) {
+                void** vt = *reinterpret_cast<void***>(owner);
+                asc = reinterpret_cast<uintptr_t(*)(void*)>(vt[236])(reinterpret_cast<void*>(owner));
+            }
+            if (!asc) return;
+            int num = *reinterpret_cast<int*>(card + 0x30);
+            uintptr_t data = *reinterpret_cast<uintptr_t*>(card + 0x28);
+            for (int i = 0; i < num; i++) {
+                int handle = *reinterpret_cast<int*>(data + 16 * i + 8);
+                uintptr_t spec = handle ? reinterpret_cast<uintptr_t(*)(uintptr_t, int)>(Globals::ModuleBase + 0x316CBA0)(asc, handle) : 0;
+                if (spec) *reinterpret_cast<int*>(spec + 0x18) = level;
+            }
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER) {}
+    }
+
+    void SafeFixCardGASpec(uintptr_t card) {
+        __try {
+            uintptr_t outer = *reinterpret_cast<uintptr_t*>(card + 0x20);
+            uintptr_t owner = outer ? reinterpret_cast<uintptr_t(*)(void*)>(Globals::ModuleBase + 0x6C8E00)(reinterpret_cast<void*>(outer)) : 0;
+            uintptr_t asc = 0;
+            if (owner) {
+                void** vt = *reinterpret_cast<void***>(owner);
+                asc = reinterpret_cast<uintptr_t(*)(void*)>(vt[236])(reinterpret_cast<void*>(owner));
+            }
+            if (!asc) return;
+            uintptr_t data = *reinterpret_cast<uintptr_t*>(card + 0x28);
+            int num = *reinterpret_cast<int*>(card + 0x30);
+            if (!data || num <= 0) return;
+            for (int i = 0; i < num; i++) {
+                int gaHandle = *reinterpret_cast<int*>(data + 16 * i + 0xC);
+                uintptr_t gaSpec = (gaHandle > 0) ? reinterpret_cast<uintptr_t(*)(uintptr_t, int)>(Globals::ModuleBase + 0x316CBA0)(asc, gaHandle) : 0;
+                if (gaSpec && *reinterpret_cast<int*>(gaSpec + 0x18) == 0) {
+                    *reinterpret_cast<int*>(gaSpec + 0x18) = 11;
+                    *reinterpret_cast<uintptr_t*>(gaSpec + 0x20) = card;
+                }
+            }
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER) {}
+    }
+
+    int SafeApplyKeywordGEs(uintptr_t card, void* applyFn) {
+        __try {
+            uintptr_t outer = *reinterpret_cast<uintptr_t*>(card + 0x20);
+            uintptr_t owner = outer ? reinterpret_cast<uintptr_t(*)(void*)>(Globals::ModuleBase + 0x6C8E00)(reinterpret_cast<void*>(outer)) : 0;
+            uintptr_t asc = 0;
+            if (owner) { void** vt = *reinterpret_cast<void***>(owner); asc = reinterpret_cast<uintptr_t(*)(void*)>(vt[236])(reinterpret_cast<void*>(owner)); }
+            if (!asc || !applyFn) return -1;
+            uintptr_t data = *reinterpret_cast<uintptr_t*>(card + 0x28);
+            int num = *reinterpret_cast<int*>(card + 0x30);
+            if (!data || num <= 0) return 0;
+            void* applied[16] = { 0 }; int nApplied = 0;
+            for (int i = 0; i < num && i < 16; i++) {
+                uintptr_t config = reinterpret_cast<uintptr_t(*)(uintptr_t)>(Globals::ModuleBase + 0x985F40)(data + 16 * i + 0x00);
+                if (!config || IsBadReadPtr(reinterpret_cast<void*>(config + 0x130), 8)) continue;
+                void* geClass = *reinterpret_cast<void**>(config + 0x130);
+                if (!geClass) continue;
+                bool dup = false;
+                for (int j = 0; j < nApplied; j++) if (applied[j] == geClass) { dup = true; break; }
+                if (dup) continue;
+                if (nApplied < 16) applied[nApplied++] = geClass;
+                unsigned char params[0x40] = { 0 };
+                *reinterpret_cast<void**>(params + 0x0) = geClass;
+                *reinterpret_cast<float*>(params + 0x8) = 11.0f;
+                reinterpret_cast<void* (__thiscall*)(void*, void*, void*)>(origProcessEvent)(
+                    reinterpret_cast<void*>(asc), applyFn, params);
+            }
+            return nApplied;
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER) { return -2; }
+    }
+
+    bool IsValidUE4Object(void* Ptr) {
+        if (!Ptr) return false;
+
+        uintptr_t Addr = reinterpret_cast<uintptr_t>(Ptr);
+        if (Addr < 0x10000ULL || Addr > 0x00007FFFFFFFFFFFULL) return false;
+
+        if (IsBadReadPtr(Ptr, 0x10)) return false;
+
+        return true;
+    }
+
+    bool SafeDoDamagePipeline(UOrionDamage* dmg, void* params) {
+        __try {
+            Params::GameplayEffectExecutionCalculation_Execute* dmgParams =
+                reinterpret_cast<Params::GameplayEffectExecutionCalculation_Execute*>(params);
+
+            if (!dmgParams) return false;
+            if (!dmgParams->ExecutionParams.OwningSpec) return false;
+
+            auto* targetASC = dmgParams->ExecutionParams.TargetAbilitySystemComponent.Get();
+            if (!targetASC) return false;
+            if (!targetASC->AvatarActor) return false;
+
+            DamageCalculations::DoDamagePipeline(dmg, dmgParams);
+            return true;
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER) {
+            return false;
+        }
+    }
+
+    int LogEngineTickCrash(EXCEPTION_POINTERS* ep, unsigned long long tick, size_t shadowCount) {
+        DWORD code = ep->ExceptionRecord->ExceptionCode;
+        void* pc = ep->ExceptionRecord->ExceptionAddress;
+        void* faultAddr = nullptr;
+        unsigned long long readWrite = 0;
+        if (code == EXCEPTION_ACCESS_VIOLATION && ep->ExceptionRecord->NumberParameters >= 2) {
+            readWrite = (unsigned long long)ep->ExceptionRecord->ExceptionInformation[0];
+            faultAddr = (void*)ep->ExceptionRecord->ExceptionInformation[1];
+        }
+
+        unsigned long long rva = 0;
+        if (Globals::ModuleBase != 0 && (uintptr_t)pc >= Globals::ModuleBase) {
+            rva = (unsigned long long)((uintptr_t)pc - Globals::ModuleBase);
+        }
+
+        printf("[SEH-ENGINE-TICK-CRASH] Code=0x%08lX PC=%p RVA=0x%llX ModBase=0x%llX FaultAddr=%p RW=%llu Tick=%llu Shadows=%zu\n",
+            code, pc, rva, (unsigned long long)Globals::ModuleBase, faultAddr, readWrite, tick, shadowCount);
+        fflush(stdout);
+
+        FILE* f = nullptr;
+        fopen_s(&f, "seh_crash.txt", "ab");
+        if (f) {
+            SYSTEMTIME st;
+            GetLocalTime(&st);
+            fprintf(f, "[%04u-%02u-%02u %02u:%02u:%02u.%03u] [SEH-ENGINE-TICK-CRASH] "
+                "Code=0x%08lX PC=%p RVA=0x%llX ModBase=0x%llX FaultAddr=%p RW=%llu Tick=%llu Shadows=%zu\n",
+                st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute, st.wSecond, st.wMilliseconds,
+                code, pc, rva, (unsigned long long)Globals::ModuleBase, faultAddr, readWrite, tick, shadowCount);
+            fflush(f);
+            fclose(f);
+        }
+
+        {
+            CONTEXT* ctx = ep->ContextRecord;
+            char modName[MAX_PATH]; modName[0] = 0;
+            HMODULE hMod = nullptr;
+            unsigned long long pcModBase = 0, pcRva = 0;
+            if (GetModuleHandleExA(0x4 | 0x2,
+                                   (LPCSTR)pc, &hMod) && hMod) {
+                GetModuleFileNameA(hMod, modName, MAX_PATH);
+                pcModBase = (unsigned long long)hMod;
+                pcRva = (unsigned long long)((uintptr_t)pc - (uintptr_t)hMod);
+            }
+            printf("[SEH-DIAG] PC-Module='%s' PcModBase=0x%llX PcRVA=0x%llX\n",
+                   modName[0] ? modName : "<UNKNOWN/garbage>", pcModBase, pcRva);
+            if (ctx) {
+                printf("[SEH-DIAG] RIP=%p RSP=%p RBP=%p RAX=%p RBX=%p RCX=%p RDX=%p RSI=%p RDI=%p\n",
+                       (void*)ctx->Rip,(void*)ctx->Rsp,(void*)ctx->Rbp,(void*)ctx->Rax,(void*)ctx->Rbx,
+                       (void*)ctx->Rcx,(void*)ctx->Rdx,(void*)ctx->Rsi,(void*)ctx->Rdi);
+                printf("[SEH-DIAG] R8=%p R9=%p R10=%p R11=%p R12=%p R13=%p R14=%p R15=%p\n",
+                       (void*)ctx->R8,(void*)ctx->R9,(void*)ctx->R10,(void*)ctx->R11,
+                       (void*)ctx->R12,(void*)ctx->R13,(void*)ctx->R14,(void*)ctx->R15);
+                uintptr_t* sp = (uintptr_t*)ctx->Rsp;
+                int hits = 0;
+                for (int i = 0; i < 400 && hits < 24; ++i) {
+                    if (IsBadReadPtr(sp + i, sizeof(uintptr_t))) break;
+                    uintptr_t val = sp[i];
+                    if (val < 0x10000) continue;
+                    HMODULE hm = nullptr;
+                    if (GetModuleHandleExA(0x4 | 0x2, (LPCSTR)val, &hm) && hm) {
+                        char mn[MAX_PATH]; mn[0] = 0;
+                        GetModuleFileNameA(hm, mn, MAX_PATH);
+                        const char* base = mn;
+                        for (char* p = mn; *p; ++p) if (*p == '\\') base = p + 1;
+                        printf("[SEH-STACK] +0x%X ret=%p mod=%s rva=0x%llX\n",
+                               (unsigned)(i * 8), (void*)val, base,
+                               (unsigned long long)((uintptr_t)val - (uintptr_t)hm));
+                        hits++;
+                    }
+                }
+            }
+            fflush(stdout);
+            FILE* f2 = nullptr;
+            fopen_s(&f2, "seh_crash.txt", "ab");
+            if (f2) {
+                fprintf(f2, "[SEH-DIAG] PC-Module='%s' PcRVA=0x%llX RIP=%p RAX=%p RCX=%p RDX=%p R8=%p R9=%p\n",
+                        modName[0] ? modName : "<garbage>", pcRva, ctx ? (void*)ctx->Rip : 0,
+                        ctx ? (void*)ctx->Rax : 0, ctx ? (void*)ctx->Rcx : 0, ctx ? (void*)ctx->Rdx : 0,
+                        ctx ? (void*)ctx->R8 : 0, ctx ? (void*)ctx->R9 : 0);
+                fflush(f2); fclose(f2);
+            }
+        }
+
+        return EXCEPTION_CONTINUE_SEARCH;
+    }
+
+    int SafeOrigGameEngineTick(
+        void* origFnPtr,
+        UGameEngine* engine,
+        float deltatime,
+        char a3,
+        unsigned long long tick,
+        size_t shadowCount)
+    {
+        __try {
+            return reinterpret_cast<int(*)(UGameEngine*, float, char)>(origFnPtr)(engine, deltatime, a3);
+        }
+        __except (LogEngineTickCrash(GetExceptionInformation(), tick, shadowCount)) {
+            return 0;
+        }
+    }
+
+
+    static std::map<AOrionAIBot*, int> GBotRoles;
+    volatile long long g_diagTickCounter = 0;
+    int32_t   g_lastSSRTHandle = -1;
+    int16_t   g_lastSSRTPredKey = -1;
+
+    struct S13LiveLock {
+        void*     asc;
+        int32_t   handle;
+        int32_t   predkey;
+        int32_t   actorIdx;
+        uint32_t  dstOff;
+        long long expiryTick;
+        int       writes;
+        std::string ab;
+    };
+    std::vector<S13LiveLock> g_liveLocks;
+
+
+    inline uintptr_t s13_RefetchTd0(void* asc, int32_t handle, int32_t predkey) {
+        if (!asc || IsBadReadPtr(asc, 0x584)) return 0;
+        uintptr_t a = reinterpret_cast<uintptr_t>(asc);
+        uintptr_t base = *reinterpret_cast<uintptr_t*>(a + 0x538);
+        if (!base || IsBadReadPtr(reinterpret_cast<void*>(base), 8)) return 0;
+        uint32_t hashSize = *reinterpret_cast<uint32_t*>(a + 0x580);
+        if (hashSize == 0) return 0;
+        uintptr_t hashPtr = *reinterpret_cast<uintptr_t*>(a + 0x578);
+        if (!hashPtr) hashPtr = a + 0x570;
+        uint32_t hi = (hashSize - 1) & static_cast<uint32_t>(handle ^ predkey);
+        if (IsBadReadPtr(reinterpret_cast<void*>(hashPtr + 4ull * hi), 4)) return 0;
+        int32_t idx = *reinterpret_cast<int32_t*>(hashPtr + 4ull * hi);
+        for (int guard = 0; idx >= 0 && guard < 256; ++guard) {
+            uintptr_t entry = base + 1872ll * idx;
+            if (IsBadReadPtr(reinterpret_cast<void*>(entry), 0x30)) return 0;
+            if (*reinterpret_cast<int32_t*>(entry + 0) == handle
+                && *reinterpret_cast<int32_t*>(entry + 4) == predkey) {
+                if (*reinterpret_cast<int32_t*>(entry + 0x28) <= 0) return 0;
+                uintptr_t h = entry + 0x10;
+                uintptr_t arr = (!IsBadReadPtr(reinterpret_cast<void*>(h + 0x10), 8))
+                              ? *reinterpret_cast<uintptr_t*>(h + 0x10) : 0;
+                uintptr_t eb = arr ? arr : h;
+                if (IsBadReadPtr(reinterpret_cast<void*>(eb), 8)) return 0;
+                return *reinterpret_cast<uintptr_t*>(eb);
+            }
+            if (IsBadReadPtr(reinterpret_cast<void*>(entry + 0x740), 4)) return 0;
+            idx = *reinterpret_cast<int32_t*>(entry + 0x740);
+        }
+        return 0;
+    }
+
+    static std::vector<class AOrionAIBot*> ShadowBots;
+
+    void* ProcessEventHook(UObject* object, UFunction* function, void* params) {
+
+        static UFunction* onAllMontagesEndedFunc = nullptr;
+        static UFunction* onFinishedDyingFunc = nullptr;
+
+        if (!onAllMontagesEndedFunc)
+            onAllMontagesEndedFunc = UObject::FindObject<UFunction>(
+                "Function OrionGame.OrionChar.OnAllMontageInstancesEnded");
+
+        if (!onFinishedDyingFunc)
+            onFinishedDyingFunc = UObject::FindObject<UFunction>(
+                "Function OrionGame.OrionChar.OnFinishedDying");
+
+        if (function == onAllMontagesEndedFunc) {
+            if (object->IsA(AOrionCharHero::StaticClass()) &&
+                object->GetName().find("Decoy") == std::string::npos) {
+                uint8_t flagByte = *reinterpret_cast<uint8_t*>(
+                    reinterpret_cast<uintptr_t>(object) + 0x09E8);
+                bool bIsDying = (flagByte >> 2) & 1;
+
+                if (!bIsDying) {
+                    return nullptr;
+                }
+            }
+        }
+
+        if (function == onFinishedDyingFunc) {
+            if (object->IsA(AOrionCharHero::StaticClass()) &&
+                object->GetName().find("Decoy") == std::string::npos) {
+                uint8_t flagByte = *reinterpret_cast<uint8_t*>(
+                    reinterpret_cast<uintptr_t>(object) + 0x09E8);
+                bool bIsDying = (flagByte >> 2) & 1;
+
+                if (!bIsDying) {
+                    return nullptr;
+                }
+            }
+        }
+
+        if (!procingCurrentFuncPtrs && FuncPtrsToProcInGameThread.size() > 0) {
+            procingCurrentFuncPtrs = true;
+            while (FuncPtrsToProcInGameThread.size() > 0) {
+                void* funcPtr = FuncPtrsToProcInGameThread.back();
+                reinterpret_cast<void(*)()>(funcPtr)();
+                FuncPtrsToProcInGameThread.pop_back();
+            }
+            procingCurrentFuncPtrs = false;
+        }
+
+
+        static UFunction* internalServerTryActiveAbilityFunction = nullptr;
+        static UFunction* internalServerTryActiveAbilityFunctionWithEventData = nullptr;
+        static UFunction* serverSetReplicatedTargetDataFunction = nullptr;
+        static UFunction* serverSetInputPressedFunc = nullptr;
+        static UFunction* serverSetInputReleasedFunc = nullptr;
+        static UFunction* serverSetReplicatedEventFunc = nullptr;
+
+        static UClass* waitTargetDataClass = nullptr;
+        static UClass* waitInputPressClass = nullptr;
+        static UClass* waitInputReleaseClass = nullptr;
+
+        if (!internalServerTryActiveAbilityFunction)
+            internalServerTryActiveAbilityFunction = UObject::FindObject<UFunction>(
+                "Function GameplayAbilities.AbilitySystemComponent.ServerTryActivateAbility");
+
+        if (!internalServerTryActiveAbilityFunctionWithEventData)
+            internalServerTryActiveAbilityFunctionWithEventData = UObject::FindObject<UFunction>(
+                "Function GameplayAbilities.AbilitySystemComponent.ServerTryActivateAbilityWithEventData");
+
+        if (!serverSetReplicatedTargetDataFunction)
+            serverSetReplicatedTargetDataFunction = UObject::FindObject<UFunction>(
+                "Function GameplayAbilities.AbilitySystemComponent.ServerSetReplicatedTargetData");
+
+        if (!serverSetInputPressedFunc)
+            serverSetInputPressedFunc = UObject::FindObject<UFunction>(
+                "Function GameplayAbilities.AbilitySystemComponent.ServerSetInputPressed");
+
+        if (!serverSetInputReleasedFunc)
+            serverSetInputReleasedFunc = UObject::FindObject<UFunction>(
+                "Function GameplayAbilities.AbilitySystemComponent.ServerSetInputReleased");
+
+        if (!serverSetReplicatedEventFunc)
+            serverSetReplicatedEventFunc = UObject::FindObject<UFunction>(
+                "Function GameplayAbilities.AbilitySystemComponent.ServerSetReplicatedEvent");
+
+        if (!waitTargetDataClass)
+            waitTargetDataClass = UObject::FindClass("Class GameplayAbilities.AbilityTask_WaitTargetData");
+        if (!waitInputPressClass)
+            waitInputPressClass = UObject::FindClass("Class GameplayAbilities.AbilityTask_WaitInputPress");
+        if (!waitInputReleaseClass)
+            waitInputReleaseClass = UObject::FindClass("Class GameplayAbilities.AbilityTask_WaitInputRelease");
+
+        {
+            static UFunction* factoryWaitInputPress = nullptr;
+            static UFunction* factoryWaitInputRelease = nullptr;
+            static UFunction* factoryWaitTargetData = nullptr;
+            static UFunction* factoryWaitInputPressWithState = nullptr;
+
+            if (!factoryWaitInputPress)
+                factoryWaitInputPress = UObject::FindObject<UFunction>(
+                    "Function GameplayAbilities.AbilityTask_WaitInputPress.WaitInputPress");
+            if (!factoryWaitInputRelease)
+                factoryWaitInputRelease = UObject::FindObject<UFunction>(
+                    "Function GameplayAbilities.AbilityTask_WaitInputRelease.WaitInputRelease");
+            if (!factoryWaitTargetData)
+                factoryWaitTargetData = UObject::FindObject<UFunction>(
+                    "Function GameplayAbilities.AbilityTask_WaitTargetData.WaitTargetData");
+            if (!factoryWaitInputPressWithState)
+                factoryWaitInputPressWithState = UObject::FindObject<UFunction>(
+                    "Function OrionGame.OrionAbilityTask_WaitInputPress_WithState.WaitInputPress_WithState");
+
+            if (function == factoryWaitInputPress) {
+                void* ret = reinterpret_cast<void* (__thiscall*)(UObject*, UFunction*, void*)>(origProcessEvent)(object, function, params);
+                UObject* newTask = *reinterpret_cast<UObject**>(reinterpret_cast<uint8_t*>(params) + 0x10);
+                if (newTask && newTask != object) {
+                    GameplayAbilities::waitInputPressTasks.push_back(newTask);
+                }
+                return ret;
+            }
+
+            if (function == factoryWaitInputRelease) {
+                void* ret = reinterpret_cast<void* (__thiscall*)(UObject*, UFunction*, void*)>(origProcessEvent)(object, function, params);
+                UObject* newTask = *reinterpret_cast<UObject**>(reinterpret_cast<uint8_t*>(params) + 0x10);
+                if (newTask && newTask != object) {
+                    GameplayAbilities::waitInputReleaseTasks.push_back(newTask);
+                }
+                return ret;
+            }
+
+            if (function == factoryWaitTargetData) {
+                void* ret = reinterpret_cast<void* (__thiscall*)(UObject*, UFunction*, void*)>(origProcessEvent)(object, function, params);
+                UObject* newTask = *reinterpret_cast<UObject**>(reinterpret_cast<uint8_t*>(params) + 0x20);
+                if (newTask && newTask != object) {
+                    GameplayAbilities::waitTargetDataTasks.push_back(newTask);
+                }
+                return ret;
+            }
+
+            if (function == factoryWaitInputPressWithState) {
+                void* ret = reinterpret_cast<void* (__thiscall*)(UObject*, UFunction*, void*)>(origProcessEvent)(object, function, params);
+                UObject* newTask = *reinterpret_cast<UObject**>(reinterpret_cast<uint8_t*>(params) + 0x10);
+                if (newTask && newTask != object) {
+                    GameplayAbilities::waitInputPressTasks.push_back(newTask);
+                }
+                return ret;
+            }
+        }
+        std::string funcName = function->GetFullName();
+        if (funcName.find("ServerSetSelectedDeckItem") != std::string::npos) {
+            return nullptr;
+        }
+
+        if (funcName.find("ServerEquipCard") != std::string::npos) {
+            void* eqRet = reinterpret_cast<void* (__thiscall*)(UObject*, UFunction*, void*)>(origProcessEvent)(object, function, params);
+            int32_t handIdx = (params) ? *reinterpret_cast<int32_t*>(params) : -999;
+            UObject* eqPS = nullptr;
+            if (IsValidUE4Object(object)) {
+                AOrionPlayerController_Game* eqPC = reinterpret_cast<AOrionPlayerController_Game*>(object);
+                eqPS = reinterpret_cast<UObject*>(eqPC->PlayerState);
+            }
+            bool eqDone = false; int eqCompMitOuter = 0; int eqAllCardsNum = -1;
+            if (IsValidUE4Object(eqPS) && handIdx >= 0) {
+                for (UOrionItemizationComponent* eqComp : SDKUtils::GetAllObjectsOfType<UOrionItemizationComponent>()) {
+                    if (IsValidUE4Object(eqComp) && reinterpret_cast<UObject*>(eqComp)->Outer == eqPS) {
+                        eqCompMitOuter++;
+                        eqAllCardsNum = eqComp->AllCards.NumElements;
+                        if (IsValidUE4Object(eqComp->AllCards.Data) && handIdx < eqComp->AllCards.NumElements) {
+                            UOrionGameplayCard* eqCard = eqComp->AllCards.Data[handIdx];
+                            if (IsValidUE4Object(eqCard)) {
+                                if (!COMPARE_MATERIALIZED) {
+                                    SafeGrantItemAbilities(eqCard);
+                                    int eqLvl = 11;
+                                    SafeSetSpecLevels(reinterpret_cast<uintptr_t>(eqCard), eqLvl);
+                                    if (eqCard->SourceItemDefinition && IsValidUE4Object(eqCard->SourceItemDefinition)) {
+                                        {
+                                            static UObject* s_applyFn = nullptr; static bool s_applySearched = false;
+                                            if (!s_applySearched) {
+                                                s_applySearched = true;
+                                                for (UFunction* f : SDKUtils::GetAllObjectsOfType<UFunction>()) {
+                                                    UObject* fo = reinterpret_cast<UObject*>(f);
+                                                    if (!IsValidUE4Object(fo)) continue;
+                                                    if (fo->GetName() == "BP_ApplyGameplayEffectToSelf" && fo->Outer
+                                                        && fo->Outer->GetName().find("AbilitySystemComponent") != std::string::npos) {
+                                                        s_applyFn = fo; break;
+                                                    }
+                                                }
+                                            }
+                                            static std::set<void*> s_geAppliedCards;
+                                            if (s_applyFn && s_geAppliedCards.find(eqCard) == s_geAppliedCards.end()) {
+                                                s_geAppliedCards.insert(eqCard);
+                                                int geN = SafeApplyKeywordGEs(reinterpret_cast<uintptr_t>(eqCard), s_applyFn);
+                                                SafeFixCardGASpec(reinterpret_cast<uintptr_t>(eqCard));
+                                            } else if (s_applyFn) {
+                                                CardLog() << "[ALL-CARDS] GENERIC-GE-APPLY: Karte schon verarbeitet (Re-Equip) -> skip" << std::endl;
+                                            } else {
+                                                CardLog() << "[ALL-CARDS] GENERIC-GE-APPLY: BP_ApplyGameplayEffectToSelf NICHT gefunden" << std::endl;
+                                            }
+                                        }
+                                    }
+                                }
+                                eqDone = true;
+                            }
+                        }
+                        break;
+                    }
+                }
+            }
+            if (!eqDone) {
+                CardLog() << "[ALL-CARDS] Lazy-Grant Equip FEHLT: handIdx=" << handIdx
+                    << " PSvalid=" << (IsValidUE4Object(eqPS) ? 1 : 0)
+                    << " compMitOuter=" << eqCompMitOuter << " AllCardsNum=" << eqAllCardsNum << std::endl;
+            }
+            return eqRet;
+        }
+
+        if (funcName.find("ServerActivateCardInSlot") != std::string::npos) {
+            uintptr_t actCard = 0;
+            if (params && IsValidUE4Object(object)) {
+                int32_t actSlot = *reinterpret_cast<int32_t*>(params);
+                int actHandles = -1, actSlotNum = -1, actCanAct = -1;
+                if (SafeActDiag(object, actSlot, &actCard, &actHandles, &actSlotNum, &actCanAct)) {
+                    if (actCard) {
+                        uintptr_t actAbils[8] = { 0 }; int actLevels[8] = { 0 }; uintptr_t actGGA[8] = { 0 }; uintptr_t actSrc[8] = { 0 };
+                        int actN = SafeActTrace(actCard, actAbils, actLevels, 8, actGGA, actSrc);
+                    }
+                }
+            }
+            if (actCard) SafeFixCardGASpec(actCard);
+            void* actRet = reinterpret_cast<void* (__thiscall*)(UObject*, UFunction*, void*)>(origProcessEvent)(object, function, params);
+            return actRet;
+        }
+
+        auto bugb_findSpec = [](UAbilitySystemComponent* asc, int32_t handle) -> uintptr_t {
+            if (!IsValidUE4Object(asc)) return 0;
+            uintptr_t ascAddr = reinterpret_cast<uintptr_t>(asc);
+            if (IsBadReadPtr(reinterpret_cast<void*>(ascAddr + 0x520), 16)) return 0;
+            uintptr_t itemsData = *reinterpret_cast<uintptr_t*>(ascAddr + 0x520);
+            int32_t   itemsNum  = *reinterpret_cast<int32_t*>(ascAddr + 0x528);
+            if (!itemsData || itemsNum <= 0 || itemsNum > 200) return 0;
+            for (int32_t i = 0; i < itemsNum; ++i) {
+                uintptr_t specAddr = itemsData + (uintptr_t)i * 0xC8;
+                if (IsBadReadPtr(reinterpret_cast<void*>(specAddr + 0x0C), 4)) continue;
+                if (*reinterpret_cast<int32_t*>(specAddr + 0x0C) == handle) return specAddr;
+            }
+            return 0;
+        };
+
+        if (function == internalServerTryActiveAbilityFunction) {
+            Params::AbilitySystemComponent_ServerTryActivateAbility* castParams =
+                reinterpret_cast<Params::AbilitySystemComponent_ServerTryActivateAbility*>(params);
+
+
+            GameplayAbilities::InternalServerTryActiveAbility(
+                reinterpret_cast<UAbilitySystemComponent*>(object),
+                castParams->AbilityToActivate, castParams->InputPressed,
+                castParams->PredictionKey, nullptr);
+
+            void* bugb_origRet = reinterpret_cast<void* (__thiscall*)(UObject*, UFunction*, void*)>(origProcessEvent)(object, function, params);
+
+            return bugb_origRet;
+        }
+
+        if (function == internalServerTryActiveAbilityFunctionWithEventData) {
+            struct TempEventDataParams {
+                FGameplayAbilitySpecHandle AbilityToActivate;
+                bool InputPressed;
+                FPredictionKey PredictionKey;
+                FGameplayEventData TriggerEventData;
+            };
+            TempEventDataParams* castParams = reinterpret_cast<TempEventDataParams*>(params);
+
+
+            GameplayAbilities::InternalServerTryActiveAbility(
+                reinterpret_cast<UAbilitySystemComponent*>(object),
+                castParams->AbilityToActivate, castParams->InputPressed,
+                castParams->PredictionKey, &castParams->TriggerEventData);
+
+            void* bugb_origRet = reinterpret_cast<void* (__thiscall*)(UObject*, UFunction*, void*)>(origProcessEvent)(object, function, params);
+
+            return bugb_origRet;
+        }
+
+        if (function == serverSetReplicatedTargetDataFunction) {
+            void* ret = reinterpret_cast<void* (__thiscall*)(UObject*, UFunction*, void*)>(origProcessEvent)(object, function, params);
+
+            UAbilitySystemComponent* castObj = reinterpret_cast<UAbilitySystemComponent*>(object);
+
+
+            if (!IsBadReadPtr(params, 0x0C)) {
+                g_lastSSRTHandle  = *reinterpret_cast<int32_t*>(params);
+                g_lastSSRTPredKey = *reinterpret_cast<int16_t*>(reinterpret_cast<uint8_t*>(params) + 0x08);
+            }
+
+            if (!IsBadReadPtr(params, 0x10)) {
+                int32_t ssrtHandle = *reinterpret_cast<int32_t*>(params);
+                int16_t origCur  = *reinterpret_cast<int16_t*>(reinterpret_cast<uint8_t*>(params) + 0x08);
+                int32_t ssrtTgtCount = -1;
+                if (!IsBadReadPtr(reinterpret_cast<uint8_t*>(params) + 0x38, 4))
+                    ssrtTgtCount = *reinterpret_cast<int32_t*>(reinterpret_cast<uint8_t*>(params) + 0x38);
+                uintptr_t ssrtSpec = bugb_findSpec(castObj, ssrtHandle);
+                std::string ssrtAb;
+                if (ssrtSpec && !IsBadReadPtr(reinterpret_cast<void*>(ssrtSpec + 0x10), sizeof(void*))) {
+                    void* ab = *reinterpret_cast<void**>(ssrtSpec + 0x10);
+                    if (IsValidUE4Object(ab)) ssrtAb = static_cast<UObject*>(ab)->GetFullName();
+                }
+
+                static const bool S13_GLOBAL_LIVELOC = true;
+                float t1x = 0.f, t1y = 0.f, t1z = 0.f, t2x = 0.f, t2y = 0.f, t2z = 0.f;
+                float lx = 0.f, ly = 0.f, lz = 0.f; int32_t num = -1;
+                bool wrote = false;
+                int32_t s13lockIdx = -1; uint32_t s13lockDst = 0;
+                bool s13fd = GameplayAbilities::s13_NeedsForceDeliver(ssrtAb);
+                uintptr_t s13vtblRva = 0;
+                const bool s13_excluded = (ssrtAb.find("Primary") != std::string::npos);
+                if ((S13_GLOBAL_LIVELOC || s13fd) && !s13_excluded && ssrtTgtCount > 0
+                    && !IsBadReadPtr(reinterpret_cast<uint8_t*>(params) + 0x20, 8)) {
+                    uintptr_t s13arr = (!IsBadReadPtr(reinterpret_cast<uint8_t*>(params) + 0x30, 8))
+                                     ? *reinterpret_cast<uintptr_t*>(reinterpret_cast<uint8_t*>(params) + 0x30) : 0;
+                    uintptr_t s13base = s13arr ? s13arr
+                                      : reinterpret_cast<uintptr_t>(reinterpret_cast<uint8_t*>(params) + 0x20);
+                    uintptr_t td0 = (!IsBadReadPtr(reinterpret_cast<void*>(s13base), 8))
+                                  ? *reinterpret_cast<uintptr_t*>(s13base) : 0;
+                    if (td0 && !IsBadReadPtr(reinterpret_cast<void*>(td0), 8))
+                        s13vtblRva = *reinterpret_cast<uintptr_t*>(td0) - Globals::ModuleBase;
+                    if (td0 && s13vtblRva == 0x3914aa0ull && !IsBadReadPtr(reinterpret_cast<void*>(td0 + 0x84), 4)) {
+                        t1x = *reinterpret_cast<float*>(td0 + 0x20);
+                        t1y = *reinterpret_cast<float*>(td0 + 0x24);
+                        t1z = *reinterpret_cast<float*>(td0 + 0x28);
+                        t2x = *reinterpret_cast<float*>(td0 + 0x50);
+                        t2y = *reinterpret_cast<float*>(td0 + 0x54);
+                        t2z = *reinterpret_cast<float*>(td0 + 0x58);
+                        uintptr_t arrData = *reinterpret_cast<uintptr_t*>(td0 + 0x78);
+                        num = *reinterpret_cast<int32_t*>(td0 + 0x80);
+                        if (arrData && num > 0 && num < 256 && !IsBadReadPtr(reinterpret_cast<void*>(arrData), 4)) {
+                            int32_t objIdx = *reinterpret_cast<int32_t*>(arrData);
+                            if (objIdx > 0 && UObject::GObjects && objIdx < UObject::GObjects->Num()) {
+                                auto obj = UObject::GObjects->GetByIndex(objIdx);
+                                if (obj && IsValidUE4Object(obj) && obj->IsA(AActor::StaticClass())) {
+                                    FVector live = reinterpret_cast<AActor*>(obj)->K2_GetActorLocation();
+                                    lx = live.X; ly = live.Y; lz = live.Z;
+                                    float d1 = (t1x-lx)*(t1x-lx) + (t1y-ly)*(t1y-ly) + (t1z-lz)*(t1z-lz);
+                                    float d2 = (t2x-lx)*(t2x-lx) + (t2y-ly)*(t2y-ly) + (t2z-lz)*(t2z-lz);
+                                    s13lockDst = (d2 <= d1) ? 0x50u : 0x20u;
+                                    s13lockIdx = objIdx;
+                                    uintptr_t dst = td0 + s13lockDst;
+                                    *reinterpret_cast<float*>(dst + 0) = lx;
+                                    *reinterpret_cast<float*>(dst + 4) = ly;
+                                    *reinterpret_cast<float*>(dst + 8) = lz;
+                                    wrote = true;
+                                }
+                            }
+                        }
+                    }
+                }
+
+                if (wrote && s13lockIdx > 0) {
+                    bool renewed = false;
+                    for (auto& lk : g_liveLocks) {
+                        if (lk.asc == reinterpret_cast<void*>(castObj) && lk.handle == ssrtHandle
+                            && lk.predkey == static_cast<int32_t>(origCur)) {
+                            lk.actorIdx = s13lockIdx; lk.dstOff = s13lockDst;
+                            lk.expiryTick = g_diagTickCounter + 30; renewed = true; break;
+                        }
+                    }
+                    if (!renewed && g_liveLocks.size() < 64)
+                        g_liveLocks.push_back({ reinterpret_cast<void*>(castObj), ssrtHandle,
+                                                static_cast<int32_t>(origCur), s13lockIdx, s13lockDst,
+                                                g_diagTickCounter + 30, 0, ssrtAb });
+                }
+
+            }
+
+            bool triggered = GameplayAbilities::TriggerAbilities(castObj);
+
+
+            bool ssrt_alreadyPending = false;
+            if (!triggered) {
+                const long long nowTick = g_diagTickCounter;
+                for (auto it = GameplayAbilities::pendingConfirmASCs.begin();
+                     it != GameplayAbilities::pendingConfirmASCs.end(); ) {
+                    if ((nowTick - it->pushTick) > GameplayAbilities::PENDING_TTL_TICKS) {
+                        it = GameplayAbilities::pendingConfirmASCs.erase(it);
+                    }
+                    else {
+                        if (it->asc == castObj) ssrt_alreadyPending = true;
+                        ++it;
+                    }
+                }
+                if (!ssrt_alreadyPending) {
+                    GameplayAbilities::pendingConfirmASCs.push_back({ castObj, nowTick });
+                }
+            }
+
+            FGameplayAbilityTargetDataHandle* targetDataHandle =
+                reinterpret_cast<FGameplayAbilityTargetDataHandle*>(
+                    reinterpret_cast<uint8_t*>(params) + 0x20);
+
+            GameplayAbilities::ForwardTargetDataToWaitTasks(
+                castObj, origProcessEvent, targetDataHandle);
+            return ret;
+        }
+
+        if (function == serverSetInputPressedFunc) {
+            void* ret = reinterpret_cast<void* (__thiscall*)(UObject*, UFunction*, void*)>(origProcessEvent)(object, function, params);
+
+            UAbilitySystemComponent* castObj = reinterpret_cast<UAbilitySystemComponent*>(object);
+            GameplayAbilities::ForwardInputPressToTasks(castObj, origProcessEvent);
+            return ret;
+        }
+
+        if (function == serverSetInputReleasedFunc) {
+            void* ret = reinterpret_cast<void* (__thiscall*)(UObject*, UFunction*, void*)>(origProcessEvent)(object, function, params);
+
+            UAbilitySystemComponent* castObj = reinterpret_cast<UAbilitySystemComponent*>(object);
+            GameplayAbilities::ForwardInputReleaseToTasks(castObj, origProcessEvent);
+            return ret;
+        }
+
+        if (function == serverSetReplicatedEventFunc) {
+            void* ret = reinterpret_cast<void* (__thiscall*)(UObject*, UFunction*, void*)>(origProcessEvent)(object, function, params);
+
+            UAbilitySystemComponent* castObj = reinterpret_cast<UAbilitySystemComponent*>(object);
+
+
+            GameplayAbilities::ForwardInputPressToTasks(castObj, origProcessEvent);
+            GameplayAbilities::ForwardInputReleaseToTasks(castObj, origProcessEvent);
+
+            GameplayAbilities::TriggerAbilities(castObj);
+            return ret;
+        }
+        static UClass* orionExecuteClass = nullptr;
+        if (!orionExecuteClass)
+            orionExecuteClass = UObject::FindClass("Class OrionGame.OrionExecute");
+
+        if (object->IsA(UOrionDamage::StaticClass()) || (orionExecuteClass && object->IsA(orionExecuteClass))) {
+            UOrionDamage* dmg = reinterpret_cast<UOrionDamage*>(object);
+            if (!SafeDoDamagePipeline(dmg, params)) {
+            }
+            return nullptr;
+        }
+        return reinterpret_cast<void* (__thiscall*)(UObject*, UFunction*, void*)>(origProcessEvent)(object, function, params);
+    }
+
+    void* origStatManagerCrash = nullptr;
+
+    void StatManagerCrashHook() {
+        return;
+    }
+
+    void* origNetDriverTickFlush = nullptr;
+
+    void NetDriverTickFlushHook(__int64 NetDriver, float DeltaTime) {
+        reinterpret_cast<void(*)(__int64, float)>(origNetDriverTickFlush)(NetDriver, DeltaTime);
+
+        Networking::ServerReplicateActors();
+    }
+
+    struct PlayerInfo {
+        std::string hero;
+        std::string team;
+        std::string name;
+        std::string role;
+        std::string skin;
+        std::string deck;
+    };
+
+    std::vector<std::pair<APlayerController*, PlayerInfo>> playerInfoArray = std::vector<std::pair<APlayerController*, PlayerInfo>>();
+
+    void* origGameModeMOBAPostLogin = nullptr;
+
+    void GameModeMOBAPostLogin(AOrionGameMode_MOBA* gamemode, AOrionPlayerController_Game* controller) {
+        if (controller != Globals::GetLocalPlayerController< AOrionPlayerController_Game>()) {
+            PlayerInfo info;
+
+            for (auto pair : playerInfoArray) {
+                if (pair.first == controller) {
+                    info = pair.second;
+                    break;
+                }
+            }
+
+            controller->ClientHandlePostLogin();
+            controller->ClientHandleMatchIsWaitingToStart();
+
+            GameLogic::AddControllerToTeam(controller, info.team.find("1") != std::string::npos ? EOrionTeam::TeamRed : EOrionTeam::TeamBlue);
+
+            UOrionHeroData* heroData = new UOrionHeroData();
+
+
+                for (int32_t i = 0; i < UObject::GObjects->Num(); ++i)
+                {
+                    auto object = UObject::GObjects->GetByIndex(i);
+
+                if (!object)
+                    continue;
+
+                if (!object->IsA(UOrionHeroData::StaticClass()))
+                    continue;
+
+                if (object->GetFullName().find("AnimTest") != std::string::npos)
+                    continue;
+
+                if (object->GetFullName().find(info.hero) != std::string::npos)
+                    heroData = reinterpret_cast<UOrionHeroData*>(object);
+            }
+
+                    UOrionSkinItemDefinition* resolvedSkin = nullptr;
+                    if (!info.skin.empty()) {
+                        std::string want = info.skin;
+                        std::transform(want.begin(), want.end(), want.begin(),
+                            [](unsigned char c) { return (char)std::tolower(c); });
+                        UClass* skinCls = UOrionSkinItemDefinition::StaticClass();
+                        for (int32_t i = 0; i < UObject::GObjects->Num(); ++i) {
+                            auto object = UObject::GObjects->GetByIndex(i);
+                            if (!object || !object->IsA(skinCls)) continue;
+                            if (object->GetFullName().find("Default__") != std::string::npos) continue;
+                            std::string nm = object->GetName();
+                            std::transform(nm.begin(), nm.end(), nm.begin(),
+                                [](unsigned char c) { return (char)std::tolower(c); });
+                            if (nm == want) {
+                                resolvedSkin = reinterpret_cast<UOrionSkinItemDefinition*>(object);
+                                break;
+                            }
+                        }
+                        if (resolvedSkin)
+                            std::cout << "[LOGIN] skin resolved -> " << info.skin << std::endl;
+                        else
+                            std::cout << "[LOGIN] skin '" << info.skin
+                                      << "' NOT FOUND - using DefaultSkin" << std::endl;
+                    }
+
+            std::wstring wname(info.name.begin(), info.name.end());
+
+            FString nameString = FString(wname.c_str());
+
+            controller->SetName(nameString);
+
+            GameLogic::SetControllerHeroData(controller, heroData, resolvedSkin);
+            GameLogic::SetupHUDForController(controller);
+            
+            static int numPlayers = 0;
+
+            numPlayers++;
+
+            if (numPlayers >= Settings::NUM_PLAYERS_TO_START)
+                Globals::shouldStartMatch = true;
+        }
+        else {
+            reinterpret_cast<void(*)(AOrionGameMode_MOBA * gamemode, AOrionPlayerController_Game * controller)>(origGameModeMOBAPostLogin)(gamemode, controller);
+        }
+    }
+
+    enum EAcceptConnection
+    {
+        Reject,
+        Accept,
+        Ignore
+    };
+
+    void* origNotifyAcceptingConnection = nullptr;
+
+    EAcceptConnection NotifyAcceptingConnectionHook(UWorld* world) {
+        return EAcceptConnection::Accept;
+    }
+
+    void* origNotifyAcceptedConnection = nullptr;
+
+    EAcceptConnection NotifyAcceptedConnectionHook(UWorld* world, UNetConnection* connection) {
+        return EAcceptConnection::Accept;
+    }
+
+    void* origNotifyAcceptingChannel = nullptr;
+
+    bool NotifyAcceptingChannelHook(UWorld* world, UChannel* channel) {
+        return true;
+    }
+
+    void* origNotifyControlMessage = nullptr;
+
+    void NotifyControlMessage(UWorld* world, UNetConnection* connection, __int8 a3, void* a4) {
+        if (!Globals::GetGWorld()->NetDriver) {
+            Globals::GetGWorld()->NetDriver = SDKUtils::GetLastOfType<UIpNetDriver>();
+        }
+        return reinterpret_cast<void(*)(__int64, UNetConnection * connection, __int8 a3, void* a4)>(origNotifyControlMessage)(reinterpret_cast<__int64>(Globals::GetGWorld()) + 0x28, connection, a3, a4);
+    }
+
+    void* origCanRestartPlayer = nullptr;
+
+    bool CanRestartPlayerHook(AOrionPlayerController_Game* a1) {
+        return a1 != Globals::GetLocalPlayerController<AOrionPlayerController_Base>();
+    }
+
+    void* origGameModeCanRestartPlayer = nullptr;
+
+    bool GameModeCanRestartPlayer(AGameMode* a1, APlayerController* a2) {
+        return a2 != Globals::GetLocalPlayerController<AOrionPlayerController_Base>();
+    }
+
+    void* origCollectGarbage = nullptr;
+
+    void CollectGarbageHook() {
+
+    }
+
+    void* origCloseConnection = nullptr;
+
+    void CloseConnection() {
+
+    }
+
+    void* origGameEngineTick = nullptr;
+
+    static int numTicksWaitedToStartMatch = 0;
+
+    const int maxNumTicksWaitedToStartMatch = 100;
+
+
+
+    struct OldBotData {
+        UOrionItemizationComponent* Deck;
+        UObject* PS;
+        AOrionChar* Pawn;
+        UOrionAbilitySystemComponent* ASC;
+    };
+
+    namespace DeckFilter {
+        static const char* const CARD_TABLE[120] = {
+            "Rebirth_C_AmplificationEngineer","Rebirth_C_Blitzrush","Rebirth_C_CompensatorRig","Rebirth_C_Deathcrawler",
+            "Rebirth_C_Demolitionist","Rebirth_C_DuneWinds","Rebirth_C_GlycerinDawn","Rebirth_C_HeavyHitter",
+            "Rebirth_C_HellfireEngine","Rebirth_C_LivingGuardian","Rebirth_C_Nitroboost","Rebirth_C_NukebloodMutant",
+            "Rebirth_C_OutlanderScout","Rebirth_C_OverclockedDroid","Rebirth_C_PressureHunter","Rebirth_C_Profiteer",
+            "Rebirth_C_ReactorBeast","Rebirth_C_RedZone","Rebirth_C_RiotSapper","Rebirth_C_SandSpeeder",
+            "Rebirth_C_ShatterGolem","Rebirth_C_ThornedYomi","Rebirth_C_TirelessReaper","Rebirth_C_UnstableCyborg",
+            "Rebirth_D_AwakentheEmeric","Rebirth_D_CulltheWeak","Rebirth_D_Devastation","Rebirth_D_FinderofPlaythings",
+            "Rebirth_D_GrinningSpectre","Rebirth_D_GuardPiercer","Rebirth_D_InvaderMage","Rebirth_D_LordVolstok",
+            "Rebirth_D_NamelessCurse","Rebirth_D_NumbingRogue","Rebirth_D_Pestilence","Rebirth_D_PlagueLordMallenk",
+            "Rebirth_D_PossessedSpryKin","Rebirth_D_ShadowDancer","Rebirth_D_SorvukkInitiate","Rebirth_D_SwampStalker",
+            "Rebirth_D_Taskmaster","Rebirth_D_TowerStrider","Rebirth_D_VampiricBlade","Rebirth_D_VeilStepper",
+            "Rebirth_D_WarlocksBurden","Rebirth_D_WickedRiposte","Rebirth_D_WitheringShadow","Rebirth_D_Woundseeker",
+            "Rebirth_G_ApexPredator","Rebirth_G_AwakenedAncient","Rebirth_G_BattleShepherd","Rebirth_G_ChantingShaman",
+            "Rebirth_G_Coinmaster","Rebirth_G_CoursingZephyr","Rebirth_G_Exoskeleton","Rebirth_G_FlameofZechin",
+            "Rebirth_G_Greenspring","Rebirth_G_GrowthTotem","Rebirth_G_Highwayman","Rebirth_G_MallenkGnasher",
+            "Rebirth_G_OneoftheTribe","Rebirth_G_PackLeader","Rebirth_G_PensiveShaman","Rebirth_G_SpryKin",
+            "Rebirth_G_SwiftHunter","Rebirth_G_TheMotherTree","Rebirth_G_Thundercleaver","Rebirth_G_Trapper",
+            "Rebirth_G_Tyrant","Rebirth_G_UnbrokenSpirit","Rebirth_G_VengefulMire","Rebirth_G_VitalWaters",
+            "Rebirth_K_Accelerator","Rebirth_K_AdvancedEvolution","Rebirth_K_ArcaneDancer","Rebirth_K_AstralLeap",
+            "Rebirth_K_AtomicSoldier","Rebirth_K_BlackIceRoutine","Rebirth_K_CorrosiveWalker","Rebirth_K_CryoAgent",
+            "Rebirth_K_EchelonSoldier","Rebirth_K_Echodrive","Rebirth_K_FontofExperience","Rebirth_K_Generator",
+            "Rebirth_K_ManaFlowAcolyte","Rebirth_K_OPDMilitia","Rebirth_K_PowerTap","Rebirth_K_Rejuvenator",
+            "Rebirth_K_ShipyardScavenger","Rebirth_K_SleeperAgent","Rebirth_K_SoldierOfFortune","Rebirth_K_StasisRune",
+            "Rebirth_K_StaticTrap","Rebirth_K_SupplySergeant","Rebirth_K_Thaumaturge","Rebirth_K_WetwareVirus",
+            "Rebirth_O_ArmoredFootman","Rebirth_O_BrilliantFortification","Rebirth_O_CripplingGlare","Rebirth_O_DomainOfStillness",
+            "Rebirth_O_FlagBearer","Rebirth_O_FormOfGrubbish","Rebirth_O_GatesofSalvation","Rebirth_O_GodmotherVigilant",
+            "Rebirth_O_KnightOfAshur","Rebirth_O_LampLighter","Rebirth_O_LightstepVanguard","Rebirth_O_MallenksGrace",
+            "Rebirth_O_MallenksPrayer","Rebirth_O_MallenksTribute","Rebirth_O_MarchOfTheMallenk","Rebirth_O_PoisedAggressor",
+            "Rebirth_O_ProtectiveSentry","Rebirth_O_RadiantHealer","Rebirth_O_SacredAlchemy","Rebirth_O_SongOfTheSentinel",
+            "Rebirth_O_StagnantDominion","Rebirth_O_VanguardCaptain","Rebirth_O_YomiGuardian","Rebirth_O_YomiSpectre"
+        };
+        inline std::string ToLower(const std::string& s) {
+            std::string r; r.reserve(s.size());
+            for (char c : s) r.push_back(static_cast<char>(std::tolower(static_cast<unsigned char>(c))));
+            return r;
+        }
+        inline std::set<std::string> ResolveSelectedLower(const std::string& deckStr) {
+            std::set<std::string> out;
+            size_t pos = 0;
+            while (pos < deckStr.size()) {
+                size_t comma = deckStr.find(',', pos);
+                std::string tok = (comma == std::string::npos)
+                    ? deckStr.substr(pos) : deckStr.substr(pos, comma - pos);
+                size_t a = tok.find_first_not_of(" \t\r\n");
+                size_t b = tok.find_last_not_of(" \t\r\n");
+                if (a != std::string::npos) {
+                    std::string num = tok.substr(a, b - a + 1);
+                    int n = 0; bool ok = !num.empty();
+                    for (char c : num) {
+                        if (c < '0' || c > '9') { ok = false; break; }
+                        n = n * 10 + (c - '0');
+                        if (n > 9999) { ok = false; break; }
+                    }
+                    if (ok && n >= 1 && n <= 120) out.insert(ToLower(CARD_TABLE[n - 1]));
+                }
+                if (comma == std::string::npos) break;
+                pos = comma + 1;
+            }
+            return out;
+        }
+    }
+
+    void StealBotDeckForHumans() {
+        std::cout << "[HOST] Robin Hood Hack: Finale Version (Karten-Duplikate ERLAUBT, Gem-Filter AKTIV, UI & GRAUER-SLOT FIX!)" << std::endl;
+
+
+        std::vector<UOrionItemizationComponent*> EmptyHumanComponents;
+        std::vector<AOrionAIBot*> ValidShadowBots;
+
+        for (UOrionItemizationComponent* Comp : SDKUtils::GetAllObjectsOfType<UOrionItemizationComponent>()) {
+            if (!IsValidUE4Object(Comp)) continue;
+            UObject* Obj = reinterpret_cast<UObject*>(Comp);
+            if (Obj->GetFullName().find("Default__") != std::string::npos) continue;
+
+            if (Obj->Outer && IsValidUE4Object(Obj->Outer) && Obj->Outer->GetFullName().find("PlayerState") != std::string::npos) {
+                if (Comp->AllCards.NumElements == 0) {
+                    EmptyHumanComponents.push_back(Comp);
+                }
+            }
+        }
+
+        for (AOrionAIBot* SBot : ShadowBots) {
+            if (IsValidUE4Object(SBot) && SBot->PlayerState) {
+                ValidShadowBots.push_back(SBot);
+            }
+        }
+
+        if (EmptyHumanComponents.empty()) return;
+
+        int currentBotIndex = 0;
+        int botsPerHuman = EmptyHumanComponents.empty() ? 0 : (int)(ValidShadowBots.size() / EmptyHumanComponents.size());
+        if (botsPerHuman > 5) botsPerHuman = 5;
+        if (botsPerHuman < 1) botsPerHuman = 1;
+
+        for (UOrionItemizationComponent* Target : EmptyHumanComponents) {
+            UObject* TargetOwner = reinterpret_cast<UObject*>(Target)->Outer;
+
+            AOrionChar* HumanPawn = nullptr;
+            UOrionAbilitySystemComponent* HumanASC = nullptr;
+
+            for (AOrionPlayerController_Game* PC : SDKUtils::GetAllObjectsOfType<AOrionPlayerController_Game>()) {
+                if (IsValidUE4Object(PC) && PC->PlayerState == TargetOwner) {
+                    HumanPawn = reinterpret_cast<AOrionChar*>(PC->Pawn);
+                    break;
+                }
+            }
+
+            for (UOrionAbilitySystemComponent* ASC : SDKUtils::GetAllObjectsOfType<UOrionAbilitySystemComponent>()) {
+                if (IsValidUE4Object(ASC)) {
+                    UObject* ASCObj = reinterpret_cast<UObject*>(ASC);
+                    if (ASCObj->Outer == TargetOwner || (HumanPawn && ASCObj->Outer == HumanPawn)) {
+                        HumanASC = ASC;
+                        break;
+                    }
+                }
+            }
+
+            std::vector<UOrionGameplayCard*> ExclusiveCards;
+            std::vector<OldBotData> CardOldData;
+
+            std::vector<UOrionGameplayGem*> ExclusiveGems;
+            std::set<int> SeenGemBranches;
+            std::set<UOrionMcpItemDefinition*> SeenGemDefs;
+            std::vector<OldBotData> GemOldData;
+
+            int assignedBots = 0;
+            while (assignedBots < botsPerHuman && currentBotIndex < ValidShadowBots.size()) {
+                AOrionAIBot* SBot = ValidShadowBots[currentBotIndex];
+
+                UOrionItemizationComponent* BotDeck = nullptr;
+                for (UOrionItemizationComponent* Comp : SDKUtils::GetAllObjectsOfType<UOrionItemizationComponent>()) {
+                    if (IsValidUE4Object(Comp) && reinterpret_cast<UObject*>(Comp)->Outer == SBot->PlayerState) {
+                        BotDeck = Comp;
+                        break;
+                    }
+                }
+
+                if (BotDeck) {
+                    UOrionAbilitySystemComponent* BotASC = nullptr;
+                    UOrionAbilitySystemComponent** ASCPtr = reinterpret_cast<UOrionAbilitySystemComponent**>(reinterpret_cast<uintptr_t>(SBot) + 0x460);
+                    if (ASCPtr && IsValidUE4Object(*ASCPtr)) BotASC = *ASCPtr;
+
+                    OldBotData BotData = { BotDeck, SBot->PlayerState, reinterpret_cast<AOrionChar*>(SBot->Pawn), BotASC };
+
+
+                    if (IsValidUE4Object(BotDeck->AllGems.Data)) {
+                        for (int i = 0; i < BotDeck->AllGems.NumElements; i++) {
+                            UOrionGameplayGem* Gem = BotDeck->AllGems.Data[i];
+                            if (IsValidUE4Object(Gem)) {
+                                UOrionMcpItemDefinition* Def = Gem->SourceItemDefinition;
+                                if (IsValidUE4Object(Def)) {
+                                    int branch = static_cast<int>(*reinterpret_cast<uint8_t*>(reinterpret_cast<uintptr_t>(Def) + 0x278));
+                                    int rank   = static_cast<int>(*reinterpret_cast<uint8_t*>(reinterpret_cast<uintptr_t>(Def) + 0x279));
+                                    int gemKey = branch * 256 + rank;
+                                    if (SeenGemBranches.find(gemKey) == SeenGemBranches.end()) {
+                                        SeenGemBranches.insert(gemKey);
+                                        ExclusiveGems.push_back(Gem);
+                                        GemOldData.push_back(BotData);
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    BotDeck->AllCards.NumElements = 0;
+                    BotDeck->AllGems.NumElements = 0;
+                    BotDeck->bHasEstablishedDeck = false;
+                }
+                assignedBots++;
+                currentBotIndex++;
+            }
+
+            if (!ExclusiveCards.empty()) {
+                Target->AllCards.Data = reinterpret_cast<UOrionGameplayCard**>(EngineLogic::Malloc(sizeof(UOrionGameplayCard*) * ExclusiveCards.size(), 0));
+                memcpy(Target->AllCards.Data, ExclusiveCards.data(), sizeof(UOrionGameplayCard*) * ExclusiveCards.size());
+                Target->AllCards.NumElements = ExclusiveCards.size();
+                Target->AllCards.MaxElements = ExclusiveCards.size();
+
+                for (size_t i = 0; i < ExclusiveCards.size(); i++) {
+                    UOrionGameplayCard* Card = Target->AllCards.Data[i];
+                    OldBotData& OldData = CardOldData[i];
+
+                    if (IsValidUE4Object(Card)) {
+                        Card->Outer = TargetOwner;
+
+                        Card->CurrentItemState = EOrionGameplayItemState::Available;
+                        Card->HandIndex = static_cast<int32>(i);
+
+                        void** PtrArray = reinterpret_cast<void**>(Card);
+                        for (int offset = 1; offset < 80; offset++) {
+                            if (OldData.ASC && HumanASC && PtrArray[offset] == OldData.ASC) PtrArray[offset] = HumanASC;
+                            if (!OldData.ASC && HumanASC && PtrArray[offset] == nullptr) {
+                            }
+
+                            if (OldData.Deck && PtrArray[offset] == OldData.Deck) PtrArray[offset] = Target;
+                            if (OldData.PS && PtrArray[offset] == OldData.PS) PtrArray[offset] = TargetOwner;
+                            if (OldData.Pawn && HumanPawn && PtrArray[offset] == OldData.Pawn) PtrArray[offset] = HumanPawn;
+                        }
+                    }
+                }
+            }
+
+            if (!ExclusiveGems.empty()) {
+                Target->AllGems.Data = reinterpret_cast<UOrionGameplayGem**>(EngineLogic::Malloc(sizeof(UOrionGameplayGem*) * ExclusiveGems.size(), 0));
+                memcpy(Target->AllGems.Data, ExclusiveGems.data(), sizeof(UOrionGameplayGem*) * ExclusiveGems.size());
+                Target->AllGems.NumElements = ExclusiveGems.size();
+                Target->AllGems.MaxElements = ExclusiveGems.size();
+
+                for (size_t i = 0; i < ExclusiveGems.size(); i++) {
+                    UOrionGameplayGem* Gem = Target->AllGems.Data[i];
+                    OldBotData& OldData = GemOldData[i];
+
+                    if (IsValidUE4Object(Gem)) {
+                        Gem->Outer = TargetOwner;
+
+                        Gem->CurrentItemState = EOrionGameplayItemState::Available;
+
+                        void** PtrArray = reinterpret_cast<void**>(Gem);
+                        for (int offset = 1; offset < 80; offset++) {
+                            if (OldData.Deck && PtrArray[offset] == OldData.Deck) PtrArray[offset] = Target;
+                            if (OldData.PS && PtrArray[offset] == OldData.PS) PtrArray[offset] = TargetOwner;
+                            if (OldData.Pawn && HumanPawn && PtrArray[offset] == OldData.Pawn) PtrArray[offset] = HumanPawn;
+                            if (OldData.ASC && HumanASC && PtrArray[offset] == OldData.ASC) PtrArray[offset] = HumanASC;
+                        }
+                    }
+                }
+            }
+
+            Target->bHasEstablishedDeck = true;
+
+            if (!COMPARE_MATERIALIZED) {
+                typedef UObject* (*fSCO)(UClass*, UObject*, FName, unsigned int, unsigned int, UObject*, bool, void*, bool);
+                fSCO PB_SCO = reinterpret_cast<fSCO>(Globals::ModuleBase + 0xED50F0);
+                UOrionMcpCuratedDeckItemDefinition* pbDeck = nullptr;
+                for (UOrionMcpCuratedDeckItemDefinition* d : SDKUtils::GetAllObjectsOfType<UOrionMcpCuratedDeckItemDefinition>()) {
+                    if (IsValidUE4Object(d) && reinterpret_cast<UObject*>(d)->GetName() == "Base_Deck_AllAssets") { pbDeck = d; break; }
+                }
+                if (PB_SCO && pbDeck && IsValidUE4Object(pbDeck->CuratedCards.Data) && pbDeck->CuratedCards.NumElements > 0) {
+                    UClass* pbCardClass = UOrionGameplayCard::StaticClass();
+                    std::vector<UOrionGameplayCard*> pbBuilt;
+                    pbBuilt.reserve(pbDeck->CuratedCards.NumElements);
+                    int pbGranted = 0;
+                    std::set<std::string> pbSel;
+                    {
+                        std::string deckStr;
+                        for (const auto& pr : playerInfoArray) {
+                            if (pr.first && reinterpret_cast<UObject*>(pr.first->PlayerState) == TargetOwner) {
+                                deckStr = pr.second.deck; break;
+                            }
+                        }
+                        pbSel = DeckFilter::ResolveSelectedLower(deckStr);
+                        if (!pbSel.empty()) CardLog() << "[DECK-CFG] Per-Client-Deck aktiv: " << pbSel.size()
+                            << " von 120 Karten gewaehlt fuer diesen Spieler." << std::endl;
+                    }
+                    for (int i = 0; i < pbDeck->CuratedCards.NumElements; i++) {
+                        FCuratedCardData& cd = pbDeck->CuratedCards.Data[i];
+                        if (!cd.CardDefinition || !IsValidUE4Object(cd.CardDefinition)) continue;
+                        if (!pbSel.empty() && pbSel.find(DeckFilter::ToLower(
+                                reinterpret_cast<UObject*>(cd.CardDefinition)->GetName())) == pbSel.end()) continue;
+                        UOrionGameplayCard* nc = reinterpret_cast<UOrionGameplayCard*>(
+                            PB_SCO(pbCardClass, TargetOwner, FName(), 0, 0, nullptr, false, nullptr, false));
+                        if (!nc || !IsValidUE4Object(nc)) continue;
+                        nc->SourceItemDefinition = reinterpret_cast<UOrionMcpItemDefinition*>(cd.CardDefinition);
+                        nc->CurrentItemState = EOrionGameplayItemState::Available;
+                        nc->HandIndex = static_cast<int32>(pbBuilt.size());
+                        nc->Outer = TargetOwner;
+                        nc->AdjustedCardCost = cd.CardDefinition->CardCost;
+                        nc->CardLevel = cd.CardLevel;
+                        if (nc->ItemAbilityHandles.NumElements > 0) pbGranted++;
+                        pbBuilt.push_back(nc);
+                    }
+                    if (!pbBuilt.empty()) {
+                        Target->AllCards.Data = reinterpret_cast<UOrionGameplayCard**>(EngineLogic::Malloc(sizeof(UOrionGameplayCard*) * pbBuilt.size(), 0));
+                        memcpy(Target->AllCards.Data, pbBuilt.data(), sizeof(UOrionGameplayCard*) * pbBuilt.size());
+                        Target->AllCards.NumElements = static_cast<int32>(pbBuilt.size());
+                        Target->AllCards.MaxElements = static_cast<int32>(pbBuilt.size());
+                    }
+                    CardLog() << "[ALL-CARDS] Path B: " << pbBuilt.size() << " Karten konstruiert + auf Mensch gesetzt (von "
+                        << pbDeck->CuratedCards.NumElements << " Definitionen, " << pbGranted
+                        << " mit Abilities granted)." << std::endl;
+                } else {
+                    CardLog() << "[ALL-CARDS] Path B: WARN StaticConstructObject/Base_Deck_AllAssets nicht verfuegbar." << std::endl;
+                }
+            }
+
+            if (!Target->EquippedCards.Data || Target->EquippedCards.MaxElements < 3) {
+                Target->EquippedCards.Data = reinterpret_cast<UOrionGameplayCard**>(EngineLogic::Malloc(sizeof(UOrionGameplayCard*) * 15, 0));
+                memset(Target->EquippedCards.Data, 0, sizeof(UOrionGameplayCard*) * 15);
+                Target->EquippedCards.MaxElements = 15;
+                Target->EquippedCards.NumElements = 0;
+            }
+
+            if (IsValidUE4Object(TargetOwner)) {
+                reinterpret_cast<void(*)(AActor*)>(Globals::ModuleBase + PLOffsets::FORCE_NET_UPDATE)(reinterpret_cast<AActor*>(TargetOwner));
+            }
+        }
+
+        while (currentBotIndex < ValidShadowBots.size()) {
+            AOrionAIBot* SBot = ValidShadowBots[currentBotIndex];
+            for (UOrionItemizationComponent* Comp : SDKUtils::GetAllObjectsOfType<UOrionItemizationComponent>()) {
+                if (IsValidUE4Object(Comp) && reinterpret_cast<UObject*>(Comp)->Outer == SBot->PlayerState) {
+                    Comp->AllCards.NumElements = 0;
+                    Comp->AllGems.NumElements = 0;
+                    Comp->bHasEstablishedDeck = false;
+                    break;
+                }
+            }
+            currentBotIndex++;
+        }
+
+        UFunction* destroyFunc = UObject::FindObject<UFunction>("Function Engine.Actor.K2_DestroyActor");
+
+        for (AOrionAIBot* SBot : ShadowBots) {
+            if (IsValidUE4Object(SBot)) {
+                if (IsValidUE4Object(SBot->Pawn) && destroyFunc) {
+                    SBot->Pawn->ProcessEvent(destroyFunc, nullptr);
+                }
+                if (destroyFunc) {
+                    SBot->ProcessEvent(destroyFunc, nullptr);
+                }
+            }
+        }
+        ShadowBots.clear();
+
+        std::cout << "[HOST] Raubzug beendet. Schattenbots komplett vom Server entfernt." << std::endl;
+
+        EngineLogic::ExecuteConsoleCommand(L"say === SHOP & INVENTAR ENTSPERRT ===");
+        EngineLogic::ExecuteConsoleCommand(L"say UI, HUD und Karten-Slots voll funktionsfaehig!");
+    }
+
+    void* origDestroyActor = nullptr;
+
+    bool __fastcall DestroyActorHook(UWorld* world, AActor* actor, bool bNetForce, bool bShouldModifyLevel) {
+        if (actor && actor->IsA(AOrionCharHero::StaticClass())) {
+            bool isShadowBot = false;
+            for (AOrionAIBot* sbot : ShadowBots) {
+                if (sbot && sbot->Pawn == actor) {
+                    isShadowBot = true;
+                    break;
+                }
+            }
+
+            if (!isShadowBot && actor->GetName().find("Decoy") == std::string::npos) {
+                uint8_t flags = *reinterpret_cast<uint8_t*>(
+                    reinterpret_cast<uintptr_t>(actor) + 0x09E8);
+                bool bIsDying = (flags >> 2) & 1;
+
+                if (!bIsDying) {
+                    std::cout << "[FIX] DestroyActor BLOCKIERT fuer lebenden Hero: "
+                        << actor->GetName() << std::endl;
+                    return false;
+                }
+            }
+        }
+        return reinterpret_cast<bool(__fastcall*)(UWorld*, AActor*, bool, bool)>(
+            origDestroyActor)(world, actor, bNetForce, bShouldModifyLevel);
+    }
+
+    static const int UNPOSSESS_VTABLE_INDEX = 0x678 / 8;
+    static void* origUnPossessFunc = nullptr;
+    static bool g_unpossessHooked = false;
+
+    void __fastcall UnPossessHook(AController* thisPtr) {
+        if (thisPtr && thisPtr->Pawn &&
+            thisPtr->Pawn->IsA(AOrionCharHero::StaticClass()))
+        {
+            bool isShadowBot = false;
+            for (AOrionAIBot* sbot : ShadowBots) {
+                if (sbot == reinterpret_cast<AOrionAIBot*>(thisPtr)) {
+                    isShadowBot = true;
+                    break;
+                }
+            }
+
+            if (!isShadowBot && thisPtr->Pawn->GetName().find("Decoy") == std::string::npos) {
+                uint8_t flags = *reinterpret_cast<uint8_t*>(
+                    reinterpret_cast<uintptr_t>(thisPtr->Pawn) + 0x09E8);
+                bool bIsDying = (flags >> 2) & 1;
+
+                if (!bIsDying) {
+                    std::cout << "[FIX] UnPossess BLOCKIERT fuer lebenden Hero: " << thisPtr->Pawn->GetName() << std::endl;
+                    return;
+                }
+            }
+        }
+        reinterpret_cast<void(__fastcall*)(AController*)>(origUnPossessFunc)(thisPtr);
+    }
+    
+    void InstallUnPossessHook(AController* anyPlayerController) {
+        if (g_unpossessHooked || !anyPlayerController) return;
+
+        void** vtable = *reinterpret_cast<void***>(anyPlayerController);
+        origUnPossessFunc = vtable[UNPOSSESS_VTABLE_INDEX];
+
+        DWORD oldProtect;
+        VirtualProtect(&vtable[UNPOSSESS_VTABLE_INDEX], 8, PAGE_EXECUTE_READWRITE, &oldProtect);
+        vtable[UNPOSSESS_VTABLE_INDEX] = reinterpret_cast<void*>(&UnPossessHook);
+        VirtualProtect(&vtable[UNPOSSESS_VTABLE_INDEX], 8, oldProtect, &oldProtect);
+
+        g_unpossessHooked = true;
+        std::cout << "[INIT] UnPossess vtable Hook installiert! "
+            << "Original: " << origUnPossessFunc << std::endl;
+    }
+
+    static volatile int s_vehCatchCount = 0;
+
+    int GameEngineTickHook(UGameEngine* gameengine, float deltatime, char a3) {
+
+        if (s_vehCatchCount > 0) {
+            std::cout << "[VEH] Exceptions abgefangen: " << s_vehCatchCount << std::endl;
+            s_vehCatchCount = 0;
+        }
+
+        std::vector<UOrionAbilityTask_StartTargeting*> ready;
+        for (auto it = GameplayAbilities::deferredConfirms.begin();
+            it != GameplayAbilities::deferredConfirms.end(); ) {
+            it->framesWaited++;
+            if (it->framesWaited >= 2) {
+                ready.push_back(it->task);
+                it = GameplayAbilities::deferredConfirms.erase(it);
+            }
+            else {
+                ++it;
+            }
+        }
+        for (UOrionAbilityTask_StartTargeting* dTask : ready) {
+            bool taskStillAlive = false;
+            if (dTask) {
+                for (int32_t i = 0; i < UObject::GObjects->Num(); ++i) {
+                    auto obj = UObject::GObjects->GetByIndex(i);
+                    if (obj == dTask) {
+                        taskStillAlive = true;
+                        break;
+                    }
+                }
+            }
+            if (taskStillAlive) {
+
+
+                {
+                    std::string s13d_ab;
+                    if (dTask->Ability) s13d_ab = dTask->Ability->GetFullName();
+                    const bool s13d_rev = GameplayAbilities::s13_NeedsForceDeliver(s13d_ab);
+                    if (GameplayAbilities::g_nativeReceivedReplicatedTargetData && s13d_rev) {
+                        reinterpret_cast<void(__fastcall*)(UOrionAbilityTask_StartTargeting*)>(
+                            GameplayAbilities::g_nativeReceivedReplicatedTargetData)(dTask);
+                    }
+                    else {
+                        dTask->ConfirmOrWait();
+                    }
+                }
+
+            }
+        }
+        if (!procingCurrentFuncPtrs && FuncPtrsToProcInGameThread.size() > 0) {
+            procingCurrentFuncPtrs = true;
+
+            while (!FuncPtrsToProcInGameThread.empty()) {
+                void* funcPtr = FuncPtrsToProcInGameThread.back();
+
+                reinterpret_cast<void(*)()>(funcPtr)();
+
+                if (!FuncPtrsToProcInGameThread.empty())
+                    FuncPtrsToProcInGameThread.pop_back();
+            }
+
+            procingCurrentFuncPtrs = false;
+        }
+
+        if (!g_unpossessHooked) {
+            if (Networking::GetNetDriver() &&
+                Networking::GetNetDriver()->ClientConnections.Count() > 0)
+            {
+                for (int i = 0; i < Networking::GetNetDriver()->ClientConnections.Count(); i++) {
+                    UNetConnection* conn = Networking::GetNetDriver()->ClientConnections[i];
+                    if (conn && conn->PlayerController) {
+                        InstallUnPossessHook(reinterpret_cast<AController*>(conn->PlayerController));
+                        break;
+                    }
+                }
+            }
+        }
+
+
+        static bool mapLoaded = false;
+        static bool mapInit = false;
+        static bool waitingForMatchInit = false;
+        static float matchInitTimer = 0.0f;
+
+        if (GetAsyncKeyState(VK_F8) && !mapLoaded) {
+            mapLoaded = true;
+            OnGameInit();
+            std::cout << "[HOST] F8 gedrueckt: Map laedt. Starte 20-Sekunden-Timer fuer MatchInit..." << std::endl;
+
+            waitingForMatchInit = true;
+        }
+
+        if (waitingForMatchInit && !mapInit) {
+            matchInitTimer += deltatime;
+
+            if (matchInitTimer >= 10.0f) {
+                mapInit = true;
+                waitingForMatchInit = false;
+
+                std::cout << "[HOST] 20 Sekunden vergangen: OnMatchInit() wird jetzt automatisch ausgefuehrt!" << std::endl;
+                OnMatchInit();
+            }
+        }
+        static std::map<AOrionAIBot*, int> GBotRoles;
+        static bool didTheFunny = false;
+        static bool ailogic = false;
+        static bool waitingForLanes = false;
+        static float laneTimer = 0.0f;
+
+        if (GetAsyncKeyState(VK_F1) && !didTheFunny) {
+            didTheFunny = true;
+            GBotRoles.clear();
+            ShadowBots.clear();
+
+            ServerConfig::LoadFromFile();
+
+            UOrionAISystem* AISystem = SDKUtils::GetLastOfType<UOrionAISystem>();
+            if (!AISystem) {
+                std::cout << "ERROR: No AISystem found!" << std::endl;
+                didTheFunny = false;
+            }
+            else {
+                int maxSafeBots = 45;
+                if (AISystem->BotControllers.MaxElements < maxSafeBots) {
+                    AOrionAIBot** newData = reinterpret_cast<AOrionAIBot**>(EngineLogic::Malloc(sizeof(AOrionAIBot*) * maxSafeBots, 0));
+                    if (AISystem->BotControllers.Data && AISystem->BotControllers.NumElements > 0) {
+                        memcpy(newData, AISystem->BotControllers.Data, sizeof(AOrionAIBot*) * AISystem->BotControllers.NumElements);
+                    }
+                    AISystem->BotControllers.Data = newData;
+                    AISystem->BotControllers.MaxElements = maxSafeBots;
+                }
+
+                auto GetRoleForHero = [](std::string Name) -> int {
+                    if (Name.find("Price") != std::string::npos || Name.find("Sparrow") != std::string::npos || Name.find("Shrapnel") != std::string::npos || Name.find("Femme") != std::string::npos || Name.find("Ghost") != std::string::npos || Name.find("TwinBlast") != std::string::npos || Name.find("Coil") != std::string::npos || Name.find("Revenant") != std::string::npos) return 2;
+                    if (Name.find("Muriel") != std::string::npos || Name.find("Totem") != std::string::npos || Name.find("Steel") != std::string::npos || Name.find("WarDrum") != std::string::npos || Name.find("Phase") != std::string::npos || Name.find("Chains") != std::string::npos) return 3;
+                    if (Name.find("RiftMage") != std::string::npos || Name.find("Gadget") != std::string::npos || Name.find("HyperBreach") != std::string::npos || Name.find("Venus") != std::string::npos || Name.find("Tacticia") != std::string::npos || Name.find("Mambo") != std::string::npos || Name.find("Pyro") != std::string::npos) return 1;
+                    if (Name.find("Grux") != std::string::npos || Name.find("Tomahawk") != std::string::npos || Name.find("Rampage") != std::string::npos || Name.find("Kurohane") != std::string::npos || Name.find("Crunch") != std::string::npos) return 4;
+                    return 0;
+                    };
+
+                std::vector<UOrionHeroData*> RoleBuckets[5];
+                std::vector<UOrionHeroData*> AllValidHeroes;
+
+                UClass* HeroDataClass = UOrionHeroData::StaticClass();
+                UClass* PlayerStateClass = UObject::FindClass("Class OrionGame.OrionPlayerState_Game");
+
+                for (int32_t i = 0; i < UObject::GObjects->Num(); ++i) {
+                    UObject* Obj = UObject::GObjects->GetByIndex(i);
+                    if (!Obj || !Obj->IsA(HeroDataClass)) continue;
+
+                    std::string Name = Obj->GetFullName();
+                    if (Name.find("AnimTest") != std::string::npos || Name.find("Default__") != std::string::npos) continue;
+
+                    UOrionHeroData* hero = reinterpret_cast<UOrionHeroData*>(Obj);
+
+                    static const std::vector<std::string> excludedFromRealBotSpawn = {
+                        "WarDrum",
+                        "Steel",
+                        "Femme", "FallenAngel", "Wukong",
+                    };
+                    bool excludedReal = false;
+                    for (const auto& exName : excludedFromRealBotSpawn) {
+                        if (Name.find(exName) != std::string::npos) {
+                            excludedReal = true;
+                            break;
+                        }
+                    }
+                    if (!excludedReal) {
+                        RoleBuckets[GetRoleForHero(Name)].push_back(hero);
+                    }
+                    AllValidHeroes.push_back(hero);
+                }
+
+                EAIBotDifficulty BlueTeamBotDifficulty = ServerConfig::ParseDifficulty(ServerConfig::BlueTeamDifficulty);
+                EAIBotDifficulty RedTeamBotDifficulty  = ServerConfig::ParseDifficulty(ServerConfig::RedTeamDifficulty);
+
+                std::vector<int> BlueRolesFilled;
+                std::vector<int> RedRolesFilled;
+                for (int32_t i = 0; i < UObject::GObjects->Num(); ++i) {
+                    UObject* Obj = UObject::GObjects->GetByIndex(i);
+                    if (!Obj || !Obj->IsA(PlayerStateClass)) continue;
+                    if (Obj->GetFullName().find("Default__") != std::string::npos) continue;
+
+                    AOrionPlayerState_Game* PS = reinterpret_cast<AOrionPlayerState_Game*>(Obj);
+                    UOrionHeroData* HumanHero = nullptr;
+
+                    for (int offset = 0x100; offset < 0x600; offset += 8) {
+                        UOrionHeroData** ptr = reinterpret_cast<UOrionHeroData**>(reinterpret_cast<uint8_t*>(PS) + offset);
+                        if (*ptr && std::find(AllValidHeroes.begin(), AllValidHeroes.end(), *ptr) != AllValidHeroes.end()) {
+                            HumanHero = *ptr;
+                            break;
+                        }
+                    }
+
+                    if (HumanHero) {
+                        EOrionTeam humanTeam = PS->GetTeamNum();
+                        int humanRole = -1;
+
+                        APlayerState* psAsBase = reinterpret_cast<APlayerState*>(PS);
+                        for (const auto& pair : playerInfoArray) {
+                            if (!pair.first || pair.first->PlayerState != psAsBase) continue;
+                            const std::string& roleStr = pair.second.role;
+                            if (roleStr.empty()) break;
+
+                            int rOverride = -1;
+                            if      (roleStr == "0" || roleStr == "offlane") rOverride = 0;
+                            else if (roleStr == "1" || roleStr == "mid"
+                                  || roleStr == "midlane" || roleStr == "caster") rOverride = 1;
+                            else if (roleStr == "2" || roleStr == "carry"
+                                  || roleStr == "adc")                          rOverride = 2;
+                            else if (roleStr == "3" || roleStr == "support"
+                                  || roleStr == "sup")                          rOverride = 3;
+                            else if (roleStr == "4" || roleStr == "jungle"
+                                  || roleStr == "jungler" || roleStr == "jgl")  rOverride = 4;
+
+                            if (rOverride >= 0 && rOverride <= 4) {
+                                humanRole = rOverride;
+                                std::cout << "[F1] Client-Override role=" << rOverride
+                                          << " (raw=\"" << roleStr << "\", auto-detect waere "
+                                          << GetRoleForHero(HumanHero->GetFullName()) << ")"
+                                          << std::endl;
+                            } else {
+                                std::cout << "[F1] WARN ungueltiger role-Wert in config.json: \""
+                                          << roleStr << "\" - falle auf Auto-Detect zurueck"
+                                          << std::endl;
+                            }
+                            break;
+                        }
+
+                        if (humanRole == -1) {
+                            humanRole = GetRoleForHero(HumanHero->GetFullName());
+                        }
+
+                        if (humanTeam == EOrionTeam::TeamBlue) {
+                            BlueRolesFilled.push_back(humanRole);
+                            std::cout << "Client Held erkannt! Team=Blue Rolle: " << humanRole << std::endl;
+                        }
+                        else if (humanTeam == EOrionTeam::TeamRed) {
+                            RedRolesFilled.push_back(humanRole);
+                            std::cout << "Client Held erkannt! Team=Red Rolle: " << humanRole << std::endl;
+                        }
+                    }
+                }
+
+                static const bool ENABLE_MATCHUP_PIN = true;
+                struct MatchupPin { EOrionTeam team; int role; const char* heroName; };
+                static const MatchupPin matchupPins[] = {
+                    { EOrionTeam::TeamBlue, 0, "Sword" },
+                    { EOrionTeam::TeamRed,  0, "Medic" },
+                };
+
+                auto SpawnBotForRole = [&](EOrionTeam team, int roleIndex, EAIBotDifficulty difficulty) {
+                    UOrionHeroData* heroData = nullptr;
+                    if (ENABLE_MATCHUP_PIN) {
+                        for (const MatchupPin& mp : matchupPins) {
+                            if (mp.team != team || mp.role != roleIndex) continue;
+                            for (UOrionHeroData* h : AllValidHeroes) {
+                                if (h && h->GetFullName().find(mp.heroName) != std::string::npos) { heroData = h; break; }
+                            }
+                            break;
+                        }
+                    }
+                    if (!heroData) {
+                        if (RoleBuckets[roleIndex].empty()) return;
+                        std::vector<UOrionHeroData*> pinFreePool;
+                        for (UOrionHeroData* h : RoleBuckets[roleIndex]) {
+                            if (!h) continue;
+                            bool bIsPinnedHero = false;
+                            if (ENABLE_MATCHUP_PIN) {
+                                std::string hName = h->GetFullName();
+                                for (const MatchupPin& mp : matchupPins) {
+                                    if (hName.find(mp.heroName) != std::string::npos) { bIsPinnedHero = true; break; }
+                                }
+                            }
+                            if (!bIsPinnedHero) pinFreePool.push_back(h);
+                        }
+                        if (pinFreePool.empty()) return;
+                        heroData = pinFreePool[rand() % pinFreePool.size()];
+                    }
+                    AOrionAIBot* botController = reinterpret_cast<AOrionAIBot * (*)(UOrionAISystem*, UOrionHeroData*, EOrionTeam, EAIBotDifficulty, FVector, FRotator)>(Globals::ModuleBase + 0x496DB0)(AISystem, heroData, team, difficulty, FVector(), FRotator());
+
+                    GameLogic::AddBotControllerToTeam(botController, team);
+
+                    if (AISystem->BotControllers.NumElements < maxSafeBots) {
+                        AISystem->BotControllers.Data[AISystem->BotControllers.NumElements] = botController;
+                        AISystem->BotControllers.NumElements++;
+                    }
+
+                    GBotRoles[botController] = roleIndex;
+
+                    };
+
+                for (int role = 0; role < 5; role++) {
+                    if (std::find(RedRolesFilled.begin(), RedRolesFilled.end(), role) == RedRolesFilled.end()) {
+                       SpawnBotForRole(EOrionTeam::TeamRed, role, RedTeamBotDifficulty);
+                   }
+               }
+
+                std::vector<int> BlueRoles = { 0, 1, 2, 3, 4 };
+                for (int i = BlueRoles.size() - 1; i > 0; --i) {
+                    int j = rand() % (i + 1);
+                    std::swap(BlueRoles[i], BlueRoles[j]);
+                }
+
+                for (size_t i = 0; i < BlueRoles.size(); i++) {
+                    if (std::find(BlueRolesFilled.begin(), BlueRolesFilled.end(), BlueRoles[i]) == BlueRolesFilled.end()) {
+                        SpawnBotForRole(EOrionTeam::TeamBlue, BlueRoles[i], BlueTeamBotDifficulty);
+                    }
+                }
+
+                bool* bHasBotsFlag = reinterpret_cast<bool*>(reinterpret_cast<uintptr_t>(AISystem) + 704);
+                *bHasBotsFlag = true;
+
+                const int SHADOW_BOTS_PER_CLIENT = 4;
+                int numClients = static_cast<int>(BlueRolesFilled.size() + RedRolesFilled.size());
+                int shadowRoomLeft = maxSafeBots - AISystem->BotControllers.NumElements;
+                int availableSlots = numClients * SHADOW_BOTS_PER_CLIENT;
+                if (availableSlots > shadowRoomLeft) availableSlots = shadowRoomLeft;
+                if (availableSlots < 0) availableSlots = 0;
+                if (availableSlots > 0) {
+                    std::cout << "[HOST] Spawne " << availableSlots << " Schatten-Bots (Netzwerk-Sicher)..." << std::endl;
+                    UFunction* SetIgnoreFunc = UObject::FindObject<UFunction>("Function OrionGame.OrionAIBot.K2_SetIgnoreEnemies");
+
+                    UOrionHeroData* allCardsHero = nullptr;
+                    {
+                        UOrionMcpCuratedDeckItemDefinition* allAssetsDeck = nullptr;
+                        for (UOrionMcpCuratedDeckItemDefinition* d : SDKUtils::GetAllObjectsOfType<UOrionMcpCuratedDeckItemDefinition>()) {
+                            if (IsValidUE4Object(d) && reinterpret_cast<UObject*>(d)->GetName() == "Base_Deck_AllAssets") {
+                                allAssetsDeck = d; break;
+                            }
+                        }
+                        static const std::vector<std::string> shadowOnlyHeroNames = {
+                            "WarDrum", "Revenant", "Phase", "Mambo", "Vamp", "Ghost",
+                            "Pyro", "Steel", "Femme", "FallenAngel", "Wukong"
+                        };
+                        if (allAssetsDeck) {
+                            for (UOrionHeroData* h : AllValidHeroes) {
+                                if (!IsValidUE4Object(h)) continue;
+                                std::string hn = reinterpret_cast<UObject*>(h)->GetFullName();
+                                for (const auto& ex : shadowOnlyHeroNames) {
+                                    if (hn.find(ex) != std::string::npos) { allCardsHero = h; break; }
+                                }
+                                if (allCardsHero) break;
+                            }
+                        }
+                        if (allCardsHero && allAssetsDeck) {
+                            int32_t deckIndex = *reinterpret_cast<int32_t*>(reinterpret_cast<uintptr_t>(allAssetsDeck) + 0x0C);
+                            int32_t deckSerial = 0;
+                            if (UObject::GObjects && deckIndex > 0 && deckIndex < UObject::GObjects->Num()) {
+                                uint8_t* itemBase = reinterpret_cast<uint8_t*>(UObject::GObjects->GetDecrytedObjPtr());
+                                if (itemBase) deckSerial = *reinterpret_cast<int32_t*>(itemBase + static_cast<uintptr_t>(deckIndex) * 0x18 + 0x10);
+                            }
+                            uintptr_t sp = reinterpret_cast<uintptr_t>(allCardsHero) + 0x4E0;
+                            *reinterpret_cast<int32_t*>(sp + 0x00) = deckIndex;
+                            *reinterpret_cast<int32_t*>(sp + 0x04) = deckSerial;
+                            *reinterpret_cast<int32_t*>(sp + 0x08) = 0;
+                            F4_LOG_EVENT("[ALL-CARDS] v3 WeakPtr-Override: hero=" << reinterpret_cast<UObject*>(allCardsHero)->GetName()
+                                << " -> Base_Deck_AllAssets (idx=" << deckIndex << " serial=" << deckSerial << ")" << std::endl);
+                        } else {
+                            F4_LOG_EVENT("[ALL-CARDS] WARN: Base_Deck_AllAssets/Hero nicht gefunden -> Override uebersprungen." << std::endl);
+                        }
+                    }
+
+                    for (int i = 0; i < availableSlots; i++) {
+                        if (AllValidHeroes.empty()) break;
+                        UOrionHeroData* donorHero = (i == 0 && allCardsHero)
+                            ? allCardsHero
+                            : AllValidHeroes[rand() % AllValidHeroes.size()];
+
+                        float gridX = (i % 6) * 200.0f;
+                        float gridY = (i / 6) * 200.0f;
+                        FVector SafePos(gridX, gridY, 8000.0f);
+                        AOrionAIBot* shadowBot = reinterpret_cast<AOrionAIBot * (*)(UOrionAISystem*, UOrionHeroData*, EOrionTeam, EAIBotDifficulty, FVector, FRotator)>(Globals::ModuleBase + 0x496DB0)(AISystem, donorHero, EOrionTeam::NoTeam, EAIBotDifficulty::Veteran, SafePos, FRotator());
+
+                        if (shadowBot) {
+                            AISystem->BotControllers.Data[AISystem->BotControllers.NumElements] = shadowBot;
+                            AISystem->BotControllers.NumElements++;
+                            ShadowBots.push_back(shadowBot);
+
+                            if (SetIgnoreFunc) {
+                                struct { bool bNewIgnoreEnemies; } params;
+                                params.bNewIgnoreEnemies = true;
+                                shadowBot->ProcessEvent(SetIgnoreFunc, &params);
+                            }
+                        }
+
+                    }
+                }
+
+                std::cout << "[HOST] Blitzschneller Team Builder abgeschlossen! Warte 10 Sekunden auf Lane-Zuweisung..." << std::endl;
+                waitingForLanes = true;
+            }
+        }
+        if (waitingForLanes && !ailogic) {
+            laneTimer += deltatime;
+
+            if (laneTimer >= 5.0f) {
+                ailogic = true;
+                waitingForLanes = false;
+
+                auto WorldState = SDKUtils::GetLastOfType<UOrionWorldStateMonitor>();
+                if (WorldState && WorldState->MapLanes.Count() >= 3) {
+                    int assignedCount = 0;
+
+                    for (AOrionAIBot* bot : SDKUtils::GetAllObjectsOfType<AOrionAIBot>()) {
+                        if (bot->GetFullName().find("Default__") != std::string::npos) continue;
+                        if (GBotRoles.find(bot) == GBotRoles.end()) continue;
+
+                        int role = GBotRoles[bot];
+
+                        EOrionTeam botTeam = EOrionTeam::NoTeam;
+                        if (bot->PlayerState) botTeam = reinterpret_cast<AOrionPlayerState_Game*>(bot->PlayerState)->GetTeamNum();
+
+                        int laneIndex = 1;
+
+                        if (role == 1) { laneIndex = 1; }
+                        else if (role == 4) { laneIndex = 1; }
+                        else if (role == 2 || role == 3) { laneIndex = 0; }
+                        else if (role == 0) { laneIndex = 2; }
+
+                        if (laneIndex >= WorldState->MapLanes.Count()) laneIndex = 0;
+
+                        reinterpret_cast<void(*)(AOrionAIBot*, FOrionAILane*)>(Globals::ModuleBase + 0x44BAD0)(bot, &WorldState->MapLanes[laneIndex]);
+                        assignedCount++;
+                    }
+                    std::cout << "[HOST] 10 Sekunden vergangen: Smarte Lanes an " << assignedCount << " Bots automatisch zugewiesen!" << std::endl;
+                }
+                else {
+                    std::cout << "[HOST] FEHLER: Konnte Lanes nicht zuweisen. WorldState nicht gefunden." << std::endl;
+                }
+            }
+        }
+
+
+        struct FRawRuntimePlaybook { class UObject* PlaybookInstance; TArray<void*> ObjectivePriorityList; };
+
+        static std::map<class AOrionAIBot*, FVector> LastBotPositions;
+        static std::map<class AOrionAIBot*, int> BotIdleTicks;
+        static std::map<class AOrionAIBot*, int> EmptyActionTicks;
+        static std::map<class AOrionAIBot*, float> LastBotHealth;
+        static std::map<class AOrionAIBot*, float> CombatTimer;
+        static std::map<class AOrionAIBot*, std::string> LastMacroAction;
+        static std::map<class AOrionAIBot*, std::string> LastMacroTargetName;
+        static std::map<class AOrionAIBot*, bool> BotIsBlind;
+        static std::map<class AOrionAIBot*, bool> BotNeedsHeal;
+        static std::map<class AOrionAIBot*, float> BossWaitStartTime;
+        static float TeamBlueBossBanTimer = 0.0f;
+        static float TeamRedBossBanTimer = 0.0f;
+        static std::map<EOrionTeam, float> BossAbortThreatStartTime;
+        static std::map<class AOrionChar*, float> GankCooldownPerTarget;
+        static std::map<AOrionAIBot*, UBotObjective*> LastKnownObjective;
+
+        static std::map<AOrionChar*, FVector> LastKnownEnemyHeroPos;
+        static std::map<AOrionChar*, float>   LastSeenEnemyHeroTime;
+
+        static std::map<AOrionAIBot*, AOrionChar*> RotationTargetEnemy;
+        static std::map<AOrionAIBot*, float>       RotationStartTime;
+
+        static std::map<AOrionAIBot*, AOrionDamageableObjective_Base*> CachedFrontTower;
+
+
+
+
+        static bool f4WasPressedB = false;
+        static bool autoPushEnabledB = false;
+        static float pushTimerB = 0.0f;
+        static float matchTimeB = 0.0f;
+
+        static UFunction* getHealthFunc = nullptr;
+        static UFunction* getMaxHealthFunc = nullptr;
+        static UFunction* IsSafeFunc = nullptr;
+        static UFunction* MoveFunc = nullptr;
+        static UFunction* GetEnemyCharacterFunc = nullptr;
+
+        static UFunction* AttackTowerFunc = nullptr;
+        static UFunction* TowerObjectiveFunc = nullptr;
+        static UFunction* DefendTowerFunc = nullptr;
+        static UFunction* ClearCampFunc = nullptr;
+        static UFunction* GroupAttackCampFunc = nullptr;
+        static UFunction* GoldRecallFunc = nullptr;
+        static UObject* RecallCDO = nullptr;
+        static UFunction* IsInsideTurretFunc = nullptr;
+        static UFunction* IsSafeToRecallFunc = nullptr;
+        static UFunction* PlaceWardFunc = nullptr;
+        static UFunction* StopMovementFunc = nullptr;
+        static const bool ENABLE_MELEE_LOCKBREAK = true;
+        static const bool ENABLE_RECALL_CANCEL = true;
+        static const bool ENABLE_RECALL_ESCAPE_JUMP = true;
+        static const float RECALL_FLEE_BASEWARD_MARGIN_M = 12.0f;
+        static const bool ENABLE_HIPHOP_TEST_CLEAR = true;
+        static UFunction* MeleeLockbreakStopFn = nullptr;
+        static const bool ENABLE_MELEE_FRONTPUSH = true;
+        static const bool ENABLE_REARWAVE_RETREAT = true;
+        static const bool  ENABLE_AKDZ_WAVE_ACCR = true;
+        static const float AKDZ_WAVE_ACC_R       = 300.0f;
+        static const bool  ENABLE_BR_WAKE   = true;
+        static const float BR_WAKE_HERO_M   = 4.0f;
+        static const bool  ENABLE_BRWAKE_SV_YIELD = true;
+        static const bool  ENABLE_RKF               = true;
+        static const float RKF_HERO_HP              = 35.0f;
+        static const float RKF_HERO_SQ              = 1800.0f * 1800.0f;
+        static const float RKF_BOT_MIN_HP           = 50.0f;
+        static const float RKF_HERO_OWNTWR_SQ       = 1600.0f * 1600.0f;
+        static const float RKF_BOT_ENTWR_SQ         = 2200.0f * 2200.0f;
+        static const float RKF_SUPPORT_SQ           = 1800.0f * 1800.0f;
+        static const float RKF_SOLO_HERO_HP         = 15.0f;
+        static const float RKF_K2_GAP_S             = 2.0f;
+        static const bool  ENABLE_BRWAKE_REDIRECT = true;
+        static const float BRWAKE_REDIR_TWR_SQ    = 1800.0f * 1800.0f;
+        static const float BRWAKE_REDIR_KILL_HP   = 35.0f;
+        static const bool  ENABLE_BRWAKE_TRADE_SKIP = true;
+        static const int   BRWAKE_TRADE_LOSE        = 15;
+        static const float BRWAKE_TRADE_KILL_HP     = 35.0f;
+        static const bool ENABLE_HOLD_STICKY = true;
+        static std::map<AOrionAIBot*, float> lastThreatRetreatTime;
+        static std::map<AOrionAIBot*, float>   g_launchIssueTime;
+        static std::map<AOrionAIBot*, float>   g_launchTraceUntil;
+        static std::map<AOrionAIBot*, FVector> g_launchTracePos;
+        static std::map<AOrionAIBot*, float>   g_launchPrevHP;
+        static const bool ENABLE_BLINDRETREAT_PROBE = true;
+        static std::map<AOrionAIBot*, int>     g_brFrozenTicks;
+        static std::map<AOrionAIBot*, float>   g_brIssueTime;
+        static std::map<AOrionAIBot*, float>   g_brActiveUntil;
+        static std::map<AOrionAIBot*, FVector> g_brTracePos;
+        static std::map<AOrionAIBot*, AActor*> g_brMoveTarget;
+        static std::map<AOrionAIBot*, float>   g_brAccRadius;
+        static const bool ENABLE_DEFEND_LOCKBREAK = true;
+        static std::map<AOrionAIBot*, int>     g_dlbFrozenTicks;
+        static const bool ENABLE_DEFEND_ENGAGE = true;
+        static std::map<AOrionAIBot*, bool>    g_deEngagedLastTick;
+        static const bool  ENABLE_DEFEND_TOWER_YIELD = true;
+        static const bool  ENABLE_LR_S0_COVER   = false;
+        static const bool  ENABLE_LR_WAKE_S0_GUARD = true;
+        static std::map<AOrionAIBot*, bool>    g_lrS0Latch;
+        static const float LR_TOWER_COVER_SQ    = 2560000.0f;
+        static const bool  ENABLE_P3_DEFEND_YIELD = true;
+        static const bool  ENABLE_PDY_WAKE_S0_GUARD = true;
+        static const float PDY_OUTSIDE_SQ   = 3240000.0f;
+        static const float PDY_COVER_SQ     = 1440000.0f;
+        static const float PDY_MAX_SQ       = 9000000.0f;
+        static const float PDY_WAKE_HERO_SQ =  160000.0f;
+        static const float PDY_COMMIT_SEC   = 6.0f;
+        static const int   PDY_ENTER_TICKS  = 2;
+        static const bool  ENABLE_DZ_HEROFOCUS_DEFEND_GATE = true;
+        static const bool  ENABLE_SV_RELEASE_HPTERM = false;
+        static const float SV_RELEASE_MIN_HP  = 0.50f;
+        static const float SV_RELEASE_HERO_SQ = 1440000.0f;
+        static const bool  ENABLE_SV_RELEASE_HP_V2 = true;
+        static std::map<AOrionAIBot*, float>   g_pdyStartT;
+        static std::map<AOrionAIBot*, int>     g_pdyStreak;
+        static std::map<AOrionAIBot*, float>   g_pdyLogT;
+        static std::map<AOrionAIBot*, int>     g_pdyPhase;
+        static std::map<AOrionAIBot*, FVector> g_pdyPos;
+        static const float DTY_TOWER_SQ = 3240000.0f;
+        static const float TOWER_SAFE_SQ = 2560000.0f;
+
+        static const bool  ENABLE_SHIELDED_DIVE  = true;
+        static const int   SHIELDED_DIVE_MIN     = 1;
+        static const int   SHIELDED_DIVE_DEFICIT = 2;
+
+        static std::map<AOrionAIBot*, float>   g_rfLaunchTime;
+        static std::map<AOrionAIBot*, float>   g_escapeJumpTime;
+        static const bool  ENABLE_EJ_STALL_GATE      = true;
+        static const int   EJ_STALL_JUMPS            = 5;
+        static const float EJ_STALL_MIN_PROGRESS_M   = 22.0f;
+        static std::map<AOrionAIBot*, float>   g_ejgLastT;
+        static std::map<AOrionAIBot*, float>   g_ejgStartTwrM;
+        static std::map<AOrionAIBot*, float>   g_ejgMinTwrM;
+        static std::map<AOrionAIBot*, int>     g_ejgJumps;
+        static const bool  ENABLE_SOLO1V1_VETO   = true;
+        static const int   SOLO1V1_LOSE_THRESH   = 15;
+        static const float SOLO1V1_WINDOW_SEC    = 5.0f;
+        static const bool  ENABLE_SOLO1V1_HOLDFIX  = true;
+        static const float SOLO1V1_MIN_HOLD_SEC    = 1.0f;
+        static const bool  ENABLE_SOLO1V1_STICKY   = true;
+        static const bool  ENABLE_SOLO1V1_WAVEHOLD = true;
+        static const bool  ENABLE_SOLO1V1_DEATHBALL = true;
+        static const float SOLO1V1_TOWER_PRIO_SQ = 9000000.0f;
+
+        static const bool  ENABLE_WAVE_FALLBACK   = true;
+        static const float WFB_WAVE_MAX_SQ        = 49000000.0f;
+        static const float WFB_WAVE_MIN_SQ        =  640000.0f;
+        static const float WFB_TOWER_MAX_SQ       = 36000000.0f;
+        static const float WFB_COMMIT_SEC         = 14.0f;
+        static const float WFB_WAKE_HERO_SQ       =  160000.0f;
+        static const float WFB_MTH_ANCHOR_SQ      = 2890000.0f;
+        static const float WFB_SAFE_HERO_SQ       = 6250000.0f;
+        static const int   WFB_STALL_TICKS        = 4;
+        static const float WFB_STALL_MIN_M        = 4.0f;
+        static std::map<AOrionAIBot*, float>   g_wfbUntil;
+        static std::map<AOrionAIBot*, AActor*> g_wfbTarget;
+        static std::map<AOrionAIBot*, float>   g_wfbBestDistSq;
+        static std::map<AOrionAIBot*, int>     g_wfbStall;
+        static std::map<AOrionAIBot*, float>   g_wfbFireT;
+        static std::map<AOrionAIBot*, bool>    g_wfbEngineBlind;
+        static std::map<AOrionAIBot*, bool>    g_wfbTgtIsWave;
+        static const bool  ENABLE_WFB_DEFICIT_EXT  = true;
+        static const float WFB_DEF_SUBST_R_SQ      = 640000.0f;
+        static std::map<AOrionAIBot*, bool>    g_wfbDefPath;
+        static std::map<AOrionAIBot*, int>     g_wfbDefParity;
+        static std::map<AOrionAIBot*, int>     g_wfbLpStall;
+        static const bool  ENABLE_WFB_DZ_INHIB     = true;
+        static const bool  ENABLE_MELEE_TOWER_HOLD = true;
+        static const bool  ENABLE_MELEE_WAVE_HOLD = true;
+        static const float MWH_ACC_R              = 300.0f;
+        static const float MWH_DFRONT_MIN_M       = 4.0f;
+        static const float MWH_WINDOW_SEC         = 6.0f;
+        static const float MWH_PERSIST_SEC        = 4.0f;
+        static const bool  ENABLE_MWH_DANGER_MODE  = true;
+        static const float MWH_DANGER_HERO_SQ      = 640000.0f;
+        static const float MWH_DEEP_MIN_SQ         = 640000.0f;
+        static const float MWH_DEEP_MAX_SQ         = 16000000.0f;
+        static const int   MWH_DANGER_KILL_HP      = 30;
+        static const bool  ENABLE_AKDZ_ANCHOR_SUBSTANCE = true;
+        static const bool  ENABLE_MWH_ANCHOR_SUBSTANCE  = true;
+        static const int   MWH_ANCHOR_MIN_SUB           = 2;
+        static const bool  ENABLE_P23_COMMIT   = true;
+        static const float P23_MAX_HOLD_S      = 14.0f;
+        static const float P23_TOWER_MAX_SQ    = 36000000.0f;
+        static const float P23_HOLD_LOG_SEC    = 2.0f;
+        static std::map<AOrionAIBot*, AActor*> g_p23Target;
+        static std::map<AOrionAIBot*, float>   g_p23AccR;
+        static std::map<AOrionAIBot*, float>   g_p23StartT;
+        static std::map<AOrionAIBot*, bool>    g_p23TgtIsWave;
+        static std::map<AOrionAIBot*, float>   g_p23LogT;
+        static std::map<AOrionAIBot*, float>   g_akpUntil;
+        static const bool  ENABLE_P23_ADVANTAGE     = true;
+        static const bool  ENABLE_ADV_HOLD          = true;
+        static const float ADV_MIN_HP               = 80.0f;
+        static const float ADV_HP_LEAD              = 30.0f;
+        static const float ADV_KEEP_HP              = 70.0f;
+        static const float ADV_KEEP_LEAD            = 15.0f;
+        static const float ADV_TWR_MAX_SQ           = 36000000.0f;
+        static const float ADV_ESC_MAX_SQ           = 6250000.0f;
+        static const float ADV_BEHIND_MAX_M         = 8.0f;
+        static std::map<AOrionAIBot*, float> g_p23AdvLogT;
+        static std::map<AOrionAIBot*, float> g_advHoldOn;
+        static const bool  ENABLE_AK_OPPORTUNITY = true;
+        static const float AKO_WINDOW_S        = 3.0f;
+        static const float AKO_COOLDOWN_S      = 4.0f;
+        static const float AKO_RETREAT_GRACE_S = 2.5f;
+        static const float AKO_STICKY_S        = 2.5f;
+        static const float AKO_HERO_MIN_SQ     = 90000.0f;
+        static const float AKO_HERO_MAX_SQ     = 640000.0f;
+        static const float AKO_HERO_CLEAR_SQ   = 1440000.0f;
+        static const float AKO_MIN_HP          = 50.0f;
+        static const float AKO_KEEP_HP         = 40.0f;
+        static const float AKO_KEEP_LEAD       = 15.0f;
+        static const float AKO_DEF_BOT_TWR_SQ  = 4840000.0f;
+        static const float AKO_DEF_HERO_TWR_SQ = 6760000.0f;
+        static const float AKO_TWR_RANGE_SQ    = 2560000.0f;
+        static const float AKO_LOG_SEC         = 2.0f;
+        static const float AKO_HBF_ENTWR_SQ    = 12250000.0f;
+        static const bool  ENABLE_H1_ADV_WIDE       = true;
+        static const bool  ENABLE_H1B_SV_ADV        = true;
+        static const bool  ENABLE_H1C_WFB_ADV       = true;
+        static const bool  ENABLE_H2_LPV_KILLSECURE = true;
+        static const bool  ENABLE_H3_AKDZ_TOWER     = true;
+        static const bool  ENABLE_H4_AKO_LOOSEN     = true;
+        static const float H_LPV_KILL_HP            = 30.0f;
+        static const float H_AKDZ_TWR_SQ            = 3240000.0f;
+        static const bool  ENABLE_I3_TWR16          = true;
+        static const bool  ENABLE_I3_H3_NOJGL       = true;
+        static const float I3_TWR16_SQ              = 2560000.0f;
+        static const float AKO_LEAD_ALLOW           = 10.0f;
+        static const float AKO_LEAD_MIN_HP          = 60.0f;
+        static const float AKO_CALM_KILL_HP         = 30.0f;
+        static const float AKO_CALM_KILL_SQ         = 250000.0f;
+        static const float AKO_HPLEAD_DIAG          = 25.0f;
+        static std::map<AOrionAIBot*, float> g_akoUntil;
+        static const bool  ENABLE_I2_KILL_ENTRY   = true;
+        static const bool  ENABLE_I2_KILL_EXTEND  = true;
+        static const bool  ENABLE_I2_TRADE_EXTEND = false;
+        static const bool  ENABLE_I2_DIVE_ALL     = true;
+        static const bool  ENABLE_J0_BRWAKE_SYNC   = true;
+        static const int   J1_KILL_HP     = 35;
+        static const bool  ENABLE_K1B_DE_NOCOMBAT  = true;
+        static const bool  ENABLE_K2_AKO_HEROFOCUS = true;
+        static const bool  ENABLE_K3_ADV_HERO_NEAR = true;
+        static const float ADV_HERO_MAX_SQ         = 3240000.0f;
+        static const bool  ENABLE_L1_F2_NO_DEF     = true;
+        static const bool  ENABLE_L2_DE_EXIT16     = true;
+        static const bool  ENABLE_L3_J1_AFTER_DE   = true;
+        static const float L3_WINDOW_S             = 3.5f;
+        static std::map<AOrionAIBot*, float> g_l3DeSeenT;
+        static const bool  ENABLE_M1_DEF_NEAR_ONLY = true;
+        static const bool  ENABLE_M5_I2_DEF_KILL   = true;
+        static const bool  ENABLE_N1_BR_FAR_DEFEND_KEEP = true;
+        static const bool  ENABLE_Q1A_GANK_CAP80   = true;
+        static const bool  ENABLE_Q1_PRESS_DETECT  = true;
+        static const bool  ENABLE_Q1C_SIDE_CAMP    = true;
+        static const bool  ENABLE_Q1D_PRESS_GANK   = true;
+        static const bool  ENABLE_Q2_GANK_JOIN     = true;
+        static const bool  ENABLE_Q3_SV_NO_JUNGLER = true;
+        static const bool  ENABLE_H1C_NOWAVE_KILLONLY = true;
+        static const float H1C_NOWAVE_KILL_HP         = 30.0f;
+        static const bool  ENABLE_Q1E_SHORT_CD_NOARRIVE = true;
+        static const float Q1E_NOARRIVE_CD_S            = 10.0f;
+        static std::map<AOrionAIBot*, bool>  g_gankArrived;
+        static std::map<AOrionChar*, float>  g_q1gEndT;
+        static const bool  ENABLE_MRK_A_DZHF_RETREAT_OFF = true;
+        static const bool  ENABLE_MRK_B_MELEE_FINISH     = true;
+        static const bool  ENABLE_MRK_C_ALONE_NO_ALLY    = true;
+        static const bool  ENABLE_MRK_C_LIMIT            = true;
+        static const float MRK_C_MIN_HP                  = 40.0f;
+        static const bool  ENABLE_P2_I2_FINISH        = true;
+        static const float P2_I2_FINISH_HERO_HP       = 10.0f;
+        static const float P2_I2_FINISH_KEEP_HERO_HP  = 15.0f;
+        static const float P2_I2_FINISH_BOT_MIN_HP    = 25.0f;
+        static const bool  ENABLE_P2_TRAIT_HP_FIX     = true;
+        static const bool  ENABLE_P2_FINISH_OUTNUM    = true;
+        static const int   P2_FINISH_OUTNUM_DIFF      = 3;
+        static const float P2_FINISH_OUTNUM_HOLD_S    = 3.0f;
+        static std::map<AOrionAIBot*, float> g_p2FinOutT;
+        static const float Q1_GANK_MAX_SQ       = 64000000.0f;
+        static const bool  ENABLE_G8_KILLLOCK   = true;
+        static const float G8_HERO_HP           = 0.25f;
+        static const float G8_DIST_SQ           = 2250000.0f;
+        static const float G8_TWR_SQ            = 4000000.0f;
+        static const float Q1_LANE_W_SQ         = 4000000.0f;
+        static const float Q1_BASE_SQ           = 25000000.0f;
+        static const float Q1_PRESS_HERO_SQ     = 6250000.0f;
+        static const float Q1_PRESS_HP_GAP      = 10.0f;
+        static const float Q1_DUO_HP_GAP        = 20.0f;
+        static const float Q1_DUO_TWR_SQ        = 20250000.0f;
+        static const float Q1_PRESS_ENTER_S     = 5.0f;
+        static const float Q1_PRESS_HOLD_S      = 20.0f;
+        static const float Q1_SIDE_CAMP_TWR_SQ  = 36000000.0f;
+        static const float Q1_SIDE_CAMP_MAX_SQ  = 81000000.0f;
+        static const float Q1_CAMP_COMMIT_SQ    = 4000000.0f;
+        static const float Q1_PRESS_GANK_SQ     = 36000000.0f;
+        static const float Q1_LANER_NEAR_SQ     = 3240000.0f;
+        static const float Q1_LANER_HOLD_SQ     = 6250000.0f;
+        static const float Q1_JGL_MIN_HP        = 50.0f;
+        static const float Q2_ENTER_SQ          = 1000000.0f;
+        static const float Q2_HOLD_SQ           = 2250000.0f;
+        static const float Q2_JGL_NEAR_SQ       = 2250000.0f;
+        static const float Q2_ENH_SQ            = 9000000.0f;
+        static const float Q2_TWR_EXCL_SQ       = 4000000.0f;
+        static const float Q2_MIN_HP            = 35.0f;
+        static const float Q2_GEO_LATCH_S       = 3.0f;
+        static const float Q2_K2_MIN_S          = 2.0f;
+        struct Q1PressState {
+            float candT = -1.0f, untilT = -1.0f, seenT = -1.0f; bool active = false; int mode = 0; int n = 0; bool human = false;
+            AOrionChar* enemy = nullptr; AOrionChar* laner = nullptr; FVector frontPos = FVector(); bool hasFront = false;
+        };
+        static Q1PressState g_q1Press[2][3];
+        static FVector g_q1TwrPos[2][3][2];
+        static bool    g_q1TwrHave[2][3][2] = {};
+        static std::map<AOrionAIBot*, int>         g_q1SelLane;
+        static std::map<AOrionAIBot*, AOrionChar*> g_q1dGankTgt;
+        struct Q1GankLog { AOrionChar* tgt = nullptr; float startT = -1.0f; bool arrived = false; bool q1d = false;
+                           std::string tgtName; int tgtHP0 = -1; AOrionChar* ally = nullptr; std::string allyName; int allyHP0 = -1; bool allyHuman = false; };
+        static std::map<AOrionAIBot*, Q1GankLog>   g_q1gState;
+        static std::map<AOrionAIBot*, float>       g_q2EnterT;
+        static std::map<AOrionAIBot*, float>       g_q2GeoUntil;
+        static std::map<AOrionAIBot*, bool>        g_q2On;
+        static std::map<AOrionAIBot*, float>       g_q2K2T;
+        static std::map<AOrionAIBot*, AOrionChar*> g_q2Hero;
+        static std::map<AOrionAIBot*, float>       g_q2StartT;
+        static std::map<AOrionAIBot*, int>         g_q2StartHP;
+        static std::map<AOrionAIBot*, int>         g_q2StartHeroHP;
+        static std::map<AOrionAIBot*, AOrionChar*> g_q1SideLatch;
+        static std::map<AOrionAIBot*, float>       g_q1SideLatchT;
+        static const bool  ENABLE_R_SCHUBSER_RANGE    = true;
+        static const bool  ENABLE_R_SCHUBSER_SITE1_K2 = true;
+        static const float RSB_RANGED_ACCR            = 1000.0f;
+        static const bool  ENABLE_R_DEFEND_CARRY      = true;
+        static const float RDC_RECENT_S               = 5.0f;
+        static const float RDC_INNER_SQ               = 5062500.0f;
+        static const float RDC_OUTER_SQ               = 4000.0f * 4000.0f;
+        static const float RDC_HERO_SQ                = 800.0f * 800.0f;
+        static const float RDC_ACCR                   = 1200.0f;
+        static const float RDC_MAX_S                  = 12.0f;
+        static std::map<AOrionAIBot*, float>       g_rdcRetreatT;
+        static std::map<AOrionAIBot*, float>       g_rdcStartT;
+        static std::map<AOrionAIBot*, float>       g_rdcLastClearT;
+        static std::map<AOrionAIBot*, FVector>     g_rdcPrevPos;
+        static std::map<AOrionAIBot*, int>         g_rdcRetreatSrc;
+        static std::map<AOrionAIBot*, float>       g_rdcPrevDefM;
+        static std::map<AOrionAIBot*, float>       g_rdcPrevDefT;
+        static const bool  ENABLE_R_DEFEND_WAKE       = true;
+        static const float RDW_HERO_CLOSE_SQ          = 400.0f * 400.0f;
+        static const float RDW_MAX_S                  = 25.0f;
+        static std::map<AOrionAIBot*, float>       g_rdcWakePrevT;
+        static std::map<AOrionAIBot*, int>         g_rdcStartKind;
+        static const bool  ENABLE_R_BLIND_RETREAT     = true;
+        static const float RBR_HERO_MAX_SQ            = 3240000.0f;
+        static const float RBR_MELEE_PURSUER_SQ       = 640000.0f;
+        static const int   RBR_ENM_MIN                = 3;
+        static const float RBR_KILL_HERO_HP           = 40.0f;
+        static const float RBR_KILL_BOT_MIN_HP        = 40.0f;
+        static const float RBR_KILL_LEAD              = 15.0f;
+        static const int   RBR_ARM_TICKS              = 1;
+        static const float RBR_TIMEOUT_S              = 12.0f;
+        static const float RBR_MIN_COMMIT_S           = 3.0f;
+        static const float RBR_COOLDOWN_S             = 5.0f;
+        static std::map<AOrionAIBot*, int>         g_rbrArmN;
+        static std::map<AOrionAIBot*, float>       g_rbrArmT;
+        static std::map<AOrionAIBot*, float>       g_rbrFireT;
+        static std::map<AOrionAIBot*, float>       g_rbrEndT;
+        static std::map<AOrionAIBot*, int>         g_rbrWaveN;
+        static std::map<AOrionAIBot*, int>         g_rbrNoHeroN;
+        static std::map<AOrionAIBot*, FVector>     g_rbrPrevPos;
+        static const bool  ENABLE_R_WFB_DUO           = true;
+        static const bool  ENABLE_R_WFB_CT            = true;
+        static const float RWFB_CT_ENTWR_SQ           = 2500.0f * 2500.0f;
+        static const float RWFB_PARTNER_COMMIT_SQ     = 800.0f * 800.0f;
+        static const bool  ENABLE_R_TOWER_RADIUS      = true;
+        static const bool  ENABLE_R_TOWER_HOLD        = true;
+        static const float RTR_A_ARRIVE_SQ            = 1200.0f * 1200.0f;
+        static const float RTR_A_ACCR                 = 800.0f;
+        static const int   RTR_A_ENTER_TICKS          = 2;
+        static const float RTR_A_COMMIT_S             = 6.0f;
+        static const float RTR_A_CAP_S                = 8.0f;
+        static const float RTR_COOLDOWN_S             = 4.0f;
+        static const float RTR_WAKE_MELEE_SQ          = 800.0f * 800.0f;
+        static const float RTR_WAKE_ANY_SQ            = 400.0f * 400.0f;
+        static const float RTR_REBLIND_MIN_S          = 2.0f;
+        static const float RTR_REBLIND_MELEE_SQ       = 1200.0f * 1200.0f;
+        static const int   RTR_A_IN16_TICKS           = 2;
+        static const float RTR_B_PULL_SQ              = 1400.0f * 1400.0f;
+        static const float RTR_B_ACCR                 = 1100.0f;
+        static const float RTR_B_TO_LEASH_SQ          = 2000.0f * 2000.0f;
+        static const float RTR_B_CAP_S                = 10.0f;
+        static const bool  ENABLE_R_WAVE_HOLD         = true;
+        static const bool  ENABLE_R_TOWER_DIST        = true;
+        static const bool  RTD_ACTION                 = false;
+        static const int   RWH_MIN_SUB                = 2;
+        static const float RWH_TIP_MIN_SQ             = 400.0f * 400.0f;
+        static const float RWH_DEEP_MIN_CM            = 400.0f;
+        static const float RWH_ACCR                   = 300.0f;
+        static const float RWH_ENMIN_SQ               = 1200.0f * 1200.0f;
+        static const float RWH_ENTWR_SQ               = 2500.0f * 2500.0f;
+        static const float RWH_HERO_RSB_SQ            = 800.0f * 800.0f;
+        static const int   RWH_ARM_TICKS              = 2;
+        static const float RWH_TIMEOUT_S              = 8.0f;
+        static const float RWH_COOLDOWN_S             = 3.0f;
+        static const float RWH_DANGER_GONE_S          = 3.0f;
+        static const float RTD_ENTER_SQ               = 2000.0f * 2000.0f;
+        static const float RTD_EXIT_SQ                = 2200.0f * 2200.0f;
+        static const float RTD_TANK_SQ                = 1500.0f * 1500.0f;
+        static const float RTD_ENTER_TANK_SQ          = 1700.0f * 1700.0f;
+        static const float RTD_TWR_ACCR               = 1500.0f;
+        static const float RTD_TIMEOUT_S              = 5.0f;
+        static const float RTD_COOLDOWN_S             = 3.0f;
+        static const float RTD_MIN_TGT_TWR_SQ         = 2000.0f * 2000.0f;
+        static std::map<AOrionAIBot*, float>   g_rtrAStartT;
+        static std::map<AOrionAIBot*, float>   g_rtrALastT;
+        static std::map<AOrionAIBot*, float>   g_rtrAEndT;
+        static std::map<AOrionAIBot*, int>     g_rtrAStreak;
+        static std::map<AOrionAIBot*, float>   g_rtrAStreakT;
+        static std::map<AOrionAIBot*, float>   g_rtrAWakeT;
+        static std::map<AOrionAIBot*, int>     g_rtrAFrMN;
+        static std::map<AOrionAIBot*, int>     g_rtrANoHeroN;
+        static std::map<AOrionAIBot*, FVector> g_rtrAPrevPos;
+        static std::map<AOrionAIBot*, float>   g_rtrALogT;
+        static std::map<AOrionAIBot*, float>   g_rtrBStartT;
+        static std::map<AOrionAIBot*, float>   g_rtrBLastT;
+        static std::map<AOrionAIBot*, float>   g_rtrBEndT;
+        static std::map<AOrionAIBot*, float>   g_rtrBHandoffT;
+        static std::map<AOrionAIBot*, float>   g_rtrBWroteT;
+        static std::map<AOrionAIBot*, int>     g_rtrBWaveN;
+        static std::map<AOrionAIBot*, int>     g_rtrBNoHeroN;
+        static std::map<AOrionAIBot*, FVector> g_rtrBPrevPos;
+        static std::map<AOrionAIBot*, float>   g_rtrBLogT;
+        static std::map<AOrionAIBot*, int>     g_rtrBPullPrev;
+        static std::map<AOrionAIBot*, int>     g_rtrBTickN;
+        static std::map<AOrionAIBot*, int>     g_rtrBPullN;
+        static std::map<AOrionAIBot*, float>   g_rwhOnT;
+        static std::map<AOrionAIBot*, float>   g_rwhWroteT;
+        static std::map<AOrionAIBot*, float>   g_rwhOwnT;
+        static std::map<AOrionAIBot*, float>   g_rwhEndT;
+        static std::map<AOrionAIBot*, int>     g_rwhArmN;
+        static std::map<AOrionAIBot*, float>   g_rwhArmT;
+        static std::map<AOrionAIBot*, int>     g_rwhAheadN;
+        static std::map<AOrionAIBot*, float>   g_rwhDangerT;
+        static std::map<AOrionAIBot*, FVector> g_rwhPrevPos;
+        static std::map<AOrionAIBot*, float>   g_rwhLogT;
+        static std::map<AOrionAIBot*, float>   g_rtdOnT;
+        static std::map<AOrionAIBot*, float>   g_rtdWroteT;
+        static std::map<AOrionAIBot*, FVector> g_rtdPrevPos;
+        static std::map<AOrionAIBot*, float>   g_rtdLogT;
+        static std::map<AOrionAIBot*, float>   g_rtrAHandoffT;
+        static std::map<AOrionAIBot*, int>     g_rtrAIn16N;
+        static std::map<AOrionAIBot*, float>   g_rtdEndT;
+        static const bool  ENABLE_R_TR_A_SEE          = true;
+        static const bool  RTR_ASEE_STOP              = true;
+        static const float RTR_ASEE_ACCR              = RDC_ACCR;
+        static const bool  ENABLE_R_WH_TRADE          = true;
+        static const float RWH_TRADE_HERO_HP          = 60.0f;
+        static const float RWH_TRADE_LEAD             = 30.0f;
+        static const bool  ENABLE_R_OWNUE_SELF        = true;
+        static const bool  ENABLE_R_WFB_KILL_FIX      = true;
+        static const bool  ENABLE_R_WFB_COVER_END     = true;
+        static const bool  ENABLE_R_RECENT            = true;
+        static const float R_RECENT_S                 = 2.5f;
+        static const bool  ENABLE_R_WFB_NOSTOP        = true;
+        static const bool  ENABLE_R_SB_TWR_GUARD      = true;
+        static const bool  ENABLE_R_WFB_DUO2          = false;
+        static const float RWFB_DUO_LOWHP             = 40.0f;
+        static const int   RBR_WHY_V44                = 1;
+        static const int   RBR_WHY_OUT                = 2;
+        static const int   RBR_WHY_LOW                = 4;
+        static const bool  ENABLE_R_TOWER_LEASH       = true;
+        static const float RTL_START_SQ               = 1800.0f * 1800.0f;
+        static const float RTL_MAX_SQ                 = 3000.0f * 3000.0f;
+        static const float RTL_HERO_SQ                = 2500.0f * 2500.0f;
+        static const float RTL_OUTWARD_CM             = 200.0f;
+        static const float RTL_CAP_S                  = 10.0f;
+        static const float RTL_COOLDOWN_S             = 3.0f;
+        static const float RTL_K2_MIN_GAP_S           = 2.0f;
+        static const bool  ENABLE_R_WH_MINGATE        = true;
+        static const int   RWH_FREE_TICKS             = 2;
+        static const bool  RWH_MINGATE_TWR_EXEMPT     = true;
+        static const bool  ENABLE_R_OFFENSE           = true;
+        static const bool  ROFF_ACTION                = true;
+        static const float ROFF_HERO_MIN_SQ           = 1800.0f * 1800.0f;
+        static const float ROFF_HERO_MAX_SQ           = 2400.0f * 2400.0f;
+        static const float ROFF_HERO_KEEP_SQ          = 2600.0f * 2600.0f;
+        static const float ROFF_POKE_ACCR             = 1350.0f;
+        static const float ROFF_END_POKE_SQ           = 1600.0f * 1600.0f;
+        static const float ROFF_HERO_TWR_SQ           = 2000.0f * 2000.0f;
+        static const float ROFF_BOT_ENTWR_SQ          = 2200.0f * 2200.0f;
+        static const float ROFF_STOP_ENTWR_SQ         = 2200.0f * 2200.0f;
+        static const float ROFF_MIN_HP                = 50.0f;
+        static const float ROFF_HEROCNT_SQ            = 2500.0f * 2500.0f;
+        static const float ROFF_MELEE_SQ              = 1200.0f * 1200.0f;
+        static const float ROFF_TIP_MARGIN_CM         = 400.0f;
+        static const float ROFF_K2_HERO_HP            = 60.0f;
+        static const float ROFF_MIA_SQ                = 5000.0f * 5000.0f;
+        static const float ROFF_MIA_MIN_S             = 15.0f;
+        static const float ROFF_MIA_MAX_S             = 120.0f;
+        static const float ROFF_CAP_S                 = 4.0f;
+        static const float ROFF_COOLDOWN_S            = 4.0f;
+        static const float ROFF_PARTNER_SQ            = 1800.0f * 1800.0f;
+        static const float ROFF_K2_MIN_GAP_S          = 2.0f;
+        static const bool  ROFF_END_RETURN            = true;
+        static const float ROFF_RETURN_ACCR           = 600.0f;
+        static const float ROFF_POST_LOG_S            = 3.5f;
+        static const bool  ENABLE_R_ADVWAIT_GATE      = true;
+        static const float RAW_HP_LOW                 = 50.0f;
+        static const float RAW_HP_CRIT                = 35.0f;
+        static const float RAW_DEBOUNCE_S             = 2.0f;
+        static const float RAW_WAVE_ACCR              = 600.0f;
+        static const float RAW_HERO30_SQ              = 3000.0f * 3000.0f;
+        static const float RAW_PARTNER_SQ             = 2500.0f * 2500.0f;
+        static const bool  RAW_STOP_ON_EXIT           = true;
+        static std::map<AOrionAIBot*, float>       g_rtrASeeT;
+        static std::map<AOrionAIBot*, float>       g_rtrASeeLogT;
+        static std::map<AOrionAIBot*, FVector>     g_rtrASeePrevPos;
+        static std::map<AOrionAIBot*, float>       g_rtrASeeLastT;
+        static std::map<AOrionAIBot*, float>       g_rRetEndT;
+        static std::map<AOrionAIBot*, int>         g_rbrStartWhy;
+        static std::map<AOrionAIBot*, int>         g_rbrV44OffN;
+        static std::map<AOrionAIBot*, float>       g_rtlStartT;
+        static std::map<AOrionAIBot*, float>       g_rtlLastT;
+        static std::map<AOrionAIBot*, float>       g_rtlEndT;
+        static std::map<AOrionAIBot*, float>       g_rtlWroteT;
+        static std::map<AOrionAIBot*, float>       g_rtlK2T;
+        static std::map<AOrionAIBot*, int>         g_rtlActN;
+        static std::map<AOrionAIBot*, int>         g_rtlNoHeroN;
+        static std::map<AOrionAIBot*, int>         g_rtlWaveN;
+        static std::map<AOrionAIBot*, int>         g_rtlTickN;
+        static std::map<AOrionAIBot*, int>         g_rtlPullN;
+        static std::map<AOrionAIBot*, int>         g_rtlPullPrev;
+        static std::map<AOrionAIBot*, float>       g_rtlPrevTwrSq;
+        static std::map<AOrionAIBot*, float>       g_rtlPrevTwrT;
+        static std::map<AOrionAIBot*, FVector>     g_rtlPrevPos;
+        static std::map<AOrionAIBot*, float>       g_rtlLogT;
+        static std::map<AOrionAIBot*, int>         g_rwhFreeN;
+        static std::map<AOrionAIBot*, float>       g_rwhFreeT;
+        static std::map<AOrionAIBot*, float>       g_roffOnT;
+        static std::map<AOrionAIBot*, float>       g_roffWroteT;
+        static std::map<AOrionAIBot*, float>       g_roffEndT;
+        static std::map<AOrionAIBot*, AOrionChar*> g_roffTgt;
+        static std::map<AOrionAIBot*, int>         g_roffK2N;
+        static std::map<AOrionAIBot*, int>         g_roffStartHP;
+        static std::map<AOrionAIBot*, int>         g_roffStartHeroHP;
+        static std::map<AOrionAIBot*, int>         g_roffStartHeroM;
+        static std::map<AOrionAIBot*, FVector>     g_roffPrevPos;
+        static std::map<AOrionAIBot*, float>       g_roffLogT;
+        static std::map<AOrionAIBot*, float>       g_roffK2T;
+        static std::map<AOrionAIBot*, float>       g_roffPostT;
+        static std::map<AOrionAIBot*, const char*> g_roffPostWhy;
+        static std::map<AOrionAIBot*, int>         g_roffPostHeroM0;
+        static std::map<AOrionAIBot*, FVector>     g_roffPostPos;
+        static std::map<AOrionAIBot*, int>         g_roffPostStop;
+        static std::map<AOrionAIBot*, float>       g_rawPullT;
+        static std::map<AOrionAIBot*, float>       g_rawPullAnyT;
+        static std::map<AOrionAIBot*, int>         g_rawMode;
+        static std::map<AOrionAIBot*, float>       g_rawModeT;
+        static const bool  ENABLE_R_WH_ESCALATE       = true;
+        static const int   RWHX_ENM_MIN               = 3;
+        static const int   RWHX_DEFICIT               = 2;
+        static const float RWHX_ENMIN_SQ              = 600.0f * 600.0f;
+        static const int   RWHX_SUB_OFFSET            = 1;
+        static const bool  RWHX_DEEP_FALLBACK         = true;
+        static const float RWHX_BEHIND_TIP_M          = 10.0f;
+        static const bool  RWHX_ARRIVE_BEHIND         = true;
+        static const float RWHX_ARRIVE_STOP_SQ        = 650.0f * 650.0f;
+        static const bool  RWHX_TRADE_GUARD           = true;
+        static const bool  ENABLE_R_OFF_TIPHYST       = true;
+        static const float ROFF_TIP_END_CM            = 150.0f;
+        static const bool  ENABLE_R_OFF_MINDEF        = true;
+        static const int   ROFF_MINDEF_TICKS          = 2;
+        static const bool  ENABLE_R_OFF_HOLD          = true;
+        static const float ROFF_HOLD_START_MIN_SQ     = 1500.0f * 1500.0f;
+        static const float ROFF_FAR_SQ                = 1800.0f * 1800.0f;
+        static const int   ROFF_FAR_TICKS             = 2;
+        static const float ROFF_REAPPROACH_SQ         = 1750.0f * 1750.0f;
+        static const int   ROFF_REAPPROACH_TICKS      = 2;
+        static const float ROFF_HOLD_CAP_S            = 10.0f;
+        static const bool  ROFF_HOLD_STOP             = true;
+        static const int   ROFF_HOLD_STOP_MAX         = 1;
+        static const bool  ENABLE_R_OFF_BIND          = true;
+        static const float ROFF_BIND_HP               = 40.0f;
+        static const bool  ROFF_BIND_K2               = true;
+        static const bool  ENABLE_R_WFB_STALL_RE      = true;
+        static const float RWS_MOVED_MIN_M            = 1.0f;
+        static const bool  RWS_TWR_NEEDS_NOAPPROACH   = true;
+        static const float RWS_TWR_SPEED_MS           = 4.0f;
+        static std::map<AOrionAIBot*, float>       g_rwhxFireT;
+        static std::map<AOrionAIBot*, float>       g_roffHoldT;
+        static std::map<AOrionAIBot*, int>         g_roffHoldN;
+        static std::map<AOrionAIBot*, int>         g_roffFarN;
+        static std::map<AOrionAIBot*, int>         g_roffOutN;
+        static std::map<AOrionAIBot*, int>         g_roffStopN;
+        static std::map<AOrionAIBot*, int>         g_roffPhaseK;
+        static std::map<AOrionAIBot*, int>         g_roffPhaseN;
+        static std::map<AOrionAIBot*, int>         g_roffK2Ph;
+        static std::map<AOrionAIBot*, int>         g_roffBindN;
+        static std::map<AOrionAIBot*, int>         g_roffBindK2Done;
+        static std::map<AOrionAIBot*, int>         g_roffDefN;
+        static std::map<AOrionAIBot*, float>       g_rwsEpT;
+        static std::map<AOrionAIBot*, int>         g_rwsN;
+        static std::map<AOrionAIBot*, int>         g_rwsTwrDone;
+        static std::map<AOrionAIBot*, float>       g_rwsPrevTgtSq;
+        auto RRetreatRecent = [](AOrionAIBot* b, float now, const char** src) -> bool {
+            const char* s = nullptr;
+            if (lastThreatRetreatTime.count(b) && (now - lastThreatRetreatTime[b]) < R_RECENT_S) s = "sticky";
+            else if (g_rbrEndT.count(b) && (now - g_rbrEndT[b]) < RBR_COOLDOWN_S)                 s = "rwfb";
+            else if (g_rRetEndT.count(b) && (now - g_rRetEndT[b]) < R_RECENT_S)                   s = "rtrA";
+            if (src) *src = s ? s : "-";
+            return ENABLE_R_RECENT && s != nullptr;
+        };
+        static const float I2_KILL_HP         = 35.0f;
+        static const float I2_KILL_BOT_MIN_HP = 40.0f;
+        static const float I2_KILL_LEAD       = 15.0f;
+        static const float I2_KILL_MAX_SQ     = 2250000.0f;
+        static const float I2_KILL_CLEAR_SQ   = 3240000.0f;
+        static const float I2_KILL_KEEP_HP    = 40.0f;
+        static const float I2_DEF_HERO_TWR_SQ = 11560000.0f;
+        static const float I2_EXT_S           = 2.0f;
+        static const float I2_MAX_S           = 9.0f;
+        static const int   I2_TRADE_LOST      = 6;
+        static std::map<AOrionAIBot*, int>         g_akoKill;
+        static std::map<AOrionAIBot*, float> g_akoStartT;
+        static std::map<AOrionAIBot*, float> g_akoLastT;
+        static std::map<AOrionAIBot*, float> g_akoRetreatSeenT;
+        static std::map<AOrionAIBot*, float> g_akoLogT;
+        static std::map<AOrionAIBot*, float> g_akoStartHP;
+        static std::map<AOrionAIBot*, int>   g_akoStartHeroHP;
+        static std::map<AOrionAIBot*, int>   g_akoMode;
+        static std::map<AOrionAIBot*, float> g_mwhAheadZeroSince;
+        static std::map<AOrionAIBot*, float> g_mwhUntil;
+        static std::map<AOrionAIBot*, float> g_mwhStartT;
+        static std::map<AOrionAIBot*, int>   g_mwhStartGap;
+        static std::map<AOrionAIBot*, int>   g_mwhTicks;
+
+
+        static const bool  ENABLE_AK_WAVE_AHEAD_VETO = true;
+        static const float AK_WAVE_AHEAD_R_SQ        = 6250000.0f;
+        static const int   AK_WAVE_AHEAD_KILL_HP     = 30;
+        static const bool  ENABLE_AK_HERO_BEYOND_FRONT = true;
+        static const float AHBF_ENTER_M     = 0.0f;
+        static const float AHBF_EXIT_M      = 2.0f;
+        static const float AHBF_MIN_HOLD_S  = 2.0f;
+        static const int   AHBF_KILL_HP     = 40;
+        static std::map<AOrionAIBot*, float> g_ahbfOnT;
+
+        static const bool  ENABLE_SOLO1V1_V44DIVE   = true;
+        static std::map<AOrionAIBot*, float> g_svActiveUntil;
+        static std::map<AOrionAIBot*, int>   g_svEpBotHP;
+        static std::map<AOrionAIBot*, int>   g_svEpHeroHP;
+        static std::map<AOrionAIBot*, float> g_svLastT;
+        static std::map<AOrionAIBot*, float> g_svFireT;
+        static const bool ENABLE_SOLO1V1_ANCHORRESET = true;
+        static std::map<AOrionAIBot*, int>   g_svFireHP;
+        static const bool  ENABLE_SV_TARGET_LATCH = true;
+
+        static std::map<AOrionAIBot*, AActor*> g_svTarget;
+        static std::map<AOrionAIBot*, bool>    g_svTgtIsWave;
+        static const bool  ENABLE_RETREAT_COVER_RELEASE = true;
+        static const float RETREAT_MAX_HOLD_S           = 14.0f;
+        static const float RETREAT_COVER_TWR_SQ         = 3240000.0f;
+        static std::map<AOrionAIBot*, float>   g_svMaxHoldT;
+        static const bool  ENABLE_POST_RELEASE_HOLD    = true;   static const bool PRH_ACTION = false;
+        static const float POST_RELEASE_HOLD_S         = 4.0f;
+        static std::map<AOrionAIBot*, float>       g_postRelUntil;
+        auto p5EraseBot = [](AOrionAIBot* b) {
+        };
+        static const bool  ENABLE_TRADE_TRACKER   = true;
+        static const float TR_WINDOW_S            = 3.0f;
+        static const int   TR_LOSE_PP             = 10;
+        struct P6TrState { AActor* hero; float t[8]; int bhp[8]; int hhp[8]; int n; };
+        static std::map<AOrionAIBot*, P6TrState> g_trState;
+        static const bool  ENABLE_DE_TOWER_LEASH  = true;
+        static const float DE_HERO_TWR_IN_SQ      = 2560000.0f;
+        static const float DE_HERO_TWR_OUT_SQ     = 4000000.0f;
+        static const float DE_BOT_TWR_SQ          = 4840000.0f;
+        static std::map<AOrionAIBot*, int>   g_deLeashOn;
+        static const bool  ENABLE_DEF_POKE_YIELD2 = true;
+        static const bool  DPY_ACTION             = true;
+        static const bool  ENABLE_D1_DPY_MINION_TERM = true;
+        static const bool  ENABLE_D1_DPY_HIJACK_GATE = true;
+        static const bool  ENABLE_I1_POKE_DEEP       = true;
+        static const bool  ENABLE_I_F2_DPYWALK_BLOCK = true;
+        static const int   I1_LOSE_NET          = 6;
+        static const int   I1_HERO_LOSS_MAX     = 2;
+        static const float I1_LEAD_MAX          = 10.0f;
+        static const float I1_KILL_SKIP_HP      = 35.0f;
+        static std::map<AOrionAIBot*, float> g_i1EpT;
+        static const float DPY_HERO_TWR_IN_SQ     = 3240000.0f;
+        static const float DPY_HERO_TWR_OUT_SQ    = 2560000.0f;
+        static const float DPY_HERO_TWR_MAX_SQ    = 5760000.0f;
+        static const float DPY_HERO_FAR_SQ        = 9000000.0f;
+        static const float DPY_HERO_BOT_SQ        = 1960000.0f;
+        static const float DPY_BOT_MIN_SQ         = 640000.0f;
+        static const float DPY_ARRIVE_SQ          = 250000.0f;
+        static const float DPY_WALK_ACCR          = 300.0f;
+        static const float DPY_HOLD_ACCR          = 500.0f;
+        static const float DPY_HOLD_NUDGE_SQ      = 1000000.0f;
+        static const float DPY_MAX_S              = 8.0f;
+        static const float DPY_COOLDOWN_S         = 4.0f;
+        static const int   DPY_TRADE_WIN          = -5;
+        static std::map<AOrionAIBot*, float> g_dpyOnT;
+        static std::map<AOrionAIBot*, float> g_dpyArrT;
+        static std::map<AOrionAIBot*, float> g_dpyEvalT;
+        static std::map<AOrionAIBot*, float> g_dpyCoolT;
+        static std::map<AOrionAIBot*, float> g_brFireT;
+        static std::map<AOrionAIBot*, std::string> g_p7PrevAct;
+        static const bool  ENABLE_P8_DPY_FIX        = true;
+        static const float P8_DPY_HERO_TWR_IN_SQ    = 2560000.0f;
+        static const float P8_DPY_HERO_TWR_OUT_SQ   = 1960000.0f;
+        static const int   P8_DPY_HERO_LOSS_MIN     = 3;
+        static const bool  ENABLE_P8_FAR_DEFEND     = true;
+        static const float P8_FAR_IN_SQ             = 9000000.0f;
+        static const float P8_FAR_OUT_SQ            = 5760000.0f;
+        static const bool  ENABLE_P8_LRCOMMIT_LIVE  = true;
+        static const bool  ENABLE_P8_SV_POS_RELEASE = true;
+        static const float P8_SVPOS_MAX_S           = 4.0f;
+        auto p6EraseAll = [](AOrionAIBot* b) {
+            g_p7PrevAct.erase(b);
+            g_trState.erase(b); g_deLeashOn.erase(b);
+            g_dpyOnT.erase(b); g_dpyArrT.erase(b); g_dpyEvalT.erase(b); g_dpyCoolT.erase(b);
+            g_i1EpT.erase(b);
+            g_l3DeSeenT.erase(b);
+            g_brFireT.erase(b);
+            g_q1SelLane.erase(b); g_q1dGankTgt.erase(b); g_q1gState.erase(b);
+            g_gankArrived.erase(b);
+            g_q1SideLatch.erase(b); g_q1SideLatchT.erase(b);
+            g_q2EnterT.erase(b); g_q2GeoUntil.erase(b); g_q2On.erase(b); g_q2K2T.erase(b); g_q2Hero.erase(b); g_q2StartT.erase(b); g_q2StartHP.erase(b); g_q2StartHeroHP.erase(b);
+            g_rdcRetreatT.erase(b); g_rdcStartT.erase(b); g_rdcLastClearT.erase(b); g_rdcPrevPos.erase(b);
+            g_rdcRetreatSrc.erase(b); g_rdcPrevDefM.erase(b); g_rdcPrevDefT.erase(b);
+            g_rdcWakePrevT.erase(b); g_rdcStartKind.erase(b);
+            g_rtrAStartT.erase(b); g_rtrALastT.erase(b); g_rtrAEndT.erase(b); g_rtrAStreak.erase(b); g_rtrAStreakT.erase(b); g_rtrAWakeT.erase(b); g_rtrAFrMN.erase(b); g_rtrANoHeroN.erase(b); g_rtrAPrevPos.erase(b); g_rtrALogT.erase(b);
+            g_rtrBStartT.erase(b); g_rtrBLastT.erase(b); g_rtrBEndT.erase(b); g_rtrBHandoffT.erase(b); g_rtrBWroteT.erase(b); g_rtrBWaveN.erase(b); g_rtrBNoHeroN.erase(b); g_rtrBPrevPos.erase(b); g_rtrBLogT.erase(b); g_rtrBPullPrev.erase(b); g_rtrBTickN.erase(b); g_rtrBPullN.erase(b);
+            g_rwhOnT.erase(b); g_rwhWroteT.erase(b); g_rwhOwnT.erase(b); g_rwhEndT.erase(b); g_rwhArmN.erase(b); g_rwhArmT.erase(b); g_rwhAheadN.erase(b); g_rwhDangerT.erase(b); g_rwhPrevPos.erase(b); g_rwhLogT.erase(b); g_rtdOnT.erase(b); g_rtdWroteT.erase(b); g_rtdPrevPos.erase(b); g_rtdLogT.erase(b);
+            g_rtrAHandoffT.erase(b); g_rtrAIn16N.erase(b); g_rtdEndT.erase(b);
+            g_rtrASeeT.erase(b); g_rtrASeeLogT.erase(b); g_rtrASeePrevPos.erase(b); g_rtrASeeLastT.erase(b); g_rRetEndT.erase(b); g_rbrStartWhy.erase(b); g_rbrV44OffN.erase(b);
+            g_rtlStartT.erase(b); g_rtlLastT.erase(b); g_rtlEndT.erase(b); g_rtlWroteT.erase(b); g_rtlK2T.erase(b); g_rtlActN.erase(b); g_rtlNoHeroN.erase(b); g_rtlWaveN.erase(b);
+            g_rtlTickN.erase(b); g_rtlPullN.erase(b); g_rtlPullPrev.erase(b); g_rtlPrevTwrSq.erase(b); g_rtlPrevTwrT.erase(b); g_rtlPrevPos.erase(b); g_rtlLogT.erase(b);
+            g_rwhFreeN.erase(b); g_rwhFreeT.erase(b);
+            g_roffOnT.erase(b); g_roffWroteT.erase(b); g_roffEndT.erase(b); g_roffTgt.erase(b); g_roffK2N.erase(b); g_roffStartHP.erase(b); g_roffStartHeroHP.erase(b); g_roffStartHeroM.erase(b);
+            g_roffPrevPos.erase(b); g_roffLogT.erase(b); g_roffK2T.erase(b); g_roffPostT.erase(b); g_roffPostWhy.erase(b); g_roffPostHeroM0.erase(b); g_roffPostPos.erase(b); g_roffPostStop.erase(b);
+            g_rawPullT.erase(b); g_rawPullAnyT.erase(b); g_rawMode.erase(b); g_rawModeT.erase(b);
+            g_rwhxFireT.erase(b);
+            g_roffHoldT.erase(b); g_roffHoldN.erase(b); g_roffFarN.erase(b); g_roffPhaseK.erase(b); g_roffPhaseN.erase(b); g_roffK2Ph.erase(b); g_roffBindN.erase(b);
+            g_roffOutN.erase(b); g_roffStopN.erase(b);
+            g_roffBindK2Done.erase(b); g_roffDefN.erase(b);
+            g_rwsEpT.erase(b); g_rwsN.erase(b); g_rwsTwrDone.erase(b); g_rwsPrevTgtSq.erase(b);
+        };
+        auto p6EraseRecall = [](AOrionAIBot* b) {
+            g_dpyOnT.erase(b); g_dpyArrT.erase(b); g_dpyCoolT.erase(b);
+            g_i1EpT.erase(b);
+            g_l3DeSeenT.erase(b);
+            g_deLeashOn.erase(b); g_brFireT.erase(b);
+            g_q1SelLane.erase(b); g_q1dGankTgt.erase(b);
+            g_gankArrived.erase(b);
+            g_q1SideLatch.erase(b); g_q1SideLatchT.erase(b);
+            g_q2EnterT.erase(b); g_q2GeoUntil.erase(b); g_q2On.erase(b); g_q2K2T.erase(b); g_q2Hero.erase(b); g_q2StartT.erase(b); g_q2StartHP.erase(b); g_q2StartHeroHP.erase(b);
+            g_rdcRetreatT.erase(b); g_rdcStartT.erase(b); g_rdcLastClearT.erase(b); g_rdcPrevPos.erase(b);
+            g_rdcRetreatSrc.erase(b); g_rdcPrevDefM.erase(b); g_rdcPrevDefT.erase(b);
+            g_rdcWakePrevT.erase(b); g_rdcStartKind.erase(b);
+            g_rtrAStartT.erase(b); g_rtrALastT.erase(b); g_rtrAEndT.erase(b); g_rtrAStreak.erase(b); g_rtrAStreakT.erase(b); g_rtrAWakeT.erase(b); g_rtrAFrMN.erase(b); g_rtrANoHeroN.erase(b); g_rtrAPrevPos.erase(b); g_rtrALogT.erase(b);
+            g_rtrBStartT.erase(b); g_rtrBLastT.erase(b); g_rtrBEndT.erase(b); g_rtrBHandoffT.erase(b); g_rtrBWroteT.erase(b); g_rtrBWaveN.erase(b); g_rtrBNoHeroN.erase(b); g_rtrBPrevPos.erase(b); g_rtrBLogT.erase(b); g_rtrBPullPrev.erase(b); g_rtrBTickN.erase(b); g_rtrBPullN.erase(b);
+            g_rwhOnT.erase(b); g_rwhWroteT.erase(b); g_rwhOwnT.erase(b); g_rwhEndT.erase(b); g_rwhArmN.erase(b); g_rwhArmT.erase(b); g_rwhAheadN.erase(b); g_rwhDangerT.erase(b); g_rwhPrevPos.erase(b); g_rwhLogT.erase(b); g_rtdOnT.erase(b); g_rtdWroteT.erase(b); g_rtdPrevPos.erase(b); g_rtdLogT.erase(b);
+            g_rtrAHandoffT.erase(b); g_rtrAIn16N.erase(b); g_rtdEndT.erase(b);
+            g_rtrASeeT.erase(b); g_rtrASeeLogT.erase(b); g_rtrASeePrevPos.erase(b); g_rtrASeeLastT.erase(b); g_rRetEndT.erase(b); g_rbrStartWhy.erase(b); g_rbrV44OffN.erase(b);
+            g_rtlStartT.erase(b); g_rtlLastT.erase(b); g_rtlEndT.erase(b); g_rtlWroteT.erase(b); g_rtlK2T.erase(b); g_rtlActN.erase(b); g_rtlNoHeroN.erase(b); g_rtlWaveN.erase(b);
+            g_rtlTickN.erase(b); g_rtlPullN.erase(b); g_rtlPullPrev.erase(b); g_rtlPrevTwrSq.erase(b); g_rtlPrevTwrT.erase(b); g_rtlPrevPos.erase(b); g_rtlLogT.erase(b);
+            g_rwhFreeN.erase(b); g_rwhFreeT.erase(b);
+            g_roffOnT.erase(b); g_roffWroteT.erase(b); g_roffEndT.erase(b); g_roffTgt.erase(b); g_roffK2N.erase(b); g_roffStartHP.erase(b); g_roffStartHeroHP.erase(b); g_roffStartHeroM.erase(b);
+            g_roffPrevPos.erase(b); g_roffLogT.erase(b); g_roffK2T.erase(b); g_roffPostT.erase(b); g_roffPostWhy.erase(b); g_roffPostHeroM0.erase(b); g_roffPostPos.erase(b); g_roffPostStop.erase(b);
+            g_rawPullT.erase(b); g_rawPullAnyT.erase(b); g_rawMode.erase(b); g_rawModeT.erase(b);
+            g_rwhxFireT.erase(b);
+            g_roffHoldT.erase(b); g_roffHoldN.erase(b); g_roffFarN.erase(b); g_roffPhaseK.erase(b); g_roffPhaseN.erase(b); g_roffK2Ph.erase(b); g_roffBindN.erase(b);
+            g_roffOutN.erase(b); g_roffStopN.erase(b);
+            g_roffBindK2Done.erase(b); g_roffDefN.erase(b);
+            g_rwsEpT.erase(b); g_rwsN.erase(b); g_rwsTwrDone.erase(b); g_rwsPrevTgtSq.erase(b);
+        };
+        auto p5EraseWindows = [](AOrionAIBot* b) {
+        };
+        static std::map<AOrionAIBot*, int>     g_recallStartTwrM;
+        static std::map<AOrionAIBot*, int>     g_recallMinTwrM;
+        static std::map<AOrionAIBot*, int>     g_attrEntryHP;
+        static std::map<AOrionAIBot*, float>   g_vpmMoveFiredT;
+        static std::map<AOrionDamageableObjective_Base*, int> TowerDefenders;
+        static std::map<AOrionDamageableObjective_Base*, float> g_collapseThreatStart;
+        static std::map<AOrionDamageableObjective_Base*, float> g_collapseThreatLastSeen;
+        static std::map<AOrionAIBot*, float>                    g_collapseStartTime;
+        constexpr float COLLAPSE_TRAVEL_DIST_SQ = 5062500.0f;
+        constexpr float COLLAPSE_PERSIST_SEC    = 2.0f;
+        constexpr float COLLAPSE_COMMIT_SEC     = 22.0f;
+        constexpr bool  ENABLE_COLLAPSE_DIST_CAP   = true;
+        constexpr bool  ENABLE_COLLAPSE_FIGHT_GATE = true;
+        constexpr float COLLAPSE_MAX_DIST_SQ       = 144000000.0f;
+
+        static const bool ENABLE_LANE_RETURN = true;
+        static std::map<AOrionDamageableObjective_Base*, float> g_laneThreatStart;
+        static std::map<AOrionDamageableObjective_Base*, float> g_laneThreatLastSeen;
+        static std::map<AOrionAIBot*, float>                    g_laneReturnStartTime;
+        constexpr float LANE_RETURN_PERSIST_INNER_SEC = 2.5f;
+        constexpr float LANE_RETURN_PERSIST_OUTER_SEC = 4.0f;
+
+        static const bool ENABLE_FORCE_RECALL        = true;
+        constexpr float   FORCE_RECALL_MIN_DIST_SQ   = 81000000.0f;
+        constexpr float   FORCE_RECALL_MAX_DIST_SQ   = 225000000.0f;
+        constexpr float   FORCE_RECALL_HOME_DIST_SQ  = 25000000.0f;
+        constexpr float   FORCE_RECALL_COMMIT_SEC    = 18.0f;
+        static std::map<AOrionAIBot*, float>                    g_forceRecallStart;
+        static std::set<AOrionAIBot*>                           g_forceRecallFired;
+        static std::map<AOrionDamageableObjective_Base*, int>   g_forceRecallClaim;
+        constexpr int  FR_MAX_RECALLERS_HI = 2;
+        constexpr int  FR_MAX_RECALLERS_LO = 1;
+        constexpr bool ENABLE_FR_WINFIGHT_EXEMPT     = true;
+        constexpr bool ENABLE_FR_DEFSAT_SHORTCIRCUIT = true;
+        constexpr bool ENABLE_FR_NO_MOVE_PROBE       = false;
+        constexpr float LANE_RETURN_COMMIT_SEC        = 14.0f;
+        constexpr int   LANE_RETURN_NETTHREAT_INNER   = 3;
+        constexpr int   LANE_RETURN_NETTHREAT_OUTER   = 4;
+
+        static UObject* WholeLaneCDO = nullptr;
+        static UObject* JungleCampCDO = nullptr;
+        static UObject* CommanderObj = nullptr;
+        static UFunction* GankFunc = nullptr;
+        static UObject* GankCDO = nullptr;
+        static std::map<AOrionAIBot*, std::string> LastSetEnemyTarget;
+        static std::map<AOrionAIBot*, AOrionChar*> FlippedCreep;
+        static std::map<AOrionAIBot*, float> BossDeathCooldown;
+        static std::map<AOrionAIBot*, float> AntiKiteEngageTime;
+        static std::map<AOrionAIBot*, bool> PrevTickV44Threatened;
+        static std::map<AOrionAIBot*, bool> PrevTickInsideEnemyTurret;
+        static std::map<AOrionAIBot*, bool> PrevTickIsSafeToPush;
+        static std::map<AOrionAIBot*, bool> PrevTickIsFleeing;
+        static std::map<AOrionAIBot*, int>  PrevTickFrTowerM;
+        static std::map<AOrionAIBot*, int>  PrevTickEnTowerM;
+        static std::map<AOrionAIBot*, int>  PrevTickHeroDistM;
+        static std::map<AOrionAIBot*, int>  PrevTickVisEnemyBit;
+        static std::map<AOrionAIBot*, bool>        WasAlive;
+        static std::map<AOrionAIBot*, std::string> LastBotCharName;
+        static std::map<AOrionAIBot*, int>         WaveOutpaceVetoLifetimeCnt;
+        static std::map<AOrionAIBot*, float>       JungleCampHpSnap;
+        static std::map<AOrionAIBot*, float>       JungleCampHpSnapTime;
+        static std::map<AOrionAIBot*, AOrionChar*> JungleCampHpSnapPtr;
+        static std::map<AOrionAIBot*, float>       LastJungleStallKickT;
+        static std::map<AOrionAIBot*, float>       g_jglRepathT;
+        static UObject* HeroFocusQuery = nullptr;
+        static UObject* DragonFocusQuery = nullptr;
+        static UObject* JustMinionsQuery = nullptr;
+        static UObject* InsideTurretQuery = nullptr;
+        static UObject* RecallTeleportQuery = nullptr;
+        typedef UObject* (*fStaticConstructObject)(
+            UClass*, UObject*, FName, unsigned int, unsigned int,
+            UObject*, bool, void*, bool
+            );
+        static fStaticConstructObject StaticConstructObject = nullptr;
+        static UObject* BT_AttackTower = nullptr;
+        static UObject* BT_DefendTower = nullptr;
+        static UObject* BT_AttackObjective = nullptr;
+        static UObject* BT_GoToObjective = nullptr;
+        static UObject* BT_Recall = nullptr;
+        static UClass* WLClass = nullptr;
+        static UClass* JCClass = nullptr;
+        static UClass* RCClass = nullptr;
+        static UClass* GKClass = nullptr;
+        static UClass* BOClass = nullptr;
+        static std::map<AOrionAIBot*, AOrionChar*> LastGankTargetPtr;
+        static std::map<AOrionAIBot*, bool>        GankEngaged;
+        static std::map<AOrionAIBot*, float>       g_gankJumpTime;
+        static std::map<AOrionAIBot*, float>       g_akJumpTime;
+        static std::map<AOrionAIBot*, int>         g_speedGEHandle;
+        static std::map<AOrionAIBot*, float> g_recallLifeStart;
+        static std::map<AOrionAIBot*, bool>  g_rjSawBigJump;
+        static std::map<AOrionAIBot*, float> g_rjEpochStart;
+        static std::map<AOrionAIBot*, bool>  g_wdPadCommit;
+        static std::map<AOrionAIBot*, std::string> g_lastRecallPath;
+        static class ABP_HomeBasePad_C* g_blueHomeBasePad = nullptr;
+        static class ABP_HomeBasePad_C* g_redHomeBasePad = nullptr;
+        static bool g_homeBasePadDiscovered = false;
+
+
+
+            static bool matchStarted = false;
+            static float automationTimer = 0.0f;
+            static bool frankensteinTriggered = false;
+            static bool aiCommanderTriggered = false;
+
+
+            if (GetAsyncKeyState(VK_F9) && !matchStarted) {
+                matchStarted = true;
+                GameLogic::StartMatch();
+
+                for (UOrionClientSettingsRecord* Settings : SDKUtils::GetAllObjectsOfType<UOrionClientSettingsRecord>()) {
+                    if (Settings && reinterpret_cast<uintptr_t>(Settings) > 0x10000 && !IsBadReadPtr(Settings, 0x2F0)) {
+                        Settings->SetChat(true);
+                        Settings->ShowAddedItemsInChat = 1;
+                        Settings->ShowCompletedItemsInChat = 1;
+                        Settings->bChat = true;
+                    }
+                }
+                std::cout << "[HOST] F9: Match gestartet! Automatisierungs-Protokoll laeuft an..." << std::endl;
+            }
+
+            if (matchStarted) {
+                automationTimer += deltatime;
+
+
+                if (!ShadowBots.empty()) {
+
+                    static float skyTickTimer = 0.0f;
+                    skyTickTimer += deltatime;
+
+                    if (skyTickTimer >= 0.25f) {
+                        skyTickTimer = 0.0f;
+                    static UFunction* setLocFunc = nullptr;
+                    static UFunction* setCollisionFunc = nullptr;
+                    static UFunction* setDamagedFunc = nullptr;
+                    static UFunction* setHiddenFunc = nullptr;
+
+                    if (!setLocFunc) setLocFunc = UObject::FindObject<UFunction>("Function Engine.Actor.K2_SetActorLocation");
+                    if (!setCollisionFunc) setCollisionFunc = UObject::FindObject<UFunction>("Function Engine.Actor.SetActorEnableCollision");
+                    if (!setDamagedFunc) setDamagedFunc = UObject::FindObject<UFunction>("Function Engine.Actor.SetCanBeDamaged");
+                    if (!setHiddenFunc) setHiddenFunc = UObject::FindObject<UFunction>("Function Engine.Actor.SetActorHiddenInGame");
+
+                    int shadowIndex = 0;
+                    for (AOrionAIBot* SBot : ShadowBots) {
+
+                        if (SBot && IsValidUE4Object(SBot) && SBot->Pawn && IsValidUE4Object(SBot->Pawn)) {
+                            AOrionChar* CurrentPawn = reinterpret_cast<AOrionChar*>(SBot->Pawn);
+
+                                if (setLocFunc) {
+                                    uint8 paramBuffer[256];
+                                    memset(paramBuffer, 0, sizeof(paramBuffer));
+
+                                    float gridX = (shadowIndex % 6) * 150.0f;
+                                    float gridY = (shadowIndex / 6) * 150.0f;
+                                    FVector SafePos(gridX, gridY, 8000.0f);
+
+                                    *reinterpret_cast<FVector*>(paramBuffer) = SafePos;
+                                    *reinterpret_cast<bool*>(paramBuffer + 12) = false;
+                                    CurrentPawn->ProcessEvent(setLocFunc, paramBuffer);
+                                }
+
+                                bool bFalse = false;
+                                bool bTrue = true;
+                                if (setDamagedFunc) CurrentPawn->ProcessEvent(setDamagedFunc, &bFalse);
+                                if (setCollisionFunc) CurrentPawn->ProcessEvent(setCollisionFunc, &bFalse);
+                                if (setHiddenFunc) CurrentPawn->ProcessEvent(setHiddenFunc, &bTrue);
+                            }
+                        }
+                        shadowIndex++;
+                    }
+                }
+
+                if (automationTimer >= 20.0f && !frankensteinTriggered) {
+                    frankensteinTriggered = true;
+                    std::cout << "[HOST] Automatik (20s): Ernte Karten von Schatten-Bots..." << std::endl;
+                    Hooking::ProcInGameThread(StealBotDeckForHumans);
+                }
+
+            if (automationTimer >= 55.0f && !aiCommanderTriggered) {
+                aiCommanderTriggered = true;
+                std::cout << "[HOST] Automatik (65s): V45 NATIVE COMMANDER wird geladen..." << std::endl;
+
+                if (!f4WasPressedB) {
+                    f4WasPressedB = true;
+                    autoPushEnabledB = true;
+                    std::cout << "--- V45 NATIVE COMMANDER IS NOW ON ---" << std::endl;
+
+                    ServerConfig::LoadFromFile();
+
+
+
+                    {
+
+                        UOrionGameData* gameData = nullptr;
+                        UClass* gameDataClass = UOrionGameData::StaticClass();
+                        if (gameDataClass) {
+                            for (int32_t i = 0; i < UObject::GObjects->Num(); ++i) {
+                                UObject* Obj = UObject::GObjects->GetByIndex(i);
+                                if (Obj && Obj->IsA(gameDataClass)
+                                    && Obj->GetFullName().find("Default__") == std::string::npos) {
+                                    gameData = reinterpret_cast<UOrionGameData*>(Obj);
+                                    break;
+                                }
+                            }
+                        }
+                        UCurveTable* diffTable = nullptr;
+                        if (gameData && IsValidUE4Object(gameData)) {
+                            diffTable = *reinterpret_cast<UCurveTable**>(
+                                reinterpret_cast<uintptr_t>(gameData) + 0x50);
+                        }
+
+                        UFunction* fnConvName = UObject::FindObject<UFunction>("Function Engine.KismetStringLibrary.Conv_StringToName");
+                        UFunction* fnEvalCurve = UObject::FindObject<UFunction>("Function Engine.DataTableFunctionLibrary.EvaluateCurveTableRow");
+                        UObject* kismetCDO = reinterpret_cast<UObject*>(SDK::UKismetStringLibrary::GetDefaultObj());
+                        UObject* dataLibCDO = reinterpret_cast<UObject*>(SDK::UDataTableFunctionLibrary::GetDefaultObj());
+
+                        if (diffTable && IsValidUE4Object(diffTable) && fnConvName && fnEvalCurve && kismetCDO && dataLibCDO) {
+
+
+                            const bool ENABLE_BUFF_PATCH = ServerConfig::EnableBuffPatch;
+                            if (ENABLE_BUFF_PATCH) {
+                                auto wToStr = [](const wchar_t* w) -> std::string {
+                                    std::wstring ws(w);
+                                    return std::string(ws.begin(), ws.end());
+                                };
+
+
+                                const float ENEMY_BUFF_MULTIPLIER    = ServerConfig::EnemyBuffMultiplier;
+                                const float FRIENDLY_BUFF_MULTIPLIER = ServerConfig::FriendlyBuffMultiplier;
+
+                                static bool buffPatchAlreadyApplied = false;
+                                if (buffPatchAlreadyApplied) {
+                                } else {
+                                    buffPatchAlreadyApplied = true;
+
+#if F4_LOG_LEVEL >= 2
+                                    F4_LOG_EVENT("[BUFF-PATCH] === All-Keys Multiplier Mode ===" << std::endl);
+                                    F4_LOG_EVENT("[BUFF-PATCH]   ENEMY_BUFF_MULTIPLIER="    << ENEMY_BUFF_MULTIPLIER
+                                        << " (Bot.Buff.*)" << std::endl);
+                                    F4_LOG_EVENT("[BUFF-PATCH]   FRIENDLY_BUFF_MULTIPLIER=" << FRIENDLY_BUFF_MULTIPLIER
+                                        << " (Bot.Friendly.Buff.*)" << std::endl);
+#endif
+
+                                    auto patchCurveRow = [&](const wchar_t* rowNameW, float factor) -> bool {
+                                        std::string rowNameStr = wToStr(rowNameW);
+
+                                        SDK::Params::KismetStringLibrary_Conv_StringToName convP{};
+                                        convP.InString = FString(rowNameW);
+                                        kismetCDO->ProcessEvent(fnConvName, &convP);
+                                        uint64_t targetBytes = *reinterpret_cast<uint64_t*>(&convP.ReturnValue);
+
+                                        uintptr_t tableBase = reinterpret_cast<uintptr_t>(diffTable);
+                                        uintptr_t rowMapBase = tableBase + 0x30;
+                                        void* sparseData = *reinterpret_cast<void**>(rowMapBase + 0x00);
+                                        int32_t sparseNum = *reinterpret_cast<int32_t*>(rowMapBase + 0x08);
+                                        if (!sparseData || sparseNum <= 0 || sparseNum > 1000) {
+                                            F4_LOG_VERBOSE("[BUFF-PATCH] FAIL row=" << rowNameStr
+                                                << " - bad RowMap" << std::endl);
+                                            return false;
+                                        }
+
+                                        for (int i = 0; i < sparseNum; ++i) {
+                                            uintptr_t slot = reinterpret_cast<uintptr_t>(sparseData) + (i * 24);
+                                            uint64_t slotName = *reinterpret_cast<uint64_t*>(slot + 0x00);
+                                            void* curvePtr = *reinterpret_cast<void**>(slot + 0x08);
+                                            if (!curvePtr) continue;
+                                            if (slotName != targetBytes) continue;
+
+                                            uintptr_t curve = reinterpret_cast<uintptr_t>(curvePtr);
+                                            void* keysData = *reinterpret_cast<void**>(curve + 0x60);
+                                            int32_t keysNum = *reinterpret_cast<int32_t*>(curve + 0x68);
+                                            if (!keysData || keysNum <= 0 || keysNum > 64) {
+                                                F4_LOG_VERBOSE("[BUFF-PATCH] FAIL row=" << rowNameStr
+                                                    << " - bad Keys" << std::endl);
+                                                return false;
+                                            }
+
+
+                                            for (int k = 0; k < keysNum; ++k) {
+                                                uintptr_t key = reinterpret_cast<uintptr_t>(keysData) + (k * 28);
+                                                float oldValue = *reinterpret_cast<float*>(key + 0x08);
+                                                float newValue = oldValue * factor;
+                                                *reinterpret_cast<float*>(key + 0x08) = newValue;
+
+                                            }
+
+                                            return true;
+                                        }
+                                        F4_LOG_VERBOSE("[BUFF-PATCH] FAIL row=" << rowNameStr
+                                            << " - FName not in RowMap" << std::endl);
+                                        return false;
+                                    };
+
+                                    patchCurveRow(L"Bot.Buff.BasePower",   ENEMY_BUFF_MULTIPLIER);
+                                    patchCurveRow(L"Bot.Buff.Health",      ENEMY_BUFF_MULTIPLIER);
+                                    patchCurveRow(L"Bot.Buff.HealthRegen", ENEMY_BUFF_MULTIPLIER);
+                                    patchCurveRow(L"Bot.Buff.ManaRegen",   ENEMY_BUFF_MULTIPLIER);
+                                    patchCurveRow(L"Bot.Buff.Gold",        ENEMY_BUFF_MULTIPLIER);
+
+                                    patchCurveRow(L"Bot.Friendly.Buff.BasePower",   FRIENDLY_BUFF_MULTIPLIER);
+                                    patchCurveRow(L"Bot.Friendly.Buff.Health",      FRIENDLY_BUFF_MULTIPLIER);
+                                    patchCurveRow(L"Bot.Friendly.Buff.HealthRegen", FRIENDLY_BUFF_MULTIPLIER);
+                                    patchCurveRow(L"Bot.Friendly.Buff.ManaRegen",   FRIENDLY_BUFF_MULTIPLIER);
+                                    patchCurveRow(L"Bot.Friendly.Buff.Gold",        FRIENDLY_BUFF_MULTIPLIER);
+
+                                }
+                            } else {
+                            }
+
+                        } else {
+                        }
+                    }
+
+
+
+                if (!getHealthFunc) getHealthFunc = UObject::FindObject<UFunction>("Function OrionGame.OrionChar.GetHealth");
+                if (!getMaxHealthFunc) getMaxHealthFunc = UObject::FindObject<UFunction>("Function OrionGame.OrionChar.GetMaxHealth");
+                if (!IsSafeToRecallFunc) IsSafeToRecallFunc = UObject::FindObject<UFunction>("Function OrionGame.OrionAIBot.IsSafeToRecall");
+                if (!PlaceWardFunc) PlaceWardFunc = UObject::FindObject<UFunction>("Function OrionGame.OrionAIBot.PlaceWard");
+                if (!StopMovementFunc) StopMovementFunc = UObject::FindObject<UFunction>("Function AIModule.AIController.StopMovement");
+                if (!IsSafeFunc) IsSafeFunc = UObject::FindObject<UFunction>("Function OrionGame.OrionAIBot.K2_IsSafeToApproachOffensiveLaneGoal");
+                if (!MoveFunc) MoveFunc = UObject::FindObject<UFunction>("Function AIModule.AIController.MoveToActor");
+                if (!MeleeLockbreakStopFn) MeleeLockbreakStopFn = UObject::FindObject<UFunction>("Function Engine.Controller.StopMovement");
+
+                if (!AttackTowerFunc) AttackTowerFunc = UObject::FindObject<UFunction>("Function OrionGame.BotObjective_WholeLane.AttackTower");
+                if (!DefendTowerFunc) DefendTowerFunc = UObject::FindObject<UFunction>("Function OrionGame.BotObjective_WholeLane.DefendTower");
+                if (!ClearCampFunc) ClearCampFunc = UObject::FindObject<UFunction>("Function OrionGame.BotObjective_AttackJungleCamp.ClearCamp");
+                if (!GroupAttackCampFunc) GroupAttackCampFunc = UObject::FindObject<UFunction>("Function OrionGame.BotObjective_AttackJungleCamp.GroupAttackCamp");
+                if (!TowerObjectiveFunc) TowerObjectiveFunc = UObject::FindObject<UFunction>("Function OrionGame.BotObjective_WholeLane.TowerObjective");
+                if (!RecallCDO) RecallCDO = UObject::FindObject<UObject>("BotObjective_Recall Default__BotObjective_Recall");
+                if (!GoldRecallFunc) GoldRecallFunc = UObject::FindObject<UFunction>("Function OrionGame.BotObjective_Recall.GoldRecall");
+                if (!IsInsideTurretFunc) IsInsideTurretFunc = UObject::FindObject<UFunction>("Function OrionGame.OrionAIBot.K2_IsInsideTurret");
+
+                if (!WholeLaneCDO) WholeLaneCDO = UObject::FindObject<UObject>("BotObjective_WholeLane Default__BotObjective_WholeLane");
+                if (!JungleCampCDO) JungleCampCDO = UObject::FindObject<UObject>("BotObjective_AttackJungleCamp Default__BotObjective_AttackJungleCamp");
+                if (!GankCDO) GankCDO = UObject::FindObject<UObject>("BotObjective_Gank Default__BotObjective_Gank");
+                if (!GankFunc) GankFunc = UObject::FindObject<UFunction>("Function OrionGame.BotObjective_Gank.Gank");
+                if (!GetEnemyCharacterFunc) GetEnemyCharacterFunc = UObject::FindObject<UFunction>("Function OrionGame.OrionAIBot.K2_GetEnemyCharacter");
+
+
+                if (!HeroFocusQuery) {
+                    HeroFocusQuery = UObject::FindObject<UObject>("EnvQuery EQS_WeightedEnemyHero.EQS_WeightedEnemyHero");
+                    if (HeroFocusQuery) std::cout << "[EQS] HeroFocusQuery gefunden!" << std::endl;
+                }
+                if (!DragonFocusQuery) {
+                    DragonFocusQuery = UObject::FindObject<UObject>("EnvQuery EQS_EnemySelection_Dragon.EQS_EnemySelection_Dragon");
+                    if (DragonFocusQuery) std::cout << "[EQS] DragonFocusQuery gefunden!" << std::endl;
+                }
+                if (!InsideTurretQuery) {
+                    InsideTurretQuery = UObject::FindObject<UObject>("EnvQuery EQS_EnemiesInsideTurret.EQS_EnemiesInsideTurret");
+                    if (InsideTurretQuery) std::cout << "[EQS] InsideTurretQuery gefunden!" << std::endl;
+                }
+                if (!JustMinionsQuery) {
+                    JustMinionsQuery = UObject::FindObject<UObject>("EnvQuery EQS_JustMinions.EQS_JustMinions");
+                    if (JustMinionsQuery) std::cout << "[EQS] JustMinionsQuery gefunden!" << std::endl;
+                }
+
+                if (!RecallTeleportQuery) {
+                    RecallTeleportQuery = UObject::FindObject<UObject>("EnvQuery EQS_TeleportLocation.EQS_TeleportLocation");
+                    if (RecallTeleportQuery) std::cout << "[EQS] RecallTeleportQuery gefunden!" << std::endl;
+                }
+
+                if (!StaticConstructObject) {
+                    HMODULE hExe = GetModuleHandleA(NULL);
+                    if (hExe) {
+                        StaticConstructObject = (fStaticConstructObject)((uintptr_t)hExe + 0xED50F0);
+                    }
+                    std::cout << "[INIT] StaticConstructObject="
+                        << (StaticConstructObject ? "FOUND" : "NOT FOUND") << std::endl;
+                }
+
+                if (!CommanderObj) {
+                    UClass* CommanderClass = UObject::FindClass("Class OrionGame.OrionAICommander");
+                    if (CommanderClass) {
+                        for (int32_t i = 0; i < UObject::GObjects->Num(); ++i) {
+                            UObject* Obj = UObject::GObjects->GetByIndex(i);
+                            if (Obj && Obj->IsA(CommanderClass) && Obj->GetFullName().find("Default__") == std::string::npos) {
+                                CommanderObj = Obj; break;
+                            }
+                        }
+                    }
+                }
+
+
+                if (CommanderObj) {
+                    std::cout << "[INIT] CommanderObj=" << CommanderObj->GetFullName() << std::endl;
+
+                    UClass* PlaybookClass = UObject::FindClass("Class OrionGame.BotPlaybook");
+                    if (PlaybookClass && StaticConstructObject) {
+                        uint32_t* classFlags = reinterpret_cast<uint32_t*>(
+                            reinterpret_cast<uintptr_t>(PlaybookClass) + 0xB4);
+                        uint32_t original = *classFlags;
+                        *classFlags = original & ~0x01u;
+
+                        for (int t = 0; t < 2; t++) {
+                            uintptr_t botTeamsAddr = reinterpret_cast<uintptr_t>(CommanderObj) + 0x40;
+                            uintptr_t rolePlaybooksAddr = botTeamsAddr + (t * 0x120) + 0x90;
+                            FRawRuntimePlaybook* playbooks = reinterpret_cast<FRawRuntimePlaybook*>(rolePlaybooksAddr);
+                            for (int r = 0; r < 5; r++) {
+                                if (!playbooks[r].PlaybookInstance) {
+                                    UObject* newPB = StaticConstructObject(
+                                        PlaybookClass, CommanderObj, FName(),
+                                        0, 0, nullptr, false, nullptr, false
+                                    );
+                                    playbooks[r].PlaybookInstance = newPB;
+                                    std::cout << "[INIT] Team=" << t << " Role=" << r
+                                        << " -> " << (newPB ? newPB->GetFullName() : "FAIL")
+                                        << std::endl;
+                                }
+                            }
+                        }
+                        *classFlags = original;
+                    }
+
+
+                    auto AllBots = SDKUtils::GetAllObjectsOfType<AOrionAIBot>();
+                    for (AOrionAIBot* bot : AllBots) {
+                        if (bot->GetFullName().find("Default__") != std::string::npos) continue;
+                        if (!bot->PlayerState) continue;
+
+                        EOrionTeam team = reinterpret_cast<AOrionPlayerState_Game*>(bot->PlayerState)->GetTeamNum();
+                        if (team == EOrionTeam::NoTeam) continue;
+
+                        int teamIdx = (team == EOrionTeam::TeamBlue) ? 0 : 1;
+                        int role = (GBotRoles.count(bot)) ? GBotRoles[bot] : -1;
+                        if (role < 0 || role > 4) continue;
+
+                        uintptr_t teamBase = reinterpret_cast<uintptr_t>(CommanderObj) + 0x40 + (teamIdx * 0x120);
+                        uintptr_t arrayData = *reinterpret_cast<uintptr_t*>(teamBase + 0x00);
+
+                        if (arrayData > 0x10000) {
+                            memset(reinterpret_cast<void*>(arrayData + role * 0xD0), 0, 0xD0);
+                        }
+                    }
+
+                    for (int t = 0; t < 2; t++) {
+                        uintptr_t teamBase = reinterpret_cast<uintptr_t>(CommanderObj) + 0x40 + (t * 0x120);
+                        *reinterpret_cast<int32_t*>(teamBase + 0x08) = 0;
+                    }
+
+                }
+                else {
+                    std::cout << "[INIT] CommanderObj=NULL!" << std::endl;
+                }
+
+                if (!BT_AttackTower) BT_AttackTower = UObject::FindObject<UObject>("BehaviorTree BT_AttackTower.BT_AttackTower");
+                if (!BT_DefendTower) BT_DefendTower = UObject::FindObject<UObject>("BehaviorTree BT_DefendTower.BT_DefendTower");
+                if (!BT_AttackObjective) BT_AttackObjective = UObject::FindObject<UObject>("BehaviorTree BT_AttackObjective.BT_AttackObjective");
+                if (!BT_GoToObjective) BT_GoToObjective = UObject::FindObject<UObject>("BehaviorTree BT_GoToObjective.BT_GoToObjective");
+                if (!BT_Recall) BT_Recall = UObject::FindObject<UObject>("BehaviorTree BT_Recall.BT_Recall");
+                if (!WLClass) WLClass = UObject::FindClass("Class OrionGame.BotObjective_WholeLane");
+                if (!JCClass) JCClass = UObject::FindClass("Class OrionGame.BotObjective_AttackJungleCamp");
+                if (!RCClass) RCClass = UObject::FindClass("Class OrionGame.BotObjective_Recall");
+                if (!GKClass) GKClass = UObject::FindClass("Class OrionGame.BotObjective_Gank");
+                if (!BOClass) BOClass = UObject::FindClass("Class OrionGame.BotObjective");
+
+                }
+            }
+                        }
+
+
+
+        if (autoPushEnabledB) {
+            pushTimerB += deltatime;
+            matchTimeB += deltatime;
+
+            if (pushTimerB >= 1.0f) {
+                pushTimerB = 0.0f;
+                TowerDefenders.clear();
+                g_forceRecallClaim.clear();
+
+
+
+                for (auto it = GankCooldownPerTarget.begin(); it != GankCooldownPerTarget.end(); ) {
+                    if (matchTimeB > it->second) {
+                        it = GankCooldownPerTarget.erase(it);
+                    }
+                    else {
+                        ++it;
+                    }
+                }
+
+
+                std::vector<AOrionAIBot*> AllBots;
+                std::vector<AOrionChar*> AllChars;
+                std::vector<AOrionDamageableObjective_Base*> AllTowers;
+                {
+                    UClass* _cBot = AOrionAIBot::StaticClass();
+                    UClass* _cChr = AOrionChar::StaticClass();
+                    UClass* _cTwr = AOrionDamageableObjective_Base::StaticClass();
+                    int _gN = UObject::GObjects->Num();
+                    for (int _gI = 0; _gI < _gN; _gI++) {
+                        UObject* _gO = UObject::GObjects->GetByIndex(_gI);
+                        if (!_gO) continue;
+                        if (_gO->IsA(_cBot)) AllBots.push_back(static_cast<AOrionAIBot*>(_gO));
+                        if (_gO->IsA(_cChr)) AllChars.push_back(static_cast<AOrionChar*>(_gO));
+                        if (_gO->IsA(_cTwr)) AllTowers.push_back(static_cast<AOrionDamageableObjective_Base*>(_gO));
+                    }
+                }
+
+
+                std::vector<AOrionAIBot*> deadBotList;
+                for (auto it = LastMacroAction.begin(); it != LastMacroAction.end(); ++it) {
+                    bool bBotStillExists = false;
+                    for (AOrionAIBot* activeBot : AllBots) {
+                        if (activeBot == it->first) { bBotStillExists = true; break; }
+                    }
+                    if (!bBotStillExists) {
+                        deadBotList.push_back(it->first);
+                    }
+                }
+
+                for (AOrionAIBot* deadBot : deadBotList) {
+                    if (FlippedCreep.count(deadBot) && FlippedCreep[deadBot]) {
+                        AOrionChar* flipped = FlippedCreep[deadBot];
+                        bool bAnyoneElseNeedsIt = false;
+                        for (auto& fp : FlippedCreep) {
+                            if (fp.first != deadBot && fp.second == flipped) {
+                                bool bOwnerAlsoDead = false;
+                                for (AOrionAIBot* otherDead : deadBotList) {
+                                    if (otherDead == fp.first) { bOwnerAlsoDead = true; break; }
+                                }
+                                if (!bOwnerAlsoDead) {
+                                    bAnyoneElseNeedsIt = true;
+                                    break;
+                                }
+                            }
+                        }
+                        if (!bAnyoneElseNeedsIt) {
+                            flipped->TeamNum = EOrionTeam::TeamCreep;
+                        }
+                    }
+                }
+
+                for (AOrionAIBot* deadBot : deadBotList) {
+                    LastBotPositions.erase(deadBot);
+                    BotIdleTicks.erase(deadBot);
+                    EmptyActionTicks.erase(deadBot);
+                    LastBotHealth.erase(deadBot);
+                    CombatTimer.erase(deadBot);
+                    LastMacroTargetName.erase(deadBot);
+                    BossDeathCooldown.erase(deadBot);
+                    BossWaitStartTime.erase(deadBot);
+                    BotIsBlind.erase(deadBot);
+                    BotNeedsHeal.erase(deadBot);
+                    lastThreatRetreatTime.erase(deadBot);
+                    FlippedCreep.erase(deadBot);
+                    LastMacroAction.erase(deadBot);
+                    LastSetEnemyTarget.erase(deadBot);
+                    LastKnownObjective.erase(deadBot);
+                    RotationTargetEnemy.erase(deadBot);
+                    RotationStartTime.erase(deadBot);
+                    g_collapseStartTime.erase(deadBot);
+                    g_laneReturnStartTime.erase(deadBot);
+                    g_lrS0Latch.erase(deadBot);
+                    g_forceRecallStart.erase(deadBot); g_forceRecallFired.erase(deadBot);
+                    CachedFrontTower.erase(deadBot);
+                    LastGankTargetPtr.erase(deadBot);
+                    GankEngaged.erase(deadBot);
+                    g_gankJumpTime.erase(deadBot);
+                    g_akJumpTime.erase(deadBot);
+                    g_speedGEHandle.erase(deadBot);
+                     g_launchIssueTime.erase(deadBot);
+                    g_launchTraceUntil.erase(deadBot); g_launchTracePos.erase(deadBot); g_launchPrevHP.erase(deadBot);
+                    g_brFrozenTicks.erase(deadBot); g_brIssueTime.erase(deadBot); g_brActiveUntil.erase(deadBot);
+                    g_svActiveUntil.erase(deadBot); g_svEpBotHP.erase(deadBot); g_svEpHeroHP.erase(deadBot); g_svLastT.erase(deadBot); g_svFireT.erase(deadBot); g_svFireHP.erase(deadBot);
+                    g_svTarget.erase(deadBot); g_svTgtIsWave.erase(deadBot); g_svMaxHoldT.erase(deadBot);
+                    g_wfbUntil.erase(deadBot); g_wfbTarget.erase(deadBot); g_wfbBestDistSq.erase(deadBot); g_wfbStall.erase(deadBot); g_wfbFireT.erase(deadBot); g_wfbEngineBlind.erase(deadBot); g_wfbTgtIsWave.erase(deadBot);
+                    g_p23Target.erase(deadBot); g_p23AccR.erase(deadBot); g_p23StartT.erase(deadBot); g_p23TgtIsWave.erase(deadBot);
+                    g_akpUntil.erase(deadBot);
+                    g_advHoldOn.erase(deadBot);
+                    g_akoUntil.erase(deadBot); g_akoKill.erase(deadBot); g_akoStartT.erase(deadBot); g_akoLastT.erase(deadBot); g_akoRetreatSeenT.erase(deadBot); g_akoStartHP.erase(deadBot); g_akoStartHeroHP.erase(deadBot); g_akoMode.erase(deadBot);
+                    g_wfbDefPath.erase(deadBot); g_wfbDefParity.erase(deadBot); g_wfbLpStall.erase(deadBot);
+                    g_ahbfOnT.erase(deadBot);
+                    g_brMoveTarget.erase(deadBot); g_brAccRadius.erase(deadBot);
+                    g_dlbFrozenTicks.erase(deadBot);
+                    g_deEngagedLastTick.erase(deadBot);
+                    g_pdyStartT.erase(deadBot); g_pdyStreak.erase(deadBot); g_pdyLogT.erase(deadBot); g_pdyPhase.erase(deadBot); g_pdyPos.erase(deadBot);
+                    p5EraseBot(deadBot); p6EraseAll(deadBot);
+                    g_rfLaunchTime.erase(deadBot);
+                    g_escapeJumpTime.erase(deadBot);
+                    g_ejgLastT.erase(deadBot); g_ejgStartTwrM.erase(deadBot); g_ejgMinTwrM.erase(deadBot); g_ejgJumps.erase(deadBot);
+                    g_attrEntryHP.erase(deadBot);
+                    g_vpmMoveFiredT.erase(deadBot);
+                }
+
+                AOrionDamageableObjective_Base* blueCore = nullptr;
+                AOrionDamageableObjective_Base* redCore = nullptr;
+                AOrionChar* orbPrime = nullptr;
+                AOrionChar* fangtooth = nullptr;
+                int livingBlue = 0;
+                int livingRed = 0;
+                int deadBlue = 0, deadRed = 0;
+                int deadInhibitorsBlue = 0, deadInhibitorsRed = 0;
+
+                for (AOrionDamageableObjective_Base* tower : AllTowers) {
+                    if (tower->GetFullName().find("Default__") != std::string::npos) continue;
+                    std::string tName = tower->GetFullName();
+                    std::transform(tName.begin(), tName.end(), tName.begin(), ::tolower);
+
+                    if (tName.find("core") != std::string::npos) {
+                        if (tower->TeamNum == EOrionTeam::TeamBlue) blueCore = tower;
+                        if (tower->TeamNum == EOrionTeam::TeamRed) redCore = tower;
+                    }
+                    if ((tName.find("bluetower_") != std::string::npos || tName.find("redtower_") != std::string::npos || tName.find("inhibitor") != std::string::npos) && tower->GetHealth() <= 0.0f) {
+                        if (tower->TeamNum == EOrionTeam::TeamBlue) deadInhibitorsBlue++;
+                        if (tower->TeamNum == EOrionTeam::TeamRed) deadInhibitorsRed++;
+                    }
+                }
+
+                struct CachedChar {
+                    AOrionChar* ptr;
+                    FVector     loc;
+                    float       health;
+                    float       maxHealth;
+                    EOrionTeam  team;
+                    bool        bIsHero;
+                    bool        bIsNeutral;
+                    std::string fullName;
+                };
+                std::vector<CachedChar> LiveChars;
+                std::vector<AOrionChar*> aliveHeroes;
+                LiveChars.reserve(AllChars.size());
+
+                for (AOrionChar* c : AllChars) {
+                    if (!c) continue;
+                    std::string fname = c->GetFullName();
+                    if (fname.find("Default__") != std::string::npos) continue;
+
+                    float h = 0.0f, mh = 1000.0f;
+                    if (getHealthFunc) c->ProcessEvent(getHealthFunc, &h);
+                    if (h <= 0.0f) {
+                        continue;
+                    }
+                    if (getMaxHealthFunc) c->ProcessEvent(getMaxHealthFunc, &mh);
+
+                    CachedChar cc;
+                    cc.ptr = c;
+                    cc.loc = c->K2_GetActorLocation();
+                    cc.health = h;
+                    cc.maxHealth = mh;
+                    cc.team = c->TeamNum;
+                    cc.bIsHero = (c->PlayerState != nullptr);
+
+                    std::string lname = fname;
+                    std::transform(lname.begin(), lname.end(), lname.begin(), ::tolower);
+                    cc.fullName = lname;
+
+                    cc.bIsNeutral = (cc.team == EOrionTeam::TeamCreep
+                        || lname.find("jungle") != std::string::npos
+                        || lname.find("river") != std::string::npos
+                        || lname.find("gold") != std::string::npos);
+
+                    LiveChars.push_back(cc);
+
+                    if (cc.bIsHero) {
+                        aliveHeroes.push_back(c);
+                    }
+                }
+                for (const CachedChar& cc : LiveChars) {
+                    if (cc.bIsHero) {
+                        if (cc.team == EOrionTeam::TeamBlue) livingBlue++;
+                        else if (cc.team == EOrionTeam::TeamRed) livingRed++;
+                    }
+
+
+
+                    if (cc.fullName.find("primehelix") != std::string::npos) {
+                        orbPrime = cc.ptr;
+                    }
+                    else if (cc.fullName.find("dragon") != std::string::npos) {
+                        fangtooth = cc.ptr;
+                    }
+                }
+
+
+                {
+                    const float MAXHP_MULT     = ServerConfig::BossMaxHpMult;
+                    const float ATTACK_MULT    = ServerConfig::BossAttackMult;
+                    const float STAT_EPSILON   = ServerConfig::BossStatEpsilon;
+
+                    struct BossSlot {
+                        AOrionChar* ptr;
+                        const char* label;
+                        float       baseRegen;
+                        float       regenEngineMin;
+                    };
+                    const BossSlot bosses[] = {
+                        { fangtooth, "Fang",  50.0f, 30.0f },
+                        { orbPrime,  "Prime", 75.0f, 50.0f },
+                    };
+
+
+
+                    static std::map<AOrionChar*, float> lastDmg;
+                    static std::map<AOrionChar*, float> lastMaxHP;
+                    if (ServerConfig::EnableBossMod)
+                    for (const BossSlot& b : bosses) {
+                        if (!b.ptr) continue;
+                        AOrionCharAI* boss = reinterpret_cast<AOrionCharAI*>(b.ptr);
+
+                        if (boss->HealthSet) {
+                            float cur = boss->HealthSet->HealthRegenRate;
+                            float targetRegen = b.baseRegen * ServerConfig::BossRegenMult;
+                            if (targetRegen >= b.regenEngineMin)
+                                targetRegen = b.regenEngineMin - 1.0f;
+                            if (cur > b.regenEngineMin && std::abs(cur - targetRegen) > STAT_EPSILON) {
+                                boss->HealthSet->HealthRegenRate = targetRegen;
+                                F4_LOG_VERBOSE("[BOSS-MOD] " << b.label << " HealthRegen " << cur
+                                    << " -> " << targetRegen << " @T=" << (int)matchTimeB << "s" << std::endl);
+                            }
+                        }
+
+                        if (boss->CombatSet) {
+                            float cur = boss->CombatSet->AttackRating;
+                            float& last = lastDmg[b.ptr];
+                            if (std::abs(cur - last) > STAT_EPSILON) {
+                                float newVal = cur * ATTACK_MULT;
+                                boss->CombatSet->AttackRating = newVal;
+                                last = newVal;
+                                F4_LOG_VERBOSE("[BOSS-MOD] " << b.label << " AttackRating " << cur
+                                    << " -> " << newVal << " @T=" << (int)matchTimeB << "s" << std::endl);
+                            }
+                        }
+
+                        if (boss->HealthSet) {
+                            float cur = boss->HealthSet->MaxHealth;
+                            float& last = lastMaxHP[b.ptr];
+                            if (std::abs(cur - last) > STAT_EPSILON) {
+                                float newVal = cur * MAXHP_MULT;
+                                boss->HealthSet->MaxHealth = newVal;
+                                last = newVal;
+                                if (boss->HealthSet->Health > newVal) {
+                                    boss->HealthSet->Health = newVal;
+                                }
+                                F4_LOG_VERBOSE("[BOSS-MOD] " << b.label << " MaxHealth " << cur
+                                    << " -> " << newVal << " @T=" << (int)matchTimeB << "s" << std::endl);
+                            }
+                        }
+                    }
+
+                }
+
+                for (auto it = LastSeenEnemyHeroTime.begin(); it != LastSeenEnemyHeroTime.end(); ) {
+                    bool bStillExists = false;
+                    for (AOrionChar* c : AllChars) {
+                        if (c == it->first) { bStillExists = true; break; }
+                    }
+                    if (!bStillExists || (matchTimeB - it->second) > 180.0f) {
+                        LastKnownEnemyHeroPos.erase(it->first);
+                        it = LastSeenEnemyHeroTime.erase(it);
+                    }
+                    else {
+                        ++it;
+                    }
+                }
+
+                static float GlobalBossCooldown = 0.0f;
+                static AOrionChar* LastRawTargetBlue = nullptr;
+                static AOrionChar* LastRawTargetRed = nullptr;
+                AOrionChar* rawTargetBlue = nullptr;
+                AOrionChar* rawTargetRed = nullptr;
+                deadBlue = 5 - livingBlue;
+                deadRed = 5 - livingRed;
+                if (matchTimeB < 30.0f) { deadBlue = 0; deadRed = 0; }
+
+
+
+                if (matchTimeB > GlobalBossCooldown) {
+                    bool bIsPrimeTime = (matchTimeB > 1500.0f);
+                    bool bIsFangtoothTime = (matchTimeB > 900.0f);
+
+                    if (orbPrime && bIsPrimeTime && (deadRed >= 2 || deadInhibitorsRed > 0)) rawTargetBlue = orbPrime;
+                    else if (fangtooth && bIsFangtoothTime && deadRed >= 1) rawTargetBlue = fangtooth;
+
+                    if (orbPrime && bIsPrimeTime && (deadBlue >= 2 || deadInhibitorsBlue > 0)) rawTargetRed = orbPrime;
+                    else if (fangtooth && bIsFangtoothTime && deadBlue >= 1) rawTargetRed = fangtooth;
+                }
+
+                static bool bWasPrimeAlive = false;
+                static bool bWasFangtoothAlive = false;
+                if (bWasPrimeAlive && !orbPrime) {
+                    GlobalBossCooldown = matchTimeB + 420.0f;
+                    for (auto& fp : FlippedCreep) {
+                        if (fp.second == LastRawTargetBlue || fp.second == LastRawTargetRed) {
+                            fp.second = nullptr;
+                        }
+                    }
+                }
+                if (bWasFangtoothAlive && !fangtooth) {
+                    GlobalBossCooldown = matchTimeB + 240.0f;
+                    for (auto& fp : FlippedCreep) {
+                        if (fp.second == LastRawTargetBlue || fp.second == LastRawTargetRed) {
+                            fp.second = nullptr;
+                        }
+                    }
+                }
+                bWasPrimeAlive = (orbPrime != nullptr);
+                bWasFangtoothAlive = (fangtooth != nullptr);
+
+                if (LastRawTargetBlue != nullptr && rawTargetBlue == nullptr) {
+                    TeamBlueBossBanTimer = matchTimeB + 60.0f;
+                }
+                if (LastRawTargetRed != nullptr && rawTargetRed == nullptr) {
+                    TeamRedBossBanTimer = matchTimeB + 60.0f;
+                }
+
+                LastRawTargetBlue = rawTargetBlue;
+                LastRawTargetRed = rawTargetRed;
+
+                AOrionChar* activeBossTargetBlue = (matchTimeB < TeamBlueBossBanTimer) ? nullptr : rawTargetBlue;
+                AOrionChar* activeBossTargetRed = (matchTimeB < TeamRedBossBanTimer) ? nullptr : rawTargetRed;
+
+                struct ActiveFight {
+                    AOrionChar* allyHero;
+                    AOrionChar* enemyHero;
+                    FVector     fightLocation;
+                    EOrionTeam  allyTeam;
+                };
+                std::vector<ActiveFight> ActiveFights;
+
+
+                for (AOrionChar* enemy : aliveHeroes) {
+                    if (enemy->TeamNum != EOrionTeam::TeamBlue && enemy->TeamNum != EOrionTeam::TeamRed) continue;
+                    FVector eLoc = enemy->K2_GetActorLocation();
+                    bool bSeenByBlue = false;
+                    bool bSeenByRed = false;
+
+                    for (AOrionChar* observer : aliveHeroes) {
+                        if (observer == enemy) continue;
+                        FVector oLoc = observer->K2_GetActorLocation();
+                        float dSq = (oLoc.X - eLoc.X) * (oLoc.X - eLoc.X) +
+                            (oLoc.Y - eLoc.Y) * (oLoc.Y - eLoc.Y) +
+                            (oLoc.Z - eLoc.Z) * (oLoc.Z - eLoc.Z);
+                        if (dSq < 9000000.0f) {
+                            if (observer->TeamNum == EOrionTeam::TeamBlue) bSeenByBlue = true;
+                            else if (observer->TeamNum == EOrionTeam::TeamRed) bSeenByRed = true;
+                        }
+                        if (bSeenByBlue && bSeenByRed) break;
+                    }
+
+                    if (!bSeenByBlue || !bSeenByRed) {
+                        for (AOrionDamageableObjective_Base* t : AllTowers) {
+                            if (!t || t->GetHealth() <= 0.0f) continue;
+                            if (t->GetFullName().find("Default__") != std::string::npos) continue;
+                            FVector tLoc = t->K2_GetActorLocation();
+                            float dSq = (tLoc.X - eLoc.X) * (tLoc.X - eLoc.X) +
+                                (tLoc.Y - eLoc.Y) * (tLoc.Y - eLoc.Y) +
+                                (tLoc.Z - eLoc.Z) * (tLoc.Z - eLoc.Z);
+                            if (dSq < 5062500.0f) {
+                                if (t->TeamNum == EOrionTeam::TeamBlue) bSeenByBlue = true;
+                                else if (t->TeamNum == EOrionTeam::TeamRed) bSeenByRed = true;
+                            }
+                            if (bSeenByBlue && bSeenByRed) break;
+                        }
+                    }
+
+                    if (enemy->TeamNum == EOrionTeam::TeamRed && bSeenByBlue) {
+                        LastKnownEnemyHeroPos[enemy] = eLoc;
+                        LastSeenEnemyHeroTime[enemy] = matchTimeB;
+                    }
+                    else if (enemy->TeamNum == EOrionTeam::TeamBlue && bSeenByRed) {
+                        LastKnownEnemyHeroPos[enemy] = eLoc;
+                        LastSeenEnemyHeroTime[enemy] = matchTimeB;
+                    }
+                }
+
+                for (size_t i = 0; i < aliveHeroes.size(); i++) {
+                    for (size_t j = i + 1; j < aliveHeroes.size(); j++) {
+                        AOrionChar* a = aliveHeroes[i];
+                        AOrionChar* b = aliveHeroes[j];
+                        if (a->TeamNum == b->TeamNum) continue;
+
+                        FVector aLoc = a->K2_GetActorLocation();
+                        FVector bLoc = b->K2_GetActorLocation();
+                        float dSq = (aLoc.X - bLoc.X) * (aLoc.X - bLoc.X) +
+                            (aLoc.Y - bLoc.Y) * (aLoc.Y - bLoc.Y) +
+                            (aLoc.Z - bLoc.Z) * (aLoc.Z - bLoc.Z);
+
+                        if (dSq < 6250000.0f) {
+                            FVector mid = { (aLoc.X + bLoc.X) / 2, (aLoc.Y + bLoc.Y) / 2,
+                                            (aLoc.Z + bLoc.Z) / 2 };
+                            ActiveFights.push_back({ a, b, mid, a->TeamNum });
+                            ActiveFights.push_back({ b, a, mid, b->TeamNum });
+                        }
+                    }
+                }
+
+
+                for (AOrionAIBot* bot : AllBots) {
+                    if (bot->GetFullName().find("Default__") != std::string::npos) continue;
+
+                    AOrionChar* botChar = reinterpret_cast<AOrionChar*>(bot->Pawn);
+                    if (!botChar) {
+                        bool bWasAliveLastTick = (WasAlive.count(bot) && WasAlive[bot]);
+
+#if F4_LOG_LEVEL >= 1
+                        if (bWasAliveLastTick) {
+                            std::string bdName = LastBotCharName.count(bot)
+                                ? LastBotCharName[bot] : "(unknown)";
+                            std::string bdAct = LastMacroAction.count(bot)
+                                ? LastMacroAction[bot] : std::string();
+                            std::string bdTgt = LastMacroTargetName.count(bot)
+                                ? LastMacroTargetName[bot] : std::string();
+                            if (bdTgt.length() > 25) bdTgt = bdTgt.substr(0, 25);
+                            int bdRole = GBotRoles.count(bot) ? GBotRoles[bot] : 0;
+                            bool bdNeedsHeal = (BotNeedsHeal.count(bot) && BotNeedsHeal[bot]);
+                            bool bdBlind = (BotIsBlind.count(bot) && BotIsBlind[bot]);
+                            float bdLastHP = LastBotHealth.count(bot) ? LastBotHealth[bot] : 0.0f;
+                            bool bdInRecallPath = !g_lastRecallPath[bot].empty();
+                            std::string bdPrevPath = g_lastRecallPath[bot];
+                            bool bdInRecallLifecycle = (g_recallLifeStart.count(bot) > 0);
+                            int bdRecallElapsed = bdInRecallLifecycle
+                                ? (int)(matchTimeB - g_recallLifeStart[bot]) : -1;
+
+                            std::cout << "[BOT-DESPAWN] bot=" << bdName
+                                << " Role=" << bdRole
+                                << " | LastAction=" << (bdAct.empty() ? "(empty)" : bdAct)
+                                << " LastTgt=" << bdTgt
+                                << " LastHP=" << (int)bdLastHP
+                                << " | NeedsHeal=" << (bdNeedsHeal ? 1 : 0)
+                                << " Blind=" << (bdBlind ? 1 : 0)
+                                << " | InRecallPath=" << (bdInRecallPath ? bdPrevPath : "(no)")
+                                << " RecallLifecycleElapsed=" << bdRecallElapsed << "s"
+                                << " T=" << (int)matchTimeB << "s"
+                                << std::endl;
+
+                            if (bdInRecallLifecycle) {
+                                int bdStartTwr = g_recallStartTwrM.count(bot) ? g_recallStartTwrM[bot] : -1;
+                                int bdMinTwr   = g_recallMinTwrM.count(bot)   ? g_recallMinTwrM[bot]   : -1;
+                                int bdHomeProg = (bdStartTwr >= 0 && bdMinTwr >= 0) ? (bdStartTwr - bdMinTwr) : -1;
+                                std::cout << "[RECALL-LIFE-R] DIED-MID-RECALL Role=" << bdRole
+                                    << " Elapsed=" << bdRecallElapsed << "s"
+                                    << " LastAction=" << (bdAct.empty() ? "(empty)" : bdAct)
+                                    << " LastHP=" << (int)bdLastHP
+                                    << " RecallPath=" << (bdInRecallPath ? bdPrevPath : "(no-path)")
+                                    << " StartTwrM=" << bdStartTwr << " MinTwrM=" << bdMinTwr << " HomeProgM=" << bdHomeProg
+                                    << " T=" << (int)matchTimeB << "s"
+                                    << std::endl;
+                            }
+                        }
+#endif
+
+                        g_recallLifeStart.erase(bot);
+                        g_recallStartTwrM.erase(bot);
+                        g_recallMinTwrM.erase(bot);
+                        g_lastRecallPath.erase(bot);
+
+#if F4_LOG_LEVEL >= 1
+                        if (bWasAliveLastTick)
+                        {
+                            int deathLogRole = 0;
+                            if (GBotRoles.find(bot) != GBotRoles.end()) deathLogRole = GBotRoles[bot];
+                            float akLagAtDeath = -1.0f;
+                            if (AntiKiteEngageTime.count(bot)) {
+                                akLagAtDeath = matchTimeB - AntiKiteEngageTime[bot];
+                            }
+                            EOrionTeam dcBotTeam = EOrionTeam::NoTeam;
+                            if (bot->PlayerState) {
+                                dcBotTeam = reinterpret_cast<AOrionPlayerState_Game*>(bot->PlayerState)->GetTeamNum();
+                            }
+                            EOrionTeam dcEnemyTeam = (dcBotTeam == EOrionTeam::TeamRed) ? EOrionTeam::TeamBlue : EOrionTeam::TeamRed;
+                            int dcFrH18 = 0, dcEnH18 = 0, dcFrM18 = 0, dcEnM18 = 0;
+                            if (LastBotPositions.count(bot)) {
+                                FVector lastLoc = LastBotPositions[bot];
+                                for (const CachedChar& cc : LiveChars) {
+                                    float dx = cc.loc.X - lastLoc.X;
+                                    float dy = cc.loc.Y - lastLoc.Y;
+                                    float dSq = dx * dx + dy * dy;
+                                    if (dSq >= 3240000.0f) continue;
+                                    if (cc.bIsHero) {
+                                        if (cc.team == dcEnemyTeam)    dcEnH18++;
+                                        else if (cc.team == dcBotTeam) dcFrH18++;
+                                    }
+                                    else if (!cc.bIsNeutral) {
+                                        if (cc.team == dcBotTeam)        dcFrM18++;
+                                        else if (cc.team == dcEnemyTeam) dcEnM18++;
+                                    }
+                                }
+                            }
+                            auto getBoolMap = [&](std::map<AOrionAIBot*, bool>& m) -> int {
+                                auto it = m.find(bot); return (it != m.end() && it->second) ? 1 : 0;
+                            };
+                            auto getIntMap = [&](std::map<AOrionAIBot*, int>& m) -> int {
+                                auto it = m.find(bot); return (it != m.end()) ? it->second : -1;
+                            };
+                            std::string ldName = LastBotCharName.count(bot) ? LastBotCharName[bot] : "(unknown)";
+                            std::string ldAct = LastMacroAction.count(bot) ? LastMacroAction[bot] : "";
+                            std::string ldTgt = LastMacroTargetName.count(bot) ? LastMacroTargetName[bot] : "";
+                            if (ldTgt.length() > 25) ldTgt = ldTgt.substr(0, 25);
+                            std::string akLagStr;
+                            if (akLagAtDeath < 0.0f) akLagStr = "NEVER";
+                            else {
+                                char buf[32]; std::snprintf(buf, sizeof(buf), "%.1f", akLagAtDeath);
+                                akLagStr = buf;
+                            }
+                            std::cout << "[AK-DEATH-CAUSE] bot=" << ldName
+                                << " Role=" << deathLogRole
+                                << " Team=" << (dcBotTeam == EOrionTeam::TeamBlue ? "B" : (dcBotTeam == EOrionTeam::TeamRed ? "R" : "N"))
+                                << " Path=Despawn"
+                                << " | LastAction=" << ldAct
+                                << " LastTgt=" << ldTgt
+                                << " | Blind=" << (BotIsBlind.count(bot) && BotIsBlind[bot] ? 1 : 0)
+                                << " Fleeing=" << getBoolMap(PrevTickIsFleeing)
+                                << " InEnemyTurret=" << getBoolMap(PrevTickInsideEnemyTurret)
+                                << " SafePush=" << getBoolMap(PrevTickIsSafeToPush)
+                                << " V44=" << getBoolMap(PrevTickV44Threatened)
+                                << " Combat=" << (CombatTimer.count(bot) ? CombatTimer[bot] : 0.0f)
+                                << " | HeroDistM=" << getIntMap(PrevTickHeroDistM)
+                                << " FrTwrM=" << getIntMap(PrevTickFrTowerM)
+                                << " EnTwrM=" << getIntMap(PrevTickEnTowerM)
+                                << " Vis=" << getIntMap(PrevTickVisEnemyBit)
+                                << " | World: FrH18=" << dcFrH18 << " EnH18=" << dcEnH18
+                                << " FrM18=" << dcFrM18 << " EnM18=" << dcEnM18
+                                << " | AKLag=" << akLagStr << std::endl;
+
+
+
+
+
+                        }
+#endif
+                        WasAlive[bot] = false;
+                        BotNeedsHeal[bot] = false;
+                        BossWaitStartTime[bot] = 0.0f;
+                        if (BotIsBlind.count(bot) && BotIsBlind[bot]) {
+                            bot->K2_SetIgnoreEnemies(false);
+                            BotIsBlind[bot] = false;
+                        }
+                        *reinterpret_cast<UObject**>(reinterpret_cast<uintptr_t>(bot) + 0x0650) = nullptr;
+                        if (LastMacroAction.count(bot) && LastMacroAction[bot] == "Boss") {
+                            BossDeathCooldown[bot] = matchTimeB + 120.0f;
+                        }
+                        if (LastMacroAction.count(bot) && LastMacroAction[bot] == "Gank"
+                            && LastGankTargetPtr.count(bot) && LastGankTargetPtr[bot]) {
+                            GankCooldownPerTarget[LastGankTargetPtr[bot]] = matchTimeB + 45.0f;
+                        }
+                        *reinterpret_cast<UBotObjective**>(reinterpret_cast<uintptr_t>(bot) + 0x0748) = nullptr;
+                        AntiKiteEngageTime.erase(bot);
+                        lastThreatRetreatTime.erase(bot);
+                         g_launchIssueTime.erase(bot);
+                        g_launchTraceUntil.erase(bot); g_launchTracePos.erase(bot); g_launchPrevHP.erase(bot);
+                        g_brFrozenTicks.erase(bot); g_brIssueTime.erase(bot); g_brActiveUntil.erase(bot);
+                        g_svActiveUntil.erase(bot); g_svEpBotHP.erase(bot); g_svEpHeroHP.erase(bot); g_svLastT.erase(bot); g_svFireT.erase(bot); g_svFireHP.erase(bot);
+                        g_svTarget.erase(bot); g_svTgtIsWave.erase(bot); g_svMaxHoldT.erase(bot);
+                        g_wfbUntil.erase(bot); g_wfbTarget.erase(bot); g_wfbBestDistSq.erase(bot); g_wfbStall.erase(bot); g_wfbFireT.erase(bot); g_wfbEngineBlind.erase(bot); g_wfbTgtIsWave.erase(bot);
+                        g_p23Target.erase(bot); g_p23AccR.erase(bot); g_p23StartT.erase(bot); g_p23TgtIsWave.erase(bot);
+                        g_akpUntil.erase(bot);
+                        g_advHoldOn.erase(bot);
+                        g_akoUntil.erase(bot); g_akoKill.erase(bot); g_akoStartT.erase(bot); g_akoLastT.erase(bot); g_akoRetreatSeenT.erase(bot); g_akoStartHP.erase(bot); g_akoStartHeroHP.erase(bot); g_akoMode.erase(bot);
+                        g_wfbDefPath.erase(bot); g_wfbDefParity.erase(bot); g_wfbLpStall.erase(bot);
+                        g_ahbfOnT.erase(bot);
+                        g_brMoveTarget.erase(bot); g_brAccRadius.erase(bot);
+                        g_dlbFrozenTicks.erase(bot);
+                        g_deEngagedLastTick.erase(bot);
+                        g_pdyStartT.erase(bot); g_pdyStreak.erase(bot); g_pdyLogT.erase(bot); g_pdyPhase.erase(bot); g_pdyPos.erase(bot);
+                        p5EraseBot(bot); p6EraseAll(bot);
+                        g_rfLaunchTime.erase(bot);
+                        g_escapeJumpTime.erase(bot);
+                        g_ejgLastT.erase(bot); g_ejgStartTwrM.erase(bot); g_ejgMinTwrM.erase(bot); g_ejgJumps.erase(bot);
+                        g_attrEntryHP.erase(bot);
+                        g_vpmMoveFiredT.erase(bot);
+                        CombatTimer[bot] = 0.0f;
+                        LastBotHealth[bot] = 0.0f;
+                        BotIdleTicks[bot] = 0;
+                        LastKnownObjective[bot] = nullptr;
+                        LastMacroAction[bot] = "";
+                        LastMacroTargetName[bot] = "";
+                        if (FlippedCreep.count(bot) && FlippedCreep[bot]) {
+                            bool bAnyoneElseNeedsIt = false;
+                            for (auto& fp : FlippedCreep) {
+                                if (fp.first == bot) continue;
+                                if (fp.second != FlippedCreep[bot]) continue;
+
+                                AOrionAIBot* otherBot = fp.first;
+                                if (!otherBot) continue;
+
+                                AOrionChar* otherChar = reinterpret_cast<AOrionChar*>(otherBot->Pawn);
+                                if (!otherChar) continue;
+                                float otherHp = 0.0f;
+                                if (getHealthFunc) otherChar->ProcessEvent(getHealthFunc, &otherHp);
+                                if (otherHp <= 0.0f) continue;
+
+                                auto actionIt = LastMacroAction.find(otherBot);
+                                if (actionIt == LastMacroAction.end()) continue;
+                                const std::string& otherAction = actionIt->second;
+                                if (otherAction != "Boss" && otherAction != "Jungle") continue;
+
+                                bAnyoneElseNeedsIt = true;
+                                break;
+                            }
+                            if (!bAnyoneElseNeedsIt) {
+                                FlippedCreep[bot]->TeamNum = EOrionTeam::TeamCreep;
+                            }
+                            FlippedCreep[bot] = nullptr;
+                        }
+                        RotationTargetEnemy.erase(bot);
+                        RotationStartTime.erase(bot);
+                        g_collapseStartTime.erase(bot);
+                        g_laneReturnStartTime.erase(bot);
+                        g_lrS0Latch.erase(bot);
+                        g_forceRecallStart.erase(bot); g_forceRecallFired.erase(bot);
+                        LastGankTargetPtr.erase(bot);
+                        GankEngaged.erase(bot);
+                        g_gankJumpTime.erase(bot);
+                        g_akJumpTime.erase(bot);
+                        g_speedGEHandle.erase(bot);
+                        CachedFrontTower.erase(bot);
+                        continue;
+                    }
+
+                    EOrionTeam botTeam = EOrionTeam::NoTeam;
+                    if (bot->PlayerState) {
+                        botTeam = reinterpret_cast<AOrionPlayerState_Game*>(bot->PlayerState)->GetTeamNum();
+                    }
+                    if (botTeam == EOrionTeam::NoTeam) continue;
+
+                    bool bLanePushVetoActive = false;
+                    bool mrkLpvSuppressed = false;
+                    std::string charName = botChar->GetFullName();
+                    bool bIsMeleeChar = (charName.find("Steel") != std::string::npos
+                        || charName.find("WarDrum") != std::string::npos   
+                        || charName.find("Chains") != std::string::npos     
+                        || charName.find("Kwang") != std::string::npos
+                        || charName.find("Grux") != std::string::npos
+                        || charName.find("Tomahawk") != std::string::npos
+                        || charName.find("FallenAngel") != std::string::npos 
+                        || charName.find("Rampage") != std::string::npos
+                        || charName.find("Vamp") != std::string::npos       
+                        || charName.find("Justice") != std::string::npos     
+                        || charName.find("Kurohane") != std::string::npos
+                        || charName.find("Sword") != std::string::npos
+                        || charName.find("Crunch") != std::string::npos
+                        || charName.find("Mudang") != std::string::npos
+                        || charName.find("Hammer") != std::string::npos
+                        || charName.find("Wukong") != std::string::npos
+                        || charName.find("Ice") != std::string::npos
+                        || charName.find("Femme") != std::string::npos
+                        || charName.find("ArcBlade") != std::string::npos); 
+
+                    {
+                        UBotObjective* preObj = *reinterpret_cast<UBotObjective**>(
+                            reinterpret_cast<uintptr_t>(bot) + 0x0748);
+                        if (LastKnownObjective.count(bot) && LastKnownObjective[bot] != nullptr
+                            && preObj != LastKnownObjective[bot] && preObj != nullptr) {
+                            if (IsValidUE4Object(LastKnownObjective[bot])
+                                && (!BOClass || reinterpret_cast<UObject*>(LastKnownObjective[bot])->IsA(BOClass))) {
+                                *reinterpret_cast<UBotObjective**>(reinterpret_cast<uintptr_t>(bot) + 0x0748)
+                                    = LastKnownObjective[bot];
+
+                            }
+                            else {
+                                LastKnownObjective[bot] = preObj;
+                            }
+                        }
+                    }
+
+
+                    float currentHealth = 1000.0f, maxHealth = 1000.0f;
+                    if (getHealthFunc && getMaxHealthFunc) {
+                        botChar->ProcessEvent(getHealthFunc, &currentHealth);
+                        botChar->ProcessEvent(getMaxHealthFunc, &maxHealth);
+                    }
+
+
+                    FVector botLoc = botChar->K2_GetActorLocation();
+
+                    bool bHasNativeTarget = false;
+                    bool bNativeTargetIsHero = false;
+                    if (GetEnemyCharacterFunc) {
+                        struct { class AActor* ReturnValue; } getEnemyParams{};
+                        getEnemyParams.ReturnValue = nullptr;
+                        bot->ProcessEvent(GetEnemyCharacterFunc, &getEnemyParams);
+                        if (getEnemyParams.ReturnValue != nullptr) {
+                            float eHealth = 0.0f;
+                            if (getHealthFunc) getEnemyParams.ReturnValue->ProcessEvent(getHealthFunc, &eHealth);
+                            if (eHealth > 0.0f) {
+                                bHasNativeTarget = true;
+                                AOrionChar* nativeEnemy = reinterpret_cast<AOrionChar*>(getEnemyParams.ReturnValue);
+                                if (nativeEnemy && nativeEnemy->PlayerState != nullptr) {
+                                    FVector neLoc = nativeEnemy->K2_GetActorLocation();
+                                    float distToNativeSq = (neLoc.X - botLoc.X) * (neLoc.X - botLoc.X) +
+                                        (neLoc.Y - botLoc.Y) * (neLoc.Y - botLoc.Y) +
+                                        (neLoc.Z - botLoc.Z) * (neLoc.Z - botLoc.Z);
+                                    if (distToNativeSq < 9000000.0f) {
+                                        bNativeTargetIsHero = true;
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    if (currentHealth <= 0.0f) {
+                        AntiKiteEngageTime.erase(bot);
+                        CombatTimer[bot] = 0.0f;
+                        LastBotHealth[bot] = 0.0f;
+                        BotIdleTicks[bot] = 0;
+                        BotNeedsHeal[bot] = false;
+                        BossWaitStartTime[bot] = 0.0f;
+                        if (BotIsBlind[bot]) {
+                            bot->K2_SetIgnoreEnemies(false);
+                            BotIsBlind[bot] = false;
+                        }
+                        UObject** deathOverridePtr = reinterpret_cast<UObject**>(
+                            reinterpret_cast<uintptr_t>(bot) + 0x0650);
+                        *deathOverridePtr = nullptr;
+
+                        if (LastMacroAction[bot] == "Boss") {
+                            BossDeathCooldown[bot] = matchTimeB + 120.0f;
+                        }
+
+                        if (FlippedCreep.count(bot) && FlippedCreep[bot]) {
+                            bool bAnyoneElseNeedsIt = false;
+                            for (auto& fp : FlippedCreep) {
+                                if (fp.first != bot && fp.second == FlippedCreep[bot]) {
+                                    bAnyoneElseNeedsIt = true;
+                                    break;
+                                }
+                            }
+                            if (!bAnyoneElseNeedsIt) {
+                                FlippedCreep[bot]->TeamNum = EOrionTeam::TeamCreep;
+                            }
+                            FlippedCreep[bot] = nullptr;
+                        }
+                        *reinterpret_cast<UBotObjective**>(reinterpret_cast<uintptr_t>(bot) + 0x0748) = nullptr;
+                        LastKnownObjective[bot] = nullptr;
+
+                        RotationTargetEnemy.erase(bot);
+                        RotationStartTime.erase(bot);
+                        if (LastMacroAction[bot] == "Gank"
+                            && LastGankTargetPtr.count(bot) && LastGankTargetPtr[bot]) {
+                            GankCooldownPerTarget[LastGankTargetPtr[bot]] = matchTimeB + 45.0f;
+                        }
+                        LastGankTargetPtr.erase(bot);
+                        GankEngaged.erase(bot);
+                        g_gankJumpTime.erase(bot);
+                        g_akJumpTime.erase(bot);
+                        g_speedGEHandle.erase(bot);
+                        LastMacroAction[bot] = "Dead";
+
+                        continue;
+                    }
+
+           
+                    bool bTookDamage = false;
+                    if (LastBotHealth.find(bot) != LastBotHealth.end() && LastBotHealth[bot] > 0.0f) {
+                        if (currentHealth < LastBotHealth[bot]) {
+                            bTookDamage = true;
+                        }
+                    }
+                    LastBotHealth[bot] = currentHealth;
+
+                    if (bTookDamage) {
+                        CombatTimer[bot] = 2.0f;
+
+                        if (LastMacroAction[bot] == "Recall") {
+                            LastMacroAction[bot] = "";
+                        }
+                    }
+                    else if (CombatTimer[bot] > 0.0f) {
+                        CombatTimer[bot] -= 1.0f;
+                    }
+
+                    if (bot->PlayerState) botTeam = reinterpret_cast<AOrionPlayerState_Game*>(bot->PlayerState)->GetTeamNum();
+                    if (botTeam == EOrionTeam::NoTeam) continue;
+                    EOrionTeam enemyTeam = (botTeam == EOrionTeam::TeamRed) ? EOrionTeam::TeamBlue : EOrionTeam::TeamRed;
+                    bool bIsBlueTeam = ((int)botTeam == 1);
+
+
+                    int roleSlot = 0;
+                    if (GBotRoles.find(bot) != GBotRoles.end()) roleSlot = GBotRoles[bot];
+                    bool bIsJungler = (roleSlot == 4);
+                    bool p2FinHeavyOut = false;
+                    if (ENABLE_P2_FINISH_OUTNUM && bIsMeleeChar) {
+                        int p2FrH = 0, p2EnH = 0;
+                        for (const CachedChar& p2h : LiveChars) {
+                            if (p2h.ptr == botChar || !p2h.bIsHero || p2h.bIsNeutral) continue;
+                            float p2dx = p2h.loc.X - botLoc.X, p2dy = p2h.loc.Y - botLoc.Y;
+                            if (p2dx * p2dx + p2dy * p2dy >= 3240000.0f) continue;
+                            if (p2h.team == botTeam) p2FrH++; else if (p2h.team == enemyTeam) p2EnH++;
+                        }
+                        if (p2EnH >= p2FrH + P2_FINISH_OUTNUM_DIFF) g_p2FinOutT[bot] = matchTimeB;
+                        p2FinHeavyOut = g_p2FinOutT.count(bot) && (matchTimeB - g_p2FinOutT[bot]) <= P2_FINISH_OUTNUM_HOLD_S;
+                    }
+
+
+
+
+
+
+                    AOrionChar* activeBossTarget = bIsBlueTeam ? activeBossTargetBlue : activeBossTargetRed;
+                    bool bDoingBoss = false;
+
+                    bool bWasDoingBoss = (LastMacroAction[bot] == "Boss");
+
+                    if (activeBossTarget != nullptr && LastMacroAction[bot] != "Recall") {
+                        int requiredDead = (activeBossTarget == orbPrime) ? 2 : 1;
+                        bool bEnemyDeadCondition = (bIsBlueTeam && deadRed >= requiredDead) ||
+                            (!bIsBlueTeam && deadBlue >= requiredDead);
+
+                        bool bBossOnCooldown = (BossDeathCooldown.count(bot) && matchTimeB < BossDeathCooldown[bot]);
+
+                        if (bEnemyDeadCondition && !bBossOnCooldown) {
+                            FVector pfaABossLoc = activeBossTarget->K2_GetActorLocation();
+                            float pfaA_dx = pfaABossLoc.X - botLoc.X;
+                            float pfaA_dy = pfaABossLoc.Y - botLoc.Y;
+                            float pfaA_distSq = pfaA_dx * pfaA_dx + pfaA_dy * pfaA_dy;
+                            if (pfaA_distSq < 64000000.0f) {
+                                bDoingBoss = true;
+
+#if F4_LOG_LEVEL >= 2
+                                if (LastMacroAction[bot] != "Boss") {
+                                    int distM = (int)(sqrt(pfaA_distSq) / 100.0f);
+                                    std::cout << "[BOSS-COMMIT] Role=" << roleSlot
+                                        << " Team=" << (bIsBlueTeam ? "B" : "R")
+                                        << " Target=" << (activeBossTarget == fangtooth ? "Fang" : "Prime")
+                                        << " Path=A"
+                                        << " DistAtCommit=" << distM << "m"
+                                        << " T=" << (int)matchTimeB << "s"
+                                        << std::endl;
+                                }
+#endif
+                            }
+                        }
+                    }
+
+                    if (bWasDoingBoss) {
+                        bool bBossOnCooldown = (BossDeathCooldown.count(bot) && matchTimeB < BossDeathCooldown[bot]);
+                        if (!bBossOnCooldown) {
+                            AOrionChar* savedTarget = nullptr;
+                            if (LastMacroTargetName[bot].find("PrimeHelix") != std::string::npos) savedTarget = orbPrime;
+                            else if (LastMacroTargetName[bot].find("Dragon") != std::string::npos) {
+                                savedTarget = fangtooth;
+                            }
+                            if (savedTarget != nullptr && savedTarget->GetHealth() > 0.0f) {
+                                activeBossTarget = savedTarget;
+                                bDoingBoss = true;
+                            }
+                        }
+                    }
+
+                    if (!bDoingBoss && LastMacroAction[bot] != "Recall") {
+                        bool bBossOnCooldown = (BossDeathCooldown.count(bot) && matchTimeB < BossDeathCooldown[bot]);
+                        if (!bBossOnCooldown) {
+                            int alliesAtFang = 0;
+                            int alliesAtPrime = 0;
+
+                            for (AOrionAIBot* otherBot : AllBots) {
+                                if (!otherBot || otherBot == bot) continue;
+                                if (otherBot->GetFullName().find("Default__") != std::string::npos) continue;
+
+                                AOrionChar* otherChar = reinterpret_cast<AOrionChar*>(otherBot->Pawn);
+                                if (!otherChar) continue;
+                                if (otherChar->GetHealth() <= 0.0f) continue;
+                                if (otherChar->TeamNum != botTeam) continue;
+
+                                auto itAct = LastMacroAction.find(otherBot);
+                                if (itAct == LastMacroAction.end() || itAct->second != "Boss") continue;
+
+                                auto itName = LastMacroTargetName.find(otherBot);
+                                if (itName == LastMacroTargetName.end()) continue;
+                                const std::string& tName = itName->second;
+
+                                AOrionChar* otherBossTarget = nullptr;
+                                if (tName.find("Dragon") != std::string::npos) {
+                                    otherBossTarget = fangtooth;
+                                }
+                                else if (tName.find("PrimeHelix") != std::string::npos) {
+                                    otherBossTarget = orbPrime;
+                                }
+                                if (!otherBossTarget || otherBossTarget->GetHealth() <= 0.0f) continue;
+
+                                if (otherBossTarget == fangtooth)      alliesAtFang++;
+                                else if (otherBossTarget == orbPrime)  alliesAtPrime++;
+                            }
+
+                            AOrionChar* sharedBossTarget = nullptr;
+                            if (alliesAtFang >= 1) {
+                                sharedBossTarget = fangtooth;
+                            }
+                            else if (alliesAtPrime >= 1) {
+                                sharedBossTarget = orbPrime;
+                            }
+
+                            if (sharedBossTarget) {
+                                FVector pfaCBossLoc = sharedBossTarget->K2_GetActorLocation();
+                                float pfaC_dx = pfaCBossLoc.X - botLoc.X;
+                                float pfaC_dy = pfaCBossLoc.Y - botLoc.Y;
+                                float pfaC_distSq = pfaC_dx * pfaC_dx + pfaC_dy * pfaC_dy;
+                                bool bWithinBossRange = (pfaC_distSq < 36000000.0f);
+
+                                if (bWithinBossRange) {
+                                    activeBossTarget = sharedBossTarget;
+                                    bDoingBoss = true;
+
+#if F4_LOG_LEVEL >= 2
+                                    int pfaC_distM = (int)(sqrt(pfaC_distSq) / 100.0f);
+                                    if (LastMacroAction[bot] != "Boss") {
+                                        std::cout << "[BOSS-COMMIT] Role=" << roleSlot
+                                            << " Team=" << (bIsBlueTeam ? "B" : "R")
+                                            << " Target=" << (sharedBossTarget == fangtooth ? "Fang" : "Prime")
+                                            << " Path=C"
+                                            << " DistAtCommit=" << pfaC_distM << "m"
+                                            << " T=" << (int)matchTimeB << "s"
+                                            << std::endl;
+                                    }
+#endif
+                                }
+                            }
+                        }
+                    }
+                    bool bLateGame = (matchTimeB > 1500.0f) || (deadInhibitorsBlue > 0 || deadInhibitorsRed > 0);
+                    UObject* myPlaybook = nullptr;
+                    if (CommanderObj) {
+                        uintptr_t botTeamsAddr = reinterpret_cast<uintptr_t>(CommanderObj) + 0x40;
+                        int teamIdx = bIsBlueTeam ? 0 : 1;
+                        uintptr_t rolePlaybooksAddr = botTeamsAddr + (teamIdx * 0x120) + 0x90;
+                        FRawRuntimePlaybook* playbooks = reinterpret_cast<FRawRuntimePlaybook*>(rolePlaybooksAddr);
+                        myPlaybook = playbooks[roleSlot].PlaybookInstance;
+                    }
+
+                    int matchMinute = (int)(matchTimeB / 60.0f);
+                    bool bJunglerLanePhase = (matchMinute % 2 != 0);
+
+                    bool bIsSafeToPush = false;
+                    if (IsSafeFunc) bot->ProcessEvent(IsSafeFunc, &bIsSafeToPush);
+
+
+                    uint8 laneEnum = 1;
+
+                    if (!bLateGame && !bDoingBoss) {
+                        if (roleSlot == 0) {
+                            laneEnum = bIsBlueTeam ? 0 : 2;
+                        }
+                        else if (roleSlot == 2 || roleSlot == 3) {
+                            laneEnum = bIsBlueTeam ? 2 : 0;
+                        }
+                    }
+                    else {
+                        laneEnum = 9;
+                    }
+
+
+                    AOrionDamageableObjective_Base* friendlyCore = bIsBlueTeam ? blueCore : redCore;
+                    FVector friendlyCoreLoc = friendlyCore ? friendlyCore->K2_GetActorLocation() : FVector();
+
+                    AOrionDamageableObjective_Base* enemyCore = bIsBlueTeam ? redCore : blueCore;
+                    FVector enemyCoreLoc = enemyCore ? enemyCore->K2_GetActorLocation() : FVector();
+                    float distToFriendlyCoreSq = friendlyCore ? ((friendlyCoreLoc.X - botLoc.X) * (friendlyCoreLoc.X - botLoc.X) + (friendlyCoreLoc.Y - botLoc.Y) * (friendlyCoreLoc.Y - botLoc.Y) + (friendlyCoreLoc.Z - botLoc.Z) * (friendlyCoreLoc.Z - botLoc.Z)) : 0.0f;
+
+                    AOrionChar* rearWaveAnchor = nullptr;
+                    float rearWaveAnchorDistSq = 1e18f;
+                    FVector rearWaveAnchorLoc = FVector();
+                    int     rwAnchorSub = 0;
+                    int   rwFrM25 = 0, rwAheadM25 = 0;
+                    bool  rF3TradeX = false;
+                    if (enemyCore && !bIsJungler && !bDoingBoss) {
+                        float botToECoreSq_rw = (enemyCoreLoc.X - botLoc.X) * (enemyCoreLoc.X - botLoc.X)
+                                              + (enemyCoreLoc.Y - botLoc.Y) * (enemyCoreLoc.Y - botLoc.Y);
+                        for (const CachedChar& cc : LiveChars) {
+                            if (cc.team != botTeam || cc.bIsHero || cc.bIsNeutral) continue;
+                            if (cc.fullName.find("bp_minion_lane_") == std::string::npos) continue;
+                            float minToECoreSq = (enemyCoreLoc.X - cc.loc.X) * (enemyCoreLoc.X - cc.loc.X)
+                                               + (enemyCoreLoc.Y - cc.loc.Y) * (enemyCoreLoc.Y - cc.loc.Y);
+                            {
+                                float dB25 = (cc.loc.X - botLoc.X) * (cc.loc.X - botLoc.X)
+                                           + (cc.loc.Y - botLoc.Y) * (cc.loc.Y - botLoc.Y);
+                                if (dB25 < 6250000.0f) {
+                                    rwFrM25++;
+                                    if (minToECoreSq < botToECoreSq_rw) rwAheadM25++;
+                                }
+                            }
+                            if (minToECoreSq <= botToECoreSq_rw) continue;
+                            float dB = (cc.loc.X - botLoc.X) * (cc.loc.X - botLoc.X)
+                                     + (cc.loc.Y - botLoc.Y) * (cc.loc.Y - botLoc.Y);
+                            if (dB > 16000000.0f) continue;
+                            if (dB < rearWaveAnchorDistSq) { rearWaveAnchorDistSq = dB; rearWaveAnchor = cc.ptr; rearWaveAnchorLoc = cc.loc; }
+                        }
+                    }
+                    if (rearWaveAnchor) {
+                        for (const CachedChar& cc : LiveChars) {
+                            if (cc.team != botTeam || cc.bIsHero || cc.bIsNeutral) continue;
+                            if (cc.fullName.find("bp_minion_lane_") == std::string::npos) continue;
+                            float sx = cc.loc.X - rearWaveAnchorLoc.X, sy = cc.loc.Y - rearWaveAnchorLoc.Y;
+                            if (sx * sx + sy * sy < 640000.0f) rwAnchorSub++;
+                        }
+                    }
+
+                    if (rwFrM25 >= 1 && rwAheadM25 == 0) {
+                        if (!g_mwhAheadZeroSince.count(bot)) g_mwhAheadZeroSince[bot] = matchTimeB;
+                    } else {
+                        g_mwhAheadZeroSince.erase(bot);
+                    }
+
+                    if (ENABLE_MELEE_WAVE_HOLD && g_mwhUntil.count(bot)) {
+                        bool mwrCrossed = (rwAheadM25 >= 1);
+                        bool mwrExpired = (matchTimeB >= g_mwhUntil[bot]);
+                        if (mwrCrossed || mwrExpired) {
+#if F4_LOG_LEVEL >= 1
+                            if (bIsBlueTeam && botChar) {
+                                std::cout << "[MWH-RELEASE] bot=" << botChar->GetFullName().substr(0, 24)
+                                    << " R=" << roleSlot
+                                    << " HP=" << (maxHealth > 0.0f ? (int)((currentHealth / maxHealth) * 100) : -1) << "%"
+                                    << " | reason=" << (mwrCrossed ? "CROSSED" : "EXPIRED")
+                                    << " durS=" << (g_mwhStartT.count(bot) ? (int)(matchTimeB - g_mwhStartT[bot]) : -1)
+                                    << " ticks=" << (g_mwhTicks.count(bot) ? g_mwhTicks[bot] : -1)
+                                    << " gapStart=" << (g_mwhStartGap.count(bot) ? g_mwhStartGap[bot] : -1)
+                                    << " gapEnd=" << (rearWaveAnchor ? (int)(sqrtf(rearWaveAnchorDistSq) / 100.0f) : -1)
+                                    << " ahead=" << rwAheadM25 << " FrM25=" << rwFrM25
+                                    << " Act=" << LastMacroAction[bot]
+                                    << " T=" << (int)matchTimeB << "s" << std::endl;
+                            }
+#endif
+                            g_mwhUntil.erase(bot); g_mwhStartT.erase(bot);
+                            g_mwhStartGap.erase(bot); g_mwhTicks.erase(bot);
+                        }
+                    }
+
+                    bool bIsInBase = friendlyCore && (distToFriendlyCoreSq < 6250000.0f);
+                    int botPhysLane = 1;
+                    if (roleSlot == 0) botPhysLane = 0;
+                    else if (roleSlot == 2 || roleSlot == 3) botPhysLane = 2;
+                    bool bV44Threatened = false;
+                    bool bHeavilyOutnumbered = false;
+
+                    if (!bDoingBoss && !bIsInBase && LastMacroAction[bot] != "Recall" && LastMacroAction[bot] != "Gank" && LastMacroAction[bot] != "Rotate") {
+                        float threatScore = 0.0f;
+                        float friendlyScore = 0.0f;
+
+                        float botHpPct = (maxHealth > 0.0f) ? (currentHealth / maxHealth) : 1.0f;
+                        friendlyScore += botHpPct;
+
+                        for (const CachedChar& cc : LiveChars) {
+                            if (cc.ptr == botChar) continue;
+                            if (!cc.bIsHero) continue;
+
+                            float dSq = (cc.loc.X - botLoc.X) * (cc.loc.X - botLoc.X) +
+                                (cc.loc.Y - botLoc.Y) * (cc.loc.Y - botLoc.Y) +
+                                (cc.loc.Z - botLoc.Z) * (cc.loc.Z - botLoc.Z);
+
+                            if (dSq < 9000000.0f) {
+                                float hpPct = (cc.maxHealth > 0.0f) ? (cc.health / cc.maxHealth) : 1.0f;
+                                if (cc.team == enemyTeam) threatScore += hpPct;
+                                else if (cc.team == botTeam) friendlyScore += hpPct;
+                            }
+                        }
+
+                        if (!bIsJungler) {
+                            AOrionDamageableObjective_Base* myFrontTower = CachedFrontTower.count(bot) ? CachedFrontTower[bot] : nullptr;
+                            bool bIsOverextended = false;
+
+                            if (myFrontTower && enemyCore) {
+                                FVector ftLoc = myFrontTower->K2_GetActorLocation();
+                                float botToEnemyCoreSq = (enemyCoreLoc.X - botLoc.X) * (enemyCoreLoc.X - botLoc.X) +
+                                    (enemyCoreLoc.Y - botLoc.Y) * (enemyCoreLoc.Y - botLoc.Y) +
+                                    (enemyCoreLoc.Z - botLoc.Z) * (enemyCoreLoc.Z - botLoc.Z);
+                                float towerToEnemyCoreSq = (enemyCoreLoc.X - ftLoc.X) * (enemyCoreLoc.X - ftLoc.X) +
+                                    (enemyCoreLoc.Y - ftLoc.Y) * (enemyCoreLoc.Y - ftLoc.Y) +
+                                    (enemyCoreLoc.Z - ftLoc.Z) * (enemyCoreLoc.Z - ftLoc.Z);
+                                bIsOverextended = (botToEnemyCoreSq < towerToEnemyCoreSq);
+                            }
+
+                            if (bIsOverextended) {
+                                int miaEnemies = 0;
+                                for (auto& lkp : LastSeenEnemyHeroTime) {
+                                    AOrionChar* trackedHero = lkp.first;
+                                    if (!trackedHero || trackedHero->TeamNum != enemyTeam) continue;
+                                    if (!trackedHero->PlayerState) continue;
+
+                                    float timeSinceSeen = matchTimeB - lkp.second;
+                                    if (timeSinceSeen > 15.0f && timeSinceSeen < 120.0f) {
+                                        FVector lastPos = LastKnownEnemyHeroPos[trackedHero];
+                                        float distLastPosToBotSq =
+                                            (lastPos.X - botLoc.X) * (lastPos.X - botLoc.X) +
+                                            (lastPos.Y - botLoc.Y) * (lastPos.Y - botLoc.Y) +
+                                            (lastPos.Z - botLoc.Z) * (lastPos.Z - botLoc.Z);
+                                        if (distLastPosToBotSq < 25000000.0f) {
+                                            miaEnemies++;
+                                        }
+                                    }
+                                }
+
+                                if (miaEnemies >= 2) {
+                                    threatScore += 0.3f * miaEnemies;
+                                }
+                            }
+                        }
+
+                        float threatMultiplier = bLateGame ? 1.2f : 1.5f;
+
+                        if (threatScore >= (friendlyScore * threatMultiplier)) {
+                            bV44Threatened = true;
+                            bIsSafeToPush = false;
+                        }
+                        bHeavilyOutnumbered = (threatScore > friendlyScore * 2.5f);
+                        if (bHeavilyOutnumbered && !bIsJungler
+                            && LastMacroAction[bot] != "Defend"
+                            && !bLateGame) {
+                            bV44Threatened = true;
+                            bIsSafeToPush = false;
+                        }
+                    }
+                    bool bIsIdle = false;
+                    if (LastBotPositions.find(bot) != LastBotPositions.end()) {
+                        FVector lastLoc = LastBotPositions[bot];
+                        float distMovedSq = (botLoc.X - lastLoc.X) * (botLoc.X - lastLoc.X) + (botLoc.Y - lastLoc.Y) * (botLoc.Y - lastLoc.Y) + (botLoc.Z - lastLoc.Z) * (botLoc.Z - lastLoc.Z);
+                        if (distMovedSq < 10000.0f) { BotIdleTicks[bot]++; }
+                        else { BotIdleTicks[bot] = 0; }
+
+                        if (g_recallLifeStart.count(bot)) {
+                            float rjSt = g_recallLifeStart[bot];
+                            if (!g_rjEpochStart.count(bot) || g_rjEpochStart[bot] != rjSt) {
+                                g_rjEpochStart[bot] = rjSt;
+                                g_rjSawBigJump[bot] = false;
+                                g_wdPadCommit[bot] = false;
+                            }
+                            if (distMovedSq > 12250000.0f)        g_rjSawBigJump[bot] = true;
+                        }
+                    }
+                    LastBotPositions[bot] = botLoc;
+
+                    if (LastMacroAction[bot] == "") {
+                        EmptyActionTicks[bot]++;
+                    }
+                    else {
+                        EmptyActionTicks[bot] = 0;
+                    }
+
+                    AActor* moveTarget = nullptr;
+                    float accRadius = 300.0f;
+                    bool bIsActivelyFighting = false;
+                    bool bIsFleeing = false;
+                    bool bIsRotatingToObjective = false;
+                    auto p8LrLive = [&]() -> bool {
+                        auto p8It = g_laneReturnStartTime.find(bot);
+                        if (p8It == g_laneReturnStartTime.end()) return false;
+                        return !ENABLE_P8_LRCOMMIT_LIVE || (matchTimeB - p8It->second) < LANE_RETURN_COMMIT_SEC;
+                    };
+                    bool bP8FarDefend = false;
+                    const char* p7Wake = "-";
+                    bool bMeleeLockbreakActive = false;
+                    bool bRangedV44Lockbreak = false;
+                    bool bRdcLockbreak = false;
+                    bool bR51Lockbreak = false;
+                    bool bLaunchProbeActive = false;
+                    bool bStickyDangerRetreat = false;
+                    bool bAntiKiteActive = false;
+                    bool bRkfActive = false;
+                    bool bBrWakeRedirect = false;
+                    AOrionChar* bestEnemyHero = nullptr;
+                    AOrionChar* bestEnemyMinion = nullptr;
+                    AOrionChar* bestJungleCreep = nullptr;
+
+
+                    AOrionChar* bestGankTarget = nullptr;
+                    float bestGankTargetDistSq = 9999999999.0f;
+                    float highestGankScore = -9999.0f;
+                    bool g8Held = false;
+                    AOrionDamageableObjective_Base* bestEnemyTower = nullptr;
+                    AOrionDamageableObjective_Base* threatenedFriendlyTower = nullptr;
+                    bool gThreatTowerHeroThreat = false;
+                    int gThreatTowerNetThreat = 0;
+                    bool gThreatTowerIsMyLane = false;
+                    AOrionChar* bestFriendlyEscortMinion = nullptr;
+                    AOrionDamageableObjective_Base* closestFriendlyTower = nullptr;
+                    float closestFriendlyTowerDistSq = 9999999999.0f;
+
+                    float closestEnemyHeroDistSq = 9999999999.0f;
+                    float closestEnemyMinionDistSq = 9999999999.0f;
+                    float closestJungleDistSq = 9999999999.0f;
+                    float closestEnemyTowerDistSq = 9999999999.0f;
+                    float closestFriendlyMinionDistSq = 9999999999.0f;
+                    int bestEnemyTowerTier = 99;
+                    int bestThreatenedTowerTier = -1;
+                    float closestThreatenedTowerDistSq = 9999999999.0f;
+                    AOrionDamageableObjective_Base* frontFriendlyTowers[3] = { nullptr, nullptr, nullptr };
+                    int frontFriendlyTiers[3] = { 99, 99, 99 };
+
+                    for (AOrionDamageableObjective_Base* t : AllTowers) {
+                        if (!t) continue;
+                        if (t->GetFullName().find("Default__") != std::string::npos || t->GetHealth() <= 0.0f) continue;
+
+                        std::string tName = t->GetFullName();
+                        std::transform(tName.begin(), tName.end(), tName.begin(), ::tolower);
+
+                        FVector tLoc = t->K2_GetActorLocation();
+                        float distSq = (tLoc.X - botLoc.X) * (tLoc.X - botLoc.X) + (tLoc.Y - botLoc.Y) * (tLoc.Y - botLoc.Y) + (tLoc.Z - botLoc.Z) * (tLoc.Z - botLoc.Z);
+
+                        bool bIsCore = (tName.find("core") != std::string::npos);
+                        bool bIsInhibitor = (tName.find("bluetower_") != std::string::npos || tName.find("redtower_") != std::string::npos);
+
+                        bool bIsBlueTower = (t->TeamNum == EOrionTeam::TeamBlue);
+                        int towerPhysLane = 1;
+
+                        if (tName.find("_left_") != std::string::npos || tName.find("tower_0") != std::string::npos) {
+                            towerPhysLane = bIsBlueTower ? 0 : 2;
+                        }
+                        else if (tName.find("_right_") != std::string::npos || tName.find("tower_2") != std::string::npos) {
+                            towerPhysLane = bIsBlueTower ? 2 : 0;
+                        }
+
+                        bool bIsMyLaneTower = (bIsInhibitor || bIsCore || botPhysLane == towerPhysLane);
+
+                        if (t->TeamNum == enemyTeam) {
+                            int deadEnemyInhibs = bIsBlueTeam ? deadInhibitorsRed : deadInhibitorsBlue;
+                            int deadEnemies = bIsBlueTeam ? deadRed : deadBlue;
+
+                            if (!bLateGame && !bDoingBoss && bIsCore && deadEnemyInhibs == 0) continue;
+                            if (!bIsJungler && !bLateGame && !bDoingBoss && !bIsCore && !bIsMyLaneTower) continue;
+
+                            if (bIsCore && deadEnemyInhibs > 0) {
+                                if (deadEnemyInhibs >= 2 || (deadEnemyInhibs == 1 && deadEnemies >= 2)) {
+                                    bestEnemyTowerTier = 0;
+                                    bestEnemyTower = t;
+                                    closestEnemyTowerDistSq = distSq;
+                                    continue;
+                                }
+                            }
+
+                            int attackTier = 99;
+                            if (tName.find("outer") != std::string::npos || tName.find("tier1") != std::string::npos) attackTier = 1;
+                            else if (tName.find("inner") != std::string::npos || tName.find("tier2") != std::string::npos) attackTier = 2;
+                            else if (bIsInhibitor || tName.find("tier3") != std::string::npos) attackTier = 3;
+                            else if (bIsCore) attackTier = 4;
+
+                            if (bLateGame && attackTier == 3) {
+                                attackTier = 0;
+                            }
+
+                            if (attackTier < bestEnemyTowerTier) {
+                                bestEnemyTowerTier = attackTier;
+                                bestEnemyTower = t;
+                                closestEnemyTowerDistSq = distSq;
+                            }
+                            else if (attackTier == bestEnemyTowerTier && distSq < closestEnemyTowerDistSq) {
+                                closestEnemyTowerDistSq = distSq;
+                                bestEnemyTower = t;
+                            }
+                        }
+                        else if (t->TeamNum == botTeam) {
+                            if (distSq < closestFriendlyTowerDistSq) { closestFriendlyTowerDistSq = distSq; closestFriendlyTower = t; }
+
+                            if (bIsJungler) {
+                                bool bIsCriticalTower = (bIsInhibitor || bIsCore);
+                                if (!bLateGame && !bIsCriticalTower) continue;
+                            }
+
+                            bool bIsBlueTower = (t->TeamNum == EOrionTeam::TeamBlue);
+                            int towerPhysLane = 1;
+
+                            if (tName.find("_left_") != std::string::npos || tName.find("tower_0") != std::string::npos) {
+                                towerPhysLane = bIsBlueTower ? 0 : 2;
+                            }
+                            else if (tName.find("_right_") != std::string::npos || tName.find("tower_2") != std::string::npos) {
+                                towerPhysLane = bIsBlueTower ? 2 : 0;
+                            }
+
+                            int defTier = 0;
+                            if (tName.find("outer") != std::string::npos || tName.find("tier1") != std::string::npos) defTier = 1;
+                            else if (tName.find("inner") != std::string::npos || tName.find("tier2") != std::string::npos) defTier = 2;
+                            else if (bIsInhibitor) defTier = 3;
+                            else if (bIsCore) defTier = 4;
+
+                            if (bIsCore || towerPhysLane == 0) {
+                                if (defTier < frontFriendlyTiers[0]) { frontFriendlyTiers[0] = defTier; frontFriendlyTowers[0] = t; }
+                            }
+                            if (bIsCore || towerPhysLane == 1) {
+                                if (defTier < frontFriendlyTiers[1]) { frontFriendlyTiers[1] = defTier; frontFriendlyTowers[1] = t; }
+                            }
+                            if (bIsCore || towerPhysLane == 2) {
+                                if (defTier < frontFriendlyTiers[2]) { frontFriendlyTiers[2] = defTier; frontFriendlyTowers[2] = t; }
+                            }
+
+                            int enemyMinionCount = 0;
+                            int friendlyMinionCount = 0;
+                            bool bHeroThreat = false;
+
+                            for (const CachedChar& cc : LiveChars) {
+                                float cDistSq = (tLoc.X - cc.loc.X) * (tLoc.X - cc.loc.X) + (tLoc.Y - cc.loc.Y) * (tLoc.Y - cc.loc.Y) + (tLoc.Z - cc.loc.Z) * (tLoc.Z - cc.loc.Z);
+
+                                if (cDistSq < 12250000.0f) {
+                                    if (cc.team == enemyTeam) {
+                                        if (cc.bIsHero) {
+                                            bHeroThreat = true; break;
+                                        }
+                                        else {
+                                            enemyMinionCount++;
+                                        }
+                                    }
+                                    else if (cc.team == botTeam && !cc.bIsHero) {
+                                        friendlyMinionCount++;
+                                    }
+                                }
+                            }
+
+                            int netThreat = enemyMinionCount - friendlyMinionCount;
+
+                            int requiredNetThreat = (bLateGame && bIsInhibitor) ? 6 : 3;
+                            if (bHeroThreat || netThreat >= requiredNetThreat) {
+
+                                bool bIsMyLaneThreat = (!bIsJungler && towerPhysLane == botPhysLane);
+                                bool bCurrentIsMyLane = false;
+
+                                if (threatenedFriendlyTower && !bIsJungler) {
+                                    std::string curName = threatenedFriendlyTower->GetFullName();
+                                    std::transform(curName.begin(), curName.end(), curName.begin(), ::tolower);
+                                    bool curIsBlue = (threatenedFriendlyTower->TeamNum == EOrionTeam::TeamBlue);
+                                    int curPhysLane = 1;
+                                    if (curName.find("_left_") != std::string::npos || curName.find("tower_0") != std::string::npos) {
+                                        curPhysLane = curIsBlue ? 0 : 2;
+                                    }
+                                    else if (curName.find("_right_") != std::string::npos || curName.find("tower_2") != std::string::npos) {
+                                        curPhysLane = curIsBlue ? 2 : 0;
+                                    }
+                                    bCurrentIsMyLane = (curPhysLane == botPhysLane);
+                                }
+
+                                bool bShouldReplace = false;
+
+                                if (defTier > bestThreatenedTowerTier) {
+                                    bShouldReplace = true;
+                                }
+                                else if (defTier == bestThreatenedTowerTier) {
+                                    if (bIsMyLaneThreat && !bCurrentIsMyLane && !bLateGame) {
+                                        bShouldReplace = true;
+                                    }
+                                    else if (bIsMyLaneThreat == bCurrentIsMyLane && distSq < closestThreatenedTowerDistSq) {
+                                        bShouldReplace = true;
+                                    }
+                                }
+
+                                if (bShouldReplace) {
+                                    bestThreatenedTowerTier = defTier;
+                                    threatenedFriendlyTower = t;
+                                    closestThreatenedTowerDistSq = distSq;
+                                    gThreatTowerNetThreat  = netThreat;
+                                    gThreatTowerIsMyLane   = bIsMyLaneThreat;
+                                    gThreatTowerHeroThreat = bHeroThreat;
+                                }
+                            }
+                        }
+                    }
+                    CachedFrontTower[bot] = frontFriendlyTowers[botPhysLane];
+                    if (threatenedFriendlyTower && bestThreatenedTowerTier >= 3) {
+                        auto itCdLs = g_collapseThreatLastSeen.find(threatenedFriendlyTower);
+                        if (itCdLs == g_collapseThreatLastSeen.end() || (matchTimeB - itCdLs->second) > 3.0f) {
+                            g_collapseThreatStart[threatenedFriendlyTower] = matchTimeB;
+                        }
+                        g_collapseThreatLastSeen[threatenedFriendlyTower] = matchTimeB;
+                    }
+                    if (ENABLE_LANE_RETURN && threatenedFriendlyTower
+                            && bestThreatenedTowerTier >= 1 && bestThreatenedTowerTier < 3) {
+                        auto itLr = g_laneThreatLastSeen.find(threatenedFriendlyTower);
+                        if (itLr == g_laneThreatLastSeen.end() || (matchTimeB - itLr->second) > 3.0f) {
+                            g_laneThreatStart[threatenedFriendlyTower] = matchTimeB;
+                        }
+                        g_laneThreatLastSeen[threatenedFriendlyTower] = matchTimeB;
+                    }
+                    if (bestEnemyTower && bestEnemyTowerTier == 0) {
+                        std::string bestName = bestEnemyTower->GetFullName();
+                        std::transform(bestName.begin(), bestName.end(), bestName.begin(), ::tolower);
+                        if (bestName.find("core") == std::string::npos) {
+                            AOrionDamageableObjective_Base* coreTarget = bIsBlueTeam ? redCore : blueCore;
+                            if (coreTarget && coreTarget->GetHealth() > 0.0f) {
+                                int deadEnemyInhibs = bIsBlueTeam ? deadInhibitorsRed : deadInhibitorsBlue;
+                                int deadEnemies = bIsBlueTeam ? deadRed : deadBlue;
+                                if (deadEnemyInhibs >= 2 || (deadEnemyInhibs == 1 && deadEnemies >= 2)) {
+                                    bestEnemyTower = coreTarget;
+                                }
+                            }
+                        }
+                    }
+
+                    uint8 mappedDefTowerEnum = 0;
+                    if (bestThreatenedTowerTier == 1) mappedDefTowerEnum = 3;
+                    else if (bestThreatenedTowerTier == 2) mappedDefTowerEnum = 2;
+                    else if (bestThreatenedTowerTier == 3) mappedDefTowerEnum = 1;
+
+                    uint8 mappedAtkTowerEnum = 0;
+                    if (bestEnemyTowerTier == 1) mappedAtkTowerEnum = 3;
+                    else if (bestEnemyTowerTier == 2) mappedAtkTowerEnum = 2;
+                    else if (bestEnemyTowerTier == 3) mappedAtkTowerEnum = 1;
+
+                    int q1SelLane = -1;
+                    AOrionChar* q1PressHero = nullptr;
+                    AOrionChar* q1PressLaner = nullptr;
+                    FVector q1FrontPos = FVector();
+                    bool q1HasFront = false;
+                    bool bQ1SideCamp = false;
+                    float q1JglHP = (maxHealth > 0.0f) ? (currentHealth / maxHealth) * 100.0f : 0.0f;
+                    bool q1JglOK = bIsJungler && !bDoingBoss && !bLateGame && q1JglHP >= Q1_JGL_MIN_HP && LastMacroAction[bot] != "Recall";
+                    if (bIsJungler && LastMacroAction[bot] != "Gank") g_q1dGankTgt.erase(bot);
+#if F4_LOG_LEVEL >= 1
+                    if (bIsJungler) {
+                        Q1GankLog& qgl = g_q1gState[bot];
+                        if (qgl.startT > matchTimeB) qgl = Q1GankLog();
+                        bool qgGank = (LastMacroAction[bot] == "Gank");
+                        AOrionChar* qgTgt = (LastGankTargetPtr.count(bot) ? LastGankTargetPtr[bot] : nullptr);
+                        if (qgGank && qgl.tgt && qgTgt == qgl.tgt && g_q1dGankTgt.count(bot) && g_q1dGankTgt[bot] == qgl.tgt) qgl.q1d = true;
+                        auto qgFind = [&](AOrionChar* a) -> const CachedChar* { if (!a) return nullptr; for (const CachedChar& x : LiveChars) if (x.ptr == a) return &x; return nullptr; };
+                        auto qgNm = [](const CachedChar* x) -> std::string { if (!x) return std::string("gone"); std::string s = x->fullName; size_t p = s.rfind('.'); return (p != std::string::npos) ? s.substr(p + 1) : s; };
+                        auto qgHp = [](const CachedChar* x) -> int { return (x && x->maxHealth > 0.0f) ? (int)(x->health / x->maxHealth * 100.0f) : -1; };
+                        auto qgDm = [&](const CachedChar* x) -> int { if (!x) return -1; float dx = x->loc.X - botLoc.X, dy = x->loc.Y - botLoc.Y; return (int)(sqrtf(dx * dx + dy * dy) / 100.0f); };
+                        if (qgl.tgt && (!qgGank || qgTgt != qgl.tgt)) {
+                            const CachedChar* xt = qgFind(qgl.tgt); const CachedChar* xa = qgFind(qgl.ally);
+                            int tHP = qgHp(xt), aHP = qgHp(xa);
+                            std::cout << "[Q1-GANK] END " << botChar->GetFullName() << " Team=" << (bIsBlueTeam ? "B" : "R") << " R=" << roleSlot
+                                << " tgt=" << qgl.tgtName << " tgtHP=" << tHP << " dTgtHP=" << ((qgl.tgtHP0 >= 0 && tHP >= 0) ? (qgl.tgtHP0 - tHP) : -999) << " tgtGone=" << (xt ? 0 : 1)
+                                << " ally=" << qgl.allyName << " allyHuman=" << (qgl.allyHuman ? 1 : 0) << " allyHP=" << aHP << " dAllyHP=" << ((qgl.allyHP0 >= 0 && aHP >= 0) ? (qgl.allyHP0 - aHP) : -999)
+                                << " jglHP=" << (int)q1JglHP << " q1d=" << (qgl.q1d ? 1 : 0) << " arrived=" << (qgl.arrived ? 1 : 0) << " durS=" << (int)(matchTimeB - qgl.startT)
+                                << " cdS=" << (GankCooldownPerTarget.count(qgl.tgt) ? (int)(GankCooldownPerTarget[qgl.tgt] - matchTimeB) : -1) << " why=" << (!qgGank ? (LastMacroAction[bot].empty() ? std::string("(none)") : LastMacroAction[bot]) : std::string("switch"))
+                                << " T=" << (int)matchTimeB << "s" << std::endl;
+                            g_q1gEndT[qgl.tgt] = matchTimeB;
+                            qgl = Q1GankLog();
+                        }
+                        if (qgGank && qgTgt && qgTgt != qgl.tgt) {
+                            const CachedChar* xt = qgFind(qgTgt);
+                            const CachedChar* xa = nullptr; float xaSq = Q1_PRESS_HERO_SQ;
+                            if (xt) for (const CachedChar& x : LiveChars) {
+                                if (!x.bIsHero || x.bIsNeutral || x.team != botTeam || x.ptr == botChar) continue;
+                                float dx = x.loc.X - xt->loc.X, dy = x.loc.Y - xt->loc.Y, dq = dx * dx + dy * dy;
+                                if (dq <= xaSq) { xaSq = dq; xa = &x; }
+                            }
+                            bool aHuman = false;
+                            if (xa) { aHuman = true; for (AOrionAIBot* qOb : AllBots) { if (qOb && reinterpret_cast<AOrionChar*>(qOb->Pawn) == xa->ptr) { aHuman = false; break; } } }
+                            qgl.tgt = qgTgt; qgl.startT = matchTimeB; qgl.arrived = false;
+                            qgl.q1d = (g_q1dGankTgt.count(bot) && g_q1dGankTgt[bot] == qgTgt);
+                            qgl.tgtName = qgNm(xt); qgl.tgtHP0 = qgHp(xt);
+                            qgl.ally = xa ? xa->ptr : nullptr; qgl.allyName = xa ? qgNm(xa) : std::string("-"); qgl.allyHP0 = qgHp(xa); qgl.allyHuman = aHuman;
+                            std::cout << "[Q1-GANK] START " << botChar->GetFullName() << " Team=" << (bIsBlueTeam ? "B" : "R") << " R=" << roleSlot
+                                << " tgt=" << qgl.tgtName << " tgtHP=" << qgl.tgtHP0 << " tgtM=" << qgDm(xt)
+                                << " ally=" << (xa ? qgl.allyName : std::string("-")) << " allyHuman=" << (aHuman ? 1 : 0) << " allyHP=" << qgl.allyHP0
+                                << " allyTgtM=" << (xa ? (int)(sqrtf(xaSq) / 100.0f) : -1) << " jglHP=" << (int)q1JglHP
+                                << " q1d=" << (qgl.q1d ? 1 : 0) << " reS=" << ((g_q1gEndT.count(qgTgt) && g_q1gEndT[qgTgt] <= matchTimeB) ? (int)(matchTimeB - g_q1gEndT[qgTgt]) : -1)
+                                << " T=" << (int)matchTimeB << "s" << std::endl;
+                        }
+                        else if (qgGank && qgl.tgt && !qgl.arrived && GankEngaged.count(bot) && GankEngaged[bot]) {
+                            const CachedChar* xt = qgFind(qgl.tgt);
+                            qgl.arrived = true;
+                            std::cout << "[Q1-GANK] ARRIVE " << botChar->GetFullName() << " Team=" << (bIsBlueTeam ? "B" : "R") << " R=" << roleSlot
+                                << " tgt=" << qgl.tgtName << " tgtHP=" << qgHp(xt) << " tgtM=" << qgDm(xt) << " afterS=" << (int)(matchTimeB - qgl.startT)
+                                << " q1d=" << (qgl.q1d ? 1 : 0) << " T=" << (int)matchTimeB << "s" << std::endl;
+                        }
+                    }
+#endif
+                    if (ENABLE_Q1_PRESS_DETECT && bIsJungler && (botTeam == EOrionTeam::TeamRed || botTeam == EOrionTeam::TeamBlue)) {
+                        const int q1T = (botTeam == EOrionTeam::TeamBlue) ? 1 : 0;
+                        bool q1Alive[2][3][2] = {};
+                        for (AOrionDamageableObjective_Base* q1t : AllTowers) {
+                            if (!q1t || q1t->GetHealth() <= 0.0f) continue;
+                            std::string q1n = q1t->GetFullName();
+                            if (q1n.find("Default__") != std::string::npos) continue;
+                            std::transform(q1n.begin(), q1n.end(), q1n.begin(), ::tolower);
+                            if (q1n.find("tower_blue_") == std::string::npos && q1n.find("tower_red_") == std::string::npos) continue;
+                            int q1Tier = (q1n.find("_outer") != std::string::npos) ? 0 : ((q1n.find("_inner") != std::string::npos) ? 1 : -1);
+                            if (q1Tier < 0) continue;
+                            bool q1Blue = (q1t->TeamNum == EOrionTeam::TeamBlue);
+                            int q1Ln = 1;
+                            if (q1n.find("_left_") != std::string::npos) q1Ln = q1Blue ? 0 : 2;
+                            else if (q1n.find("_right_") != std::string::npos) q1Ln = q1Blue ? 2 : 0;
+                            int q1Tm = q1Blue ? 1 : 0;
+                            q1Alive[q1Tm][q1Ln][q1Tier] = true;
+                            if (!g_q1TwrHave[q1Tm][q1Ln][q1Tier]) { g_q1TwrPos[q1Tm][q1Ln][q1Tier] = q1t->K2_GetActorLocation(); g_q1TwrHave[q1Tm][q1Ln][q1Tier] = true; }
+                        }
+                        auto q1SegSq = [](float px, float py, const FVector& a, const FVector& b) -> float {
+                            float abx = b.X - a.X, aby = b.Y - a.Y, apx = px - a.X, apy = py - a.Y;
+                            float ab2 = abx * abx + aby * aby;
+                            float t = (ab2 > 1.0f) ? ((apx * abx + apy * aby) / ab2) : 0.0f;
+                            if (t < 0.0f) t = 0.0f;
+                            if (t > 1.0f) t = 1.0f;
+                            float dx = apx - t * abx, dy = apy - t * aby;
+                            return dx * dx + dy * dy;
+                        };
+                        auto q1LaneOf = [&](const FVector& p) -> int {
+                            int best = -1; float bestSq = Q1_LANE_W_SQ;
+                            for (int ql = 0; ql < 3; ++ql) {
+                                FVector pts[4]; int np = 0;
+                                if (g_q1TwrHave[1][ql][1]) pts[np++] = g_q1TwrPos[1][ql][1];
+                                if (g_q1TwrHave[1][ql][0]) pts[np++] = g_q1TwrPos[1][ql][0];
+                                if (g_q1TwrHave[0][ql][0]) pts[np++] = g_q1TwrPos[0][ql][0];
+                                if (g_q1TwrHave[0][ql][1]) pts[np++] = g_q1TwrPos[0][ql][1];
+                                for (int k = 0; k + 1 < np; ++k) { float d = q1SegSq(p.X, p.Y, pts[k], pts[k + 1]); if (d <= bestSq) { bestSq = d; best = ql; } }
+                            }
+                            return best;
+                        };
+                        auto q1Pct = [](const CachedChar& x) -> float { return (x.maxHealth > 0.0f) ? (x.health / x.maxHealth) * 100.0f : 0.0f; };
+                        struct Q1H { const CachedChar* cc; int lane; bool human; };
+                        Q1H q1Own[6]; int q1OwnN = 0;
+                        const CachedChar* q1En[6]; int q1EnN = 0;
+                        for (const CachedChar& hc : LiveChars) {
+                            if (!hc.bIsHero || hc.bIsNeutral || hc.health <= 0.0f) continue;
+                            if (hc.team == enemyTeam) { if (q1EnN < 6) q1En[q1EnN++] = &hc; continue; }
+                            if (hc.team != botTeam || q1OwnN >= 6) continue;
+                            if (friendlyCore) { float bx = hc.loc.X - friendlyCoreLoc.X, by = hc.loc.Y - friendlyCoreLoc.Y; if (bx * bx + by * by <= Q1_BASE_SQ) continue; }
+                            bool hBot = false, hJgl = false;
+                            for (AOrionAIBot* q1Ob : AllBots) {
+                                if (!q1Ob || reinterpret_cast<AOrionChar*>(q1Ob->Pawn) != hc.ptr) continue;
+                                hBot = true;
+                                auto q1R = GBotRoles.find(q1Ob); hJgl = (q1R != GBotRoles.end() && q1R->second == 4);
+                                break;
+                            }
+                            if (hJgl) continue;
+                            int hl = q1LaneOf(hc.loc);
+                            if (hl < 0) continue;
+                            q1Own[q1OwnN].cc = &hc; q1Own[q1OwnN].lane = hl; q1Own[q1OwnN].human = !hBot; q1OwnN++;
+                        }
+                        for (int ql = 0; ql < 3; ++ql) {
+                            Q1PressState& ps = g_q1Press[q1T][ql];
+                            if (ps.seenT >= 0.0f && (matchTimeB < ps.seenT || (matchTimeB - ps.seenT) > 3.0f)) ps = Q1PressState();
+                            const Q1H* own[6]; int n = 0;
+                            for (int i = 0; i < q1OwnN; ++i) if (q1Own[i].lane == ql) own[n++] = &q1Own[i];
+                            FVector fPos = FVector(); bool fHave = false;
+                            if (q1Alive[q1T][ql][0] && g_q1TwrHave[q1T][ql][0]) { fPos = g_q1TwrPos[q1T][ql][0]; fHave = true; }
+                            else if (q1Alive[q1T][ql][1] && g_q1TwrHave[q1T][ql][1]) { fPos = g_q1TwrPos[q1T][ql][1]; fHave = true; }
+                            bool cond = false; AOrionChar* cEn = nullptr; AOrionChar* cLan = nullptr; bool cHuman = false; int cMode = 0;
+                            float cOwnHP = -1.0f, cEnHP = -1.0f;
+                            if (n == 1) {
+                                const CachedChar* lc = own[0]->cc; const CachedChar* ec = nullptr; float bq = Q1_PRESS_HERO_SQ;
+                                for (int e = 0; e < q1EnN; ++e) {
+                                    float dx = q1En[e]->loc.X - lc->loc.X, dy = q1En[e]->loc.Y - lc->loc.Y, dq = dx * dx + dy * dy;
+                                    if (dq <= bq) { bq = dq; ec = q1En[e]; }
+                                }
+                                if (ec) {
+                                    cOwnHP = q1Pct(*lc); cEnHP = q1Pct(*ec);
+                                    cond = (cOwnHP <= cEnHP - Q1_PRESS_HP_GAP);
+                                    cEn = ec->ptr; cLan = lc->ptr; cHuman = own[0]->human; cMode = 1;
+                                }
+                            }
+                            else if (n >= 2) {
+                                int nOwnC = 0, nEnC = 0; float sOwn = 0.0f, sEn = 0.0f; bool enAtTwr = false;
+                                const CachedChar* weakEn = nullptr; const Q1H* nearOwn = nullptr;
+                                for (int i = 0; i < n; ++i) {
+                                    bool inC = false;
+                                    for (int e = 0; e < q1EnN; ++e) {
+                                        float dx = q1En[e]->loc.X - own[i]->cc->loc.X, dy = q1En[e]->loc.Y - own[i]->cc->loc.Y;
+                                        if (dx * dx + dy * dy <= Q1_PRESS_HERO_SQ) { inC = true; break; }
+                                    }
+                                    if (inC) { nOwnC++; sOwn += q1Pct(*own[i]->cc); }
+                                }
+                                for (int e = 0; e < q1EnN; ++e) {
+                                    float bOwnSq = 1e30f; const Q1H* bo = nullptr;
+                                    for (int i = 0; i < n; ++i) {
+                                        float dx = q1En[e]->loc.X - own[i]->cc->loc.X, dy = q1En[e]->loc.Y - own[i]->cc->loc.Y, dq = dx * dx + dy * dy;
+                                        if (dq < bOwnSq) { bOwnSq = dq; bo = own[i]; }
+                                    }
+                                    if (!bo || bOwnSq > Q1_PRESS_HERO_SQ) continue;
+                                    nEnC++; sEn += q1Pct(*q1En[e]);
+                                    if (fHave) { float tx = q1En[e]->loc.X - fPos.X, ty = q1En[e]->loc.Y - fPos.Y; if (tx * tx + ty * ty <= Q1_DUO_TWR_SQ) enAtTwr = true; }
+                                    if (!weakEn || q1Pct(*q1En[e]) < q1Pct(*weakEn)) { weakEn = q1En[e]; nearOwn = bo; }
+                                }
+                                if (weakEn && nearOwn) {
+                                    cOwnHP = sOwn; cEnHP = sEn;
+                                    cond = (nOwnC >= 1) && (nEnC >= nOwnC) && (sOwn <= sEn - Q1_DUO_HP_GAP) && enAtTwr;
+                                    cEn = weakEn->ptr; cLan = nearOwn->cc->ptr; cHuman = nearOwn->human; cMode = 2;
+                                }
+                            }
+                            if (n == 0) {
+                                ps = Q1PressState(); ps.seenT = matchTimeB;
+                                continue;
+                            }
+                            if (cond) {
+                                if (ps.candT < 0.0f) ps.candT = matchTimeB;
+                                bool q1Start = !ps.active && (matchTimeB - ps.candT) >= Q1_PRESS_ENTER_S;
+                                if (q1Start) ps.active = true;
+                                if (ps.active) { ps.untilT = matchTimeB + Q1_PRESS_HOLD_S; ps.enemy = cEn; ps.laner = cLan; ps.human = cHuman; ps.mode = cMode; ps.n = n; }
+                            }
+                            else if (!ps.active) ps.candT = -1.0f;
+                            if (ps.active && matchTimeB > ps.untilT) {
+                                ps = Q1PressState();
+                            }
+                            ps.frontPos = fPos; ps.hasFront = fHave; ps.seenT = matchTimeB;
+                        }
+                        int sel = -1; float selSq = 1e30f; bool selLanerNear = false;
+                        int prevSel = g_q1SelLane.count(bot) ? g_q1SelLane[bot] : -1;
+                        for (int ql = 0; ql < 3; ++ql) {
+                            const Q1PressState& ps = g_q1Press[q1T][ql];
+                            if (!ps.active || !ps.enemy) continue;
+                            const CachedChar* ec = nullptr; const CachedChar* lc = nullptr;
+                            for (const CachedChar& x : LiveChars) { if (x.ptr == ps.enemy) ec = &x; else if (x.ptr == ps.laner) lc = &x; }
+                            if (!ec) continue;
+                            float dx = ec->loc.X - botLoc.X, dy = ec->loc.Y - botLoc.Y, dq = dx * dx + dy * dy;
+                            bool lNear = false;
+                            if (lc) { float lx = lc->loc.X - ec->loc.X, ly = lc->loc.Y - ec->loc.Y; lNear = (lx * lx + ly * ly) <= Q1_LANER_NEAR_SQ; }
+                            if (ql == prevSel) { sel = ql; selSq = dq; selLanerNear = lNear; break; }
+                            float dM = sqrtf(dq), sM = (sel >= 0) ? sqrtf(selSq) : 1e15f;
+                            bool better = (sel < 0) || (dM + 2000.0f < sM) || (fabsf(dM - sM) <= 2000.0f && lNear && !selLanerNear);
+                            if (better) { sel = ql; selSq = dq; selLanerNear = lNear; }
+                        }
+                        if (sel >= 0) {
+                            const Q1PressState& ps = g_q1Press[q1T][sel];
+                            q1SelLane = sel; q1PressHero = ps.enemy; q1PressLaner = ps.laner; q1FrontPos = ps.frontPos; q1HasFront = ps.hasFront;
+                            g_q1SelLane[bot] = sel;
+                        }
+                        else g_q1SelLane.erase(bot);
+                    }
+                    bool q1SideOn = ENABLE_Q1C_SIDE_CAMP && ENABLE_Q1_PRESS_DETECT && q1JglOK && q1SelLane >= 0 && q1HasFront && LastMacroAction[bot] != "Gank";
+                    AOrionChar* q1SideCreep = nullptr; float q1SideTwrSq = 1e30f; float q1SideDSq = 0.0f;
+                    AOrionChar* q1LatchCreep = (bIsJungler && g_q1SideLatch.count(bot) && g_q1SideLatchT.count(bot) && matchTimeB < g_q1SideLatchT[bot]) ? g_q1SideLatch[bot] : nullptr;
+                    bool q1LatchFound = false; float q1LatchDSq = 0.0f;
+                    auto q1dEligible = [&](AOrionChar* tgt, float tgtDSq) -> bool {
+                        if (!ENABLE_Q1D_PRESS_GANK || !ENABLE_Q1_PRESS_DETECT || !q1JglOK || q1SelLane < 0 || !tgt || tgt != q1PressHero || !q1PressLaner) return false;
+                        bool latched = (LastMacroAction[bot] == "Gank") && g_q1dGankTgt.count(bot) && g_q1dGankTgt[bot] == tgt;
+                        if (!latched) {
+                            if (tgtDSq > Q1_PRESS_GANK_SQ) return false;
+                            if (LastMacroAction[bot] == "Gank" && LastGankTargetPtr.count(bot) && LastGankTargetPtr[bot] && LastGankTargetPtr[bot] != tgt) return false;
+                        }
+                        const CachedChar* lcc = nullptr; const CachedChar* tcc = nullptr;
+                        for (const CachedChar& x : LiveChars) { if (x.ptr == q1PressLaner) lcc = &x; else if (x.ptr == tgt) tcc = &x; }
+                        if (!lcc || !tcc) return false;
+                        float lx = lcc->loc.X - tcc->loc.X, ly = lcc->loc.Y - tcc->loc.Y;
+                        return (lx * lx + ly * ly) <= (latched ? Q1_LANER_HOLD_SQ : Q1_LANER_NEAR_SQ);
+                    };
+                    for (const CachedChar& ccEntry : LiveChars) {
+                        const CachedChar& cc = ccEntry;
+                        if (cc.ptr == botChar) continue;
+
+                        float h = cc.health;
+                        AOrionChar* c = cc.ptr;
+                        FVector tLoc = cc.loc;
+                        float dSq = (tLoc.X - botLoc.X) * (tLoc.X - botLoc.X) + (tLoc.Y - botLoc.Y) * (tLoc.Y - botLoc.Y) + (tLoc.Z - botLoc.Z) * (tLoc.Z - botLoc.Z);
+                        bool bIsHero = cc.bIsHero;
+
+                        if (cc.team == enemyTeam) {
+                            if (bIsHero) {
+                                if (dSq < closestEnemyHeroDistSq) {
+                                    closestEnemyHeroDistSq = dSq;
+                                    bestEnemyHero = c;
+                                }
+
+                                if (bIsJungler) {
+                                    if (GankCooldownPerTarget.count(c) && matchTimeB < GankCooldownPerTarget[c]) {
+                                        continue;
+                                    }
+                                    float eMaxH = 1000.0f;
+                                    if (getMaxHealthFunc) c->ProcessEvent(getMaxHealthFunc, &eMaxH);
+                                    float hpPct = (eMaxH > 0.0f) ? (h / eMaxH) : 1.0f;
+
+                                    float closestSafeZoneDistSq = 9999999999.0f;
+                                    for (AOrionDamageableObjective_Base* safeTower : AllTowers) {
+                                        if (!safeTower) continue;
+                                        if (safeTower->TeamNum == enemyTeam && safeTower->GetHealth() > 0.0f && safeTower->GetFullName().find("Default__") == std::string::npos) {
+                                            FVector safeTLoc = safeTower->K2_GetActorLocation();
+                                            float safeDistSq = (safeTLoc.X - tLoc.X) * (safeTLoc.X - tLoc.X) + (safeTLoc.Y - tLoc.Y) * (safeTLoc.Y - tLoc.Y) + (safeTLoc.Z - tLoc.Z) * (safeTLoc.Z - tLoc.Z);
+                                            if (safeDistSq < closestSafeZoneDistSq) { closestSafeZoneDistSq = safeDistSq; }
+                                        }
+                                    }
+
+                                    float gankScore = 0.0f;
+                                    gankScore += (1.0f - hpPct) * 50.0f;
+
+                                    if (closestSafeZoneDistSq > 25000000.0f) gankScore += 40.0f;
+                                    else if (closestSafeZoneDistSq > 9000000.0f) gankScore += 20.0f;
+                                    else if (closestSafeZoneDistSq < 4000000.0f) gankScore -= 100.0f;
+
+                                    bool bJunglerInBase = (distToFriendlyCoreSq < 25000000.0f);
+                                    float distPenalty = bJunglerInBase ? (dSq / 10000000.0f) : (dSq / 1500000.0f);
+                                    gankScore -= distPenalty;
+
+                                    int friendlyMinionsNearTarget = 0;
+                                    for (AOrionChar* mn : AllChars) {
+                                        if (mn && mn->TeamNum == botTeam && !mn->PlayerState
+                                            && mn->GetHealth() > 0.0f) {
+                                            FVector mLoc = mn->K2_GetActorLocation();
+                                            float mnDistSq = (mLoc.X - tLoc.X) * (mLoc.X - tLoc.X)
+                                                + (mLoc.Y - tLoc.Y) * (mLoc.Y - tLoc.Y)
+                                                + (mLoc.Z - tLoc.Z) * (mLoc.Z - tLoc.Z);
+                                            if (mnDistSq < 4000000.0f) friendlyMinionsNearTarget++;
+                                        }
+                                    }
+                                    if (friendlyMinionsNearTarget >= 3) gankScore += 15.0f;
+
+                                    int gsEnMin20 = 0, gsFrH20 = 0, gsEnH20 = 0;
+                                    for (const CachedChar& nc : LiveChars) {
+                                        if (nc.ptr == c) continue;
+                                        if (nc.bIsNeutral) continue;
+                                        float gdx = nc.loc.X - tLoc.X;
+                                        float gdy = nc.loc.Y - tLoc.Y;
+                                        float gnDistSq = gdx * gdx + gdy * gdy;
+                                        if (gnDistSq >= 4000000.0f) continue;
+                                        if (nc.bIsHero) {
+                                            if (nc.team == botTeam)        gsFrH20++;
+                                            else if (nc.team == enemyTeam) gsEnH20++;
+                                        }
+                                        else {
+                                            if (nc.team == enemyTeam)      gsEnMin20++;
+                                        }
+                                    }
+                                    bool q1dDefPenOff = q1dEligible(c, dSq);
+                                    if (gsEnMin20 > friendlyMinionsNearTarget + 1 && !q1dDefPenOff) gankScore -= 30.0f;
+                                    if (gsEnH20 > gsFrH20 + 1)                     gankScore -= 50.0f;
+
+                                    bool q1aCapOK = !ENABLE_Q1A_GANK_CAP80 || dSq <= Q1_GANK_MAX_SQ
+                                        || (LastMacroAction[bot] == "Gank" && LastGankTargetPtr.count(bot) && LastGankTargetPtr[bot] == c);
+                                    bool g8IsA = LastMacroAction[bot] == "Gank" && LastGankTargetPtr.count(bot) && LastGankTargetPtr[bot] == c;
+                                    bool g8Lock = ENABLE_G8_KILLLOCK && g8IsA && GankEngaged.count(bot) && GankEngaged[bot]
+                                               && hpPct <= G8_HERO_HP && dSq <= G8_DIST_SQ && closestSafeZoneDistSq >= G8_TWR_SQ;
+                                    if (q1aCapOK && (g8Lock || (!g8Held && gankScore > highestGankScore))) {
+                                        highestGankScore = gankScore;
+                                        bestGankTarget = c;
+                                        bestGankTargetDistSq = dSq;
+                                        if (g8Lock) g8Held = true;
+                                    }
+                                }
+                            }
+                            else if (!bIsHero && dSq < closestEnemyMinionDistSq) {
+                                bool bIsAnyFlippedCreep = false;
+                                if (!bIsJungler && !bDoingBoss) {
+                                    for (auto& fp : FlippedCreep) {
+                                        if (fp.second == c) {
+                                            bIsAnyFlippedCreep = true;
+                                            break;
+                                        }
+                                    }
+                                }
+
+                                if (!bIsAnyFlippedCreep) {
+                                    closestEnemyMinionDistSq = dSq; bestEnemyMinion = c;
+                                }
+                            }
+                        }
+                        else if (c->TeamNum == botTeam && !bIsHero && !bIsJungler && !bIsInBase) {
+                            bool bMinionIsValidEscort = true;
+
+                            if (bestEnemyTower) {
+                                FVector twrLoc = bestEnemyTower->K2_GetActorLocation();
+                                float botToTwrSq = (twrLoc.X - botLoc.X) * (twrLoc.X - botLoc.X)
+                                    + (twrLoc.Y - botLoc.Y) * (twrLoc.Y - botLoc.Y)
+                                    + (twrLoc.Z - botLoc.Z) * (twrLoc.Z - botLoc.Z);
+                                float minToTwrSq = (twrLoc.X - tLoc.X) * (twrLoc.X - tLoc.X)
+                                    + (twrLoc.Y - tLoc.Y) * (twrLoc.Y - tLoc.Y)
+                                    + (twrLoc.Z - tLoc.Z) * (twrLoc.Z - tLoc.Z);
+
+                                bool bBotIsNearObjective = (botToTwrSq < 6250000.0f);
+
+                                if (bBotIsNearObjective) {
+                                    bMinionIsValidEscort = (minToTwrSq < botToTwrSq + 1000000.0f);
+                                }
+                            }
+
+                            bool bEscIsFlippedCreep = false;
+                            if (!bIsJungler && !bDoingBoss) {
+                                for (auto& fp : FlippedCreep) {
+                                    if (fp.second == c) { bEscIsFlippedCreep = true; break; }
+                                }
+                            }
+
+                            if (bMinionIsValidEscort && dSq < closestFriendlyMinionDistSq
+                                && dSq < 6250000.0f && !bEscIsFlippedCreep) {
+                                closestFriendlyMinionDistSq = dSq;
+                                bestFriendlyEscortMinion = c;
+                            }
+                        }
+
+
+                        bool bIsNeutral = (c->TeamNum == EOrionTeam::TeamCreep || c->GetFullName().find("Jungle") != std::string::npos || c->GetFullName().find("River") != std::string::npos || c->GetFullName().find("Gold") != std::string::npos);
+
+                        if (bIsNeutral && c->GetFullName().find("Prime") == std::string::npos && c->GetFullName().find("Dragon") == std::string::npos) {
+
+                            if (bIsJungler) {
+                                if (c->GetFullName().find("River") == std::string::npos && c->GetFullName().find("Gold") == std::string::npos) {
+                                    if (dSq < closestJungleDistSq) {
+                                        closestJungleDistSq = dSq;
+                                        bestJungleCreep = c;
+                                    }
+                                    if (q1SideOn) {
+                                        float q1cx = tLoc.X - q1FrontPos.X, q1cy = tLoc.Y - q1FrontPos.Y, q1cT = q1cx * q1cx + q1cy * q1cy;
+                                        if (q1cT <= Q1_SIDE_CAMP_TWR_SQ && dSq <= Q1_SIDE_CAMP_MAX_SQ && q1cT < q1SideTwrSq) { q1SideTwrSq = q1cT; q1SideCreep = c; q1SideDSq = dSq; }
+                                    }
+                                    if (q1LatchCreep && c == q1LatchCreep) { q1LatchFound = true; q1LatchDSq = dSq; }
+                                }
+                            }
+                            else if (roleSlot == 1 && c->GetFullName().find("River") != std::string::npos) {
+                                if (dSq < closestJungleDistSq && dSq < 4000000.0f) { closestJungleDistSq = dSq; bestJungleCreep = c; }
+                            }
+                            else if ((roleSlot == 2 || roleSlot == 3) && c->GetFullName().find("Gold") != std::string::npos) {
+                                if (dSq < closestJungleDistSq && dSq < 4000000.0f) { closestJungleDistSq = dSq; bestJungleCreep = c; }
+                            }
+                        }
+                    }
+                    {
+                        AOrionChar* q1Use = nullptr; float q1UseDSq = 0.0f; bool q1ByLatch = false;
+                        bool q1LatchOK = ENABLE_Q1C_SIDE_CAMP && q1JglOK && LastMacroAction[bot] != "Gank";
+                        if (q1SideOn && q1SideCreep) { q1Use = q1SideCreep; q1UseDSq = q1SideDSq; }
+                        else if (q1LatchOK && q1LatchCreep && q1LatchFound && q1LatchDSq <= Q1_SIDE_CAMP_MAX_SQ) { q1Use = q1LatchCreep; q1UseDSq = q1LatchDSq; q1ByLatch = true; }
+                        if (q1LatchCreep && !q1LatchFound) { g_q1SideLatch.erase(bot); g_q1SideLatchT.erase(bot); }
+                        if (q1Use) {
+                            bool q1cCommit = bestJungleCreep && bestJungleCreep != q1Use && closestJungleDistSq <= Q1_CAMP_COMMIT_SQ;
+                            if (!q1cCommit) {
+                                if (!q1ByLatch) { g_q1SideLatch[bot] = q1Use; g_q1SideLatchT[bot] = matchTimeB + Q1_PRESS_HOLD_S; }
+                                bestJungleCreep = q1Use; closestJungleDistSq = q1UseDSq; bQ1SideCamp = true;
+                            }
+                        }
+                    }
+
+
+                    if (FlippedCreep.count(bot) && FlippedCreep[bot]) {
+                        bool bStillNeedsFlip = false;
+
+                        if (bIsJungler && LastMacroAction[bot] == "Jungle"
+                            && bestJungleCreep == FlippedCreep[bot]) {
+                            bStillNeedsFlip = true;
+                        }
+                        else if (!bIsJungler && LastMacroAction[bot] == "Jungle"
+                            && bestJungleCreep == FlippedCreep[bot]) {
+                            bStillNeedsFlip = true;
+                        }
+                        else if (bDoingBoss && activeBossTarget
+                            && reinterpret_cast<AOrionChar*>(activeBossTarget) == FlippedCreep[bot]) {
+                            bStillNeedsFlip = true;
+                        }
+
+                        if (!bStillNeedsFlip) {
+                            bool bAnyoneElseNeedsIt = false;
+                            for (auto& fp : FlippedCreep) {
+                                if (fp.first != bot && fp.second == FlippedCreep[bot]) {
+                                    bAnyoneElseNeedsIt = true;
+                                    break;
+                                }
+                            }
+
+                            if (!bAnyoneElseNeedsIt) {
+                                FlippedCreep[bot]->TeamNum = EOrionTeam::TeamCreep;
+                            }
+                            FlippedCreep[bot] = nullptr;
+                        }
+                    }
+
+
+                    uint8* teamMaskPtr = reinterpret_cast<uint8*>(
+                        reinterpret_cast<uintptr_t>(bot) + 0x0668);
+
+                    uint8 baseMask = bIsBlueTeam ? 0x01 : 0x02;
+
+                    bool bNeedsCreepMask = false;
+                    if (bIsJungler) {
+                        bNeedsCreepMask = true;
+                    }
+                    else if (bDoingBoss) {
+                        bNeedsCreepMask = true;
+                    }
+                    else if (!bIsJungler && bestJungleCreep && LastMacroAction[bot] == "Jungle") {
+                        bNeedsCreepMask = true;
+                    }
+
+                    if (bNeedsCreepMask) {
+                        *teamMaskPtr = baseMask | 0x04;
+                    }
+                    else {
+                        *teamMaskPtr = baseMask;
+                    }
+
+  
+
+                    if (!threatenedFriendlyTower || bestThreatenedTowerTier < 3) {
+                        if (BossAbortThreatStartTime.count(botTeam)) {
+                            float duration = matchTimeB - BossAbortThreatStartTime[botTeam];
+                            BossAbortThreatStartTime.erase(botTeam);
+                        }
+                    }
+
+                    bool bNeedsTacticalRecall = false;
+
+                    if (threatenedFriendlyTower && bestThreatenedTowerTier >= 3) {
+                        if (distToFriendlyCoreSq > 100000000.0f) {
+
+                            int enemyBaseMinions = 0;
+                            int friendlyBaseMinions = 0;
+                            bool bHeroThreateningBase = false;
+                            FVector baseLoc = threatenedFriendlyTower->K2_GetActorLocation();
+
+                            for (AOrionChar* c : AllChars) {
+                                if (!c) continue;
+                                if (c->GetHealth() > 0) {
+                                    FVector cLoc = c->K2_GetActorLocation();
+                                    if (((cLoc.X - baseLoc.X) * (cLoc.X - baseLoc.X) + (cLoc.Y - baseLoc.Y) * (cLoc.Y - baseLoc.Y) + (cLoc.Z - baseLoc.Z) * (cLoc.Z - baseLoc.Z)) < 9000000.0f) {
+                                        if (c->TeamNum == enemyTeam) {
+                                            if (c->PlayerState != nullptr) {
+                                                bHeroThreateningBase = true; break;
+                                            }
+                                            else {
+                                                enemyBaseMinions++;
+                                            }
+                                        }
+                                        else if (c->TeamNum == botTeam && c->PlayerState == nullptr) {
+                                            friendlyBaseMinions++;
+                                        }
+                                    }
+                                }
+                            }
+
+                            int netBaseThreat = enemyBaseMinions - friendlyBaseMinions;
+
+                            if (bHeroThreateningBase || netBaseThreat >= 3) {
+
+                                bool bAtEnemyCore = (bestEnemyTowerTier == 0 || bestEnemyTowerTier == 4) && (closestEnemyTowerDistSq < 9000000.0f);
+                                bool bAtEnemyInhibitor = (bestEnemyTowerTier == 3) && (closestEnemyTowerDistSq < 9000000.0f);
+                                bool bOurCoreSafe = (bestThreatenedTowerTier < 4);
+
+                                if (!bAtEnemyCore && !(bAtEnemyInhibitor && bOurCoreSafe)) {
+                                    bool bInBossState = (LastMacroAction[bot] == "Boss");
+                                    if (bInBossState) {
+                                        if (BossAbortThreatStartTime.find(botTeam) == BossAbortThreatStartTime.end()) {
+                                            BossAbortThreatStartTime[botTeam] = matchTimeB;
+                                        }
+                                        float threatDuration = matchTimeB - BossAbortThreatStartTime[botTeam];
+                                        float requiredPersistence = (bestThreatenedTowerTier >= 4) ? 2.0f : 4.0f;
+                                        if (threatDuration >= requiredPersistence) {
+                                            bNeedsTacticalRecall = true;
+                                        }
+                                    }
+                                    else {
+                                        bNeedsTacticalRecall = true;
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+
+                    if (currentHealth < (maxHealth * 0.25f)) {
+                        BotNeedsHeal[bot] = true;
+                    }
+
+                    if (matchTimeB < 30.0f) {
+                        BotNeedsHeal[bot] = false;
+                    }
+
+                    if (currentHealth >= (maxHealth * 0.85f)) {
+                        BotNeedsHeal[bot] = false;
+                    }
+
+
+                    if (!BotNeedsHeal[bot] && !bNeedsTacticalRecall && LastMacroAction[bot] == "Recall") {
+                        LastMacroAction[bot] = "";
+                        LastMacroTargetName[bot] = "";
+                    }
+
+                    bool bForceRecall = false;
+                    if (g_forceRecallStart.count(bot)) {
+                        bool frHome       = (distToFriendlyCoreSq < FORCE_RECALL_HOME_DIST_SQ);
+                        bool frTimeout    = (matchTimeB - g_forceRecallStart[bot]) >= FORCE_RECALL_COMMIT_SEC;
+                        bool frThreatGone = (threatenedFriendlyTower == nullptr);
+                        bool frArrived = false;
+                        if (threatenedFriendlyTower) {
+                            FVector frTLx = threatenedFriendlyTower->K2_GetActorLocation();
+                            float frDx = (frTLx.X - botLoc.X)*(frTLx.X - botLoc.X) + (frTLx.Y - botLoc.Y)*(frTLx.Y - botLoc.Y);
+                            frArrived = (frDx < FORCE_RECALL_MIN_DIST_SQ);
+                        }
+                        if (frHome || frTimeout || frThreatGone || frArrived) { g_forceRecallStart.erase(bot); g_forceRecallFired.erase(bot); }
+                        else { bForceRecall = true; g_forceRecallClaim[threatenedFriendlyTower]++; }
+                    }
+                    if (!bForceRecall && !g_forceRecallStart.count(bot)
+                            && ENABLE_FORCE_RECALL && threatenedFriendlyTower
+                            && (bestThreatenedTowerTier >= 3 || !bIsJungler)
+                            && (bestThreatenedTowerTier >= 3 || (bestThreatenedTowerTier == 2 && !bLateGame))
+                            && (LastMacroAction[bot] != "Recall" || bNeedsTacticalRecall)
+                            && LastMacroAction[bot] != "Boss") {
+                        float frEnemyTwrDistSq = 9.9e18f;
+                        if (bestEnemyTower) {
+                            FVector eTL = bestEnemyTower->K2_GetActorLocation();
+                            frEnemyTwrDistSq = (eTL.X - botLoc.X)*(eTL.X - botLoc.X) + (eTL.Y - botLoc.Y)*(eTL.Y - botLoc.Y);
+                        }
+                        bool frNear         = (frEnemyTwrDistSq < 9000000.0f);
+                        bool frAtEnemyCore  = (bestEnemyTowerTier == 0 || bestEnemyTowerTier == 4) && frNear;
+                        bool frAtEnemyInhib = (bestEnemyTowerTier == 3) && frNear;
+                        bool frOurCoreSafe  = (bestThreatenedTowerTier < 4);
+                        bool frNearPush = (frEnemyTwrDistSq < 20250000.0f);
+                        bool frTrade = false;
+                        if (bestEnemyTower && frNearPush) {
+                            int frEnemyVal = (bestEnemyTowerTier == 0) ? 4 : bestEnemyTowerTier;
+                            frTrade = (frEnemyVal >= bestThreatenedTowerTier);
+                        }
+                        int  frDeadEnInh  = bIsBlueTeam ? deadInhibitorsRed : deadInhibitorsBlue;
+                        int  frDeadEn     = bIsBlueTeam ? deadRed : deadBlue;
+                        bool frV45Win     = (frDeadEnInh >= 2) || (frDeadEnInh >= 1 && frDeadEn >= 2);
+                        bool frFinishPush = frV45Win && bestEnemyTower
+                                            && (bestEnemyTowerTier == 0 || bestEnemyTowerTier == 4 || bestEnemyTowerTier == 3);
+                        bool frPoNR = frAtEnemyCore || (frAtEnemyInhib && frOurCoreSafe) || frTrade || frFinishPush;
+                        bool frWinFight = false;
+                        if (ENABLE_FR_WINFIGHT_EXEMPT
+                                && CombatTimer.count(bot) && CombatTimer[bot] > 0.0f
+                                && bestEnemyHero && closestEnemyHeroDistSq < 3240000.0f) {
+                            int frFrH18 = 0, frEnH18 = 0;
+                            for (const CachedChar& cc : LiveChars) {
+                                if (!cc.bIsHero || cc.bIsNeutral) continue;
+                                if (cc.ptr == botChar) continue;
+                                float dq = (cc.loc.X - botLoc.X)*(cc.loc.X - botLoc.X) + (cc.loc.Y - botLoc.Y)*(cc.loc.Y - botLoc.Y);
+                                if (dq >= 3240000.0f) continue;
+                                if (cc.team == enemyTeam) frEnH18++; else frFrH18++;
+                            }
+                            frWinFight = (frFrH18 >= frEnH18);
+                        }
+                        if (!frPoNR && !frWinFight) {
+                            FVector frTL = threatenedFriendlyTower->K2_GetActorLocation();
+                            float frDistSq = (frTL.X - botLoc.X)*(frTL.X - botLoc.X) + (frTL.Y - botLoc.Y)*(frTL.Y - botLoc.Y);
+                            float frBotCoreSq = (botLoc.X - friendlyCoreLoc.X)*(botLoc.X - friendlyCoreLoc.X) + (botLoc.Y - friendlyCoreLoc.Y)*(botLoc.Y - friendlyCoreLoc.Y);
+                            float frTwrCoreSq = (frTL.X - friendlyCoreLoc.X)*(frTL.X - friendlyCoreLoc.X) + (frTL.Y - friendlyCoreLoc.Y)*(frTL.Y - friendlyCoreLoc.Y);
+                            bool  frBeyondTower = (frBotCoreSq > frTwrCoreSq);
+                            float frPersist = (bestThreatenedTowerTier >= 3)
+                                ? (g_collapseThreatStart.count(threatenedFriendlyTower) ? matchTimeB - g_collapseThreatStart[threatenedFriendlyTower] : 0.0f)
+                                : (g_laneThreatStart.count(threatenedFriendlyTower)    ? matchTimeB - g_laneThreatStart[threatenedFriendlyTower]    : 0.0f);
+                            int  frCap       = (bestThreatenedTowerTier >= 3) ? FR_MAX_RECALLERS_HI : FR_MAX_RECALLERS_LO;
+                            int  frActiveRec = g_forceRecallClaim.count(threatenedFriendlyTower) ? g_forceRecallClaim[threatenedFriendlyTower] : 0;
+                            bool frCapOK     = (frActiveRec < frCap);
+                            if (ENABLE_FR_DEFSAT_SHORTCIRCUIT) {
+                                int frMaxDef   = (bestThreatenedTowerTier >= 4) ? 4 : (bestThreatenedTowerTier >= 3) ? (bLateGame ? 3 : 4) : 2;
+                                int frExistDef = TowerDefenders.count(threatenedFriendlyTower) ? TowerDefenders[threatenedFriendlyTower] : 0;
+                                if (frExistDef >= frMaxDef) frCapOK = false;
+                            }
+                            if (frDistSq > FORCE_RECALL_MIN_DIST_SQ
+                                    && (bestThreatenedTowerTier >= 3 || frDistSq < FORCE_RECALL_MAX_DIST_SQ)
+                                    && frPersist >= 2.0f && frCapOK && frBeyondTower
+                                    && (bestThreatenedTowerTier >= 3 || gThreatTowerIsMyLane)) {
+                                g_forceRecallStart[bot] = matchTimeB;
+                                bForceRecall = true;
+                                g_forceRecallClaim[threatenedFriendlyTower]++;
+#if F4_LOG_LEVEL >= 1
+                                if (bIsBlueTeam) {
+                                    std::cout << "[FORCE-RECALL] FIRE bot=" << botChar->GetFullName().substr(0, 24)
+                                        << " R=" << roleSlot << " Tier=" << (int)bestThreatenedTowerTier
+                                        << " distM=" << (int)(sqrt(frDistSq) / 100.0f)
+                                        << " cap=" << frActiveRec << "/" << frCap
+                                        << " late=" << (bLateGame ? 1 : 0)
+                                        << " T=" << (int)matchTimeB << "s" << std::endl;
+                                }
+#endif
+                            }
+                        }
+                    }
+
+                    bool bInsideEnemyTurretGlobal = false;
+                    if (IsInsideTurretFunc) {
+                        struct { bool RetVal; } turretParams{};
+                        bot->ProcessEvent(IsInsideTurretFunc, &turretParams);
+                        bInsideEnemyTurretGlobal = turretParams.RetVal;
+                    }
+
+
+                    {
+                        bool bRecallActive_wd  = (BotNeedsHeal[bot] || bNeedsTacticalRecall || bForceRecall);
+                        bool bRecallTracked_wd = (g_recallLifeStart.count(bot) > 0);
+                        int rcTwrM_wd = (closestFriendlyTower ? (int)(sqrt(closestFriendlyTowerDistSq) / 100.0f) : -1);
+                        if (bRecallActive_wd && !bRecallTracked_wd) {
+                            g_recallLifeStart[bot] = matchTimeB;
+                            g_recallStartTwrM[bot] = rcTwrM_wd;
+                            g_recallMinTwrM[bot]   = rcTwrM_wd;
+                        }
+                        else if (!bRecallActive_wd && bRecallTracked_wd) {
+                            g_recallLifeStart.erase(bot);
+                            g_recallStartTwrM.erase(bot);
+                            g_recallMinTwrM.erase(bot);
+                            g_escapeJumpTime.erase(bot);
+                        }
+                        else if (bRecallActive_wd && bRecallTracked_wd) {
+                            if (rcTwrM_wd >= 0 && g_recallMinTwrM.count(bot) && rcTwrM_wd < g_recallMinTwrM[bot])
+                                g_recallMinTwrM[bot] = rcTwrM_wd;
+                        }
+                    }
+
+#if F4_LOG_LEVEL >= 1
+
+                    if (bIsBlueTeam) {
+                        static std::map<AOrionAIBot*, float> recallLifeStart;
+                        static std::map<AOrionAIBot*, std::string> recallLifeReason;
+
+                        bool bRecallActive = (BotNeedsHeal[bot] || bNeedsTacticalRecall);
+                        std::string curAction = LastMacroAction[bot];
+
+                        if (bRecallActive && recallLifeStart.find(bot) == recallLifeStart.end()) {
+                            recallLifeStart[bot] = matchTimeB;
+                            std::string reason = "";
+                            if (BotNeedsHeal[bot]) reason += "NeedsHeal ";
+                            if (bNeedsTacticalRecall) reason += "Tactical ";
+                            recallLifeReason[bot] = reason;
+                            std::cout << "[RECALL-LIFE-R] START Role=" << roleSlot
+                                << " Reason=" << reason
+                                << " HP=" << (int)((currentHealth / maxHealth) * 100) << "%"
+                                << " T=" << (int)matchTimeB << "s"
+                                << std::endl;
+                        }
+
+
+                        if (!bRecallActive && recallLifeStart.count(bot)) {
+                            float duration = matchTimeB - recallLifeStart[bot];
+                            std::string endReason = "OTHER";
+                            if (currentHealth >= maxHealth * 0.85f) endReason = "HP-85%";
+                            else if (!bNeedsTacticalRecall && currentHealth > maxHealth * 0.25f) endReason = "TACTICAL-CLEAR";
+                            std::cout << "[RECALL-LIFE-R] END Role=" << roleSlot
+                                << " Duration=" << (int)duration << "s"
+                                << " InitReason=" << recallLifeReason[bot]
+                                << " EndReason=" << endReason
+                                    << " HP=" << (int)((currentHealth / maxHealth) * 100) << "%"
+                                    << " Action=" << curAction
+                                    << std::endl;
+                                recallLifeStart.erase(bot);
+                                recallLifeReason.erase(bot);
+                        }
+
+                    }
+#endif
+
+
+
+
+
+
+                    int  trLose3s = -999;
+                    int  trHeroLoss3s = -999;
+                    bool bTradeLosing = false;
+                    if (ENABLE_TRADE_TRACKER && bIsMeleeChar && !bIsJungler && botChar && maxHealth > 0.0f) {
+                        P6TrState& trs = g_trState[bot];
+                        AActor* trHero = (bestEnemyHero && closestEnemyHeroDistSq < 3240000.0f) ? static_cast<AActor*>(bestEnemyHero) : nullptr;
+                        if (!trHero || trs.hero != trHero || (trs.n > 0 && (matchTimeB - trs.t[trs.n - 1]) > 2.5f)) { trs.n = 0; trs.hero = trHero; }
+                        if (trHero) {
+                            int trBot = (int)((currentHealth / maxHealth) * 100.0f), trH = -1;
+                            for (const CachedChar& tc : LiveChars) {
+                                if (static_cast<AActor*>(tc.ptr) != trHero) continue;
+                                trH = (tc.maxHealth > 0.0f) ? (int)((tc.health / tc.maxHealth) * 100.0f) : -1;
+                                break;
+                            }
+                            if (trs.n == 8) { for (int k = 1; k < 8; k++) { trs.t[k - 1] = trs.t[k]; trs.bhp[k - 1] = trs.bhp[k]; trs.hhp[k - 1] = trs.hhp[k]; } trs.n = 7; }
+                            trs.t[trs.n] = matchTimeB; trs.bhp[trs.n] = trBot; trs.hhp[trs.n] = trH; trs.n++;
+                            for (int k = trs.n - 2; k >= 0; k--) {
+                                if ((matchTimeB - trs.t[k]) < TR_WINDOW_S) continue;
+                                trLose3s = (trs.bhp[k] - trBot) - ((trH >= 0 && trs.hhp[k] >= 0) ? (trs.hhp[k] - trH) : 0);
+                                if (trH >= 0 && trs.hhp[k] >= 0) trHeroLoss3s = trs.hhp[k] - trH;
+                                break;
+                            }
+                        }
+                        bTradeLosing = (trLose3s != -999) && (trLose3s >= TR_LOSE_PP);
+                    }
+                    if (BotNeedsHeal[bot] || bNeedsTacticalRecall || bForceRecall) {
+                        if (ENABLE_DEFEND_ENGAGE && g_deEngagedLastTick.count(bot) && g_deEngagedLastTick[bot]) {
+                            if (JustMinionsQuery) *reinterpret_cast<UObject**>(reinterpret_cast<uintptr_t>(bot) + 0x0650) = JustMinionsQuery;
+                            bot->K2_SetEnemy(nullptr);
+                            g_deEngagedLastTick[bot] = false;
+                        }
+                        bool bBossOverridesRecall = false;
+                        if (LastMacroAction[bot] == "Boss" && activeBossTarget) {
+                            float bHp = 1000.0f, bMax = 1000.0f;
+                            if (getHealthFunc) activeBossTarget->ProcessEvent(getHealthFunc, &bHp);
+                            if (getMaxHealthFunc) activeBossTarget->ProcessEvent(getMaxHealthFunc, &bMax);
+                            if (bMax > 0.0f && (bHp / bMax) < 0.10f) bBossOverridesRecall = true;
+                        }
+
+                        if (!bBossOverridesRecall) {
+                            if (bForceRecall) {
+                                if (BotIsBlind.count(bot) && BotIsBlind[bot]) {
+                                    bot->K2_SetIgnoreEnemies(false); BotIsBlind[bot] = false;
+                                }
+                                g_brActiveUntil.erase(bot);
+                                g_svActiveUntil.erase(bot); g_svFireT.erase(bot); g_svFireHP.erase(bot); g_svTarget.erase(bot); g_svTgtIsWave.erase(bot); g_svMaxHoldT.erase(bot); g_pdyStartT.erase(bot); g_pdyStreak.erase(bot);
+                                g_wfbUntil.erase(bot); g_wfbTarget.erase(bot); g_wfbBestDistSq.erase(bot); g_wfbStall.erase(bot); g_wfbFireT.erase(bot); g_wfbEngineBlind.erase(bot); g_wfbTgtIsWave.erase(bot); g_wfbDefPath.erase(bot); g_wfbDefParity.erase(bot); g_wfbLpStall.erase(bot); g_ahbfOnT.erase(bot);
+                                g_p23Target.erase(bot); g_p23AccR.erase(bot); g_p23StartT.erase(bot); g_p23TgtIsWave.erase(bot); g_p23LogT.erase(bot);
+                                g_akpUntil.erase(bot);
+                                g_p23AdvLogT.erase(bot); g_advHoldOn.erase(bot);
+                                g_akoUntil.erase(bot); g_akoKill.erase(bot); g_akoStartT.erase(bot); g_akoLastT.erase(bot); g_akoRetreatSeenT.erase(bot); g_akoLogT.erase(bot); g_akoStartHP.erase(bot); g_akoStartHeroHP.erase(bot); g_akoMode.erase(bot);
+                                p5EraseWindows(bot); p6EraseRecall(bot);
+                                g_collapseStartTime.erase(bot);
+                                g_laneReturnStartTime.erase(bot);
+                                g_lrS0Latch.erase(bot);
+                                LastKnownObjective[bot] = nullptr;
+                                static UFunction* frRecallFunc = nullptr;
+                                if (!frRecallFunc) frRecallFunc = UObject::FindObject<UFunction>("Function OrionGame.OrionAIBot.Recall");
+                                if (frRecallFunc && !g_forceRecallFired.count(bot)) {
+                                    struct { bool bFailIfUnsafeToRecall; bool ReturnValue; } frp{ false, false };
+                                    bot->ProcessEvent(frRecallFunc, &frp);
+                                    g_forceRecallFired.insert(bot);
+                                }
+                                LastMacroAction[bot] = "Recall";
+                                bool frLocalSafe = true;
+                                if (CombatTimer.count(bot) && CombatTimer[bot] > 0.0f) {
+                                    frLocalSafe = false;
+                                } else {
+                                    for (const CachedChar& cc : LiveChars) {
+                                        if (cc.team != enemyTeam || cc.ptr == botChar || !cc.bIsHero) continue;
+                                        float dq = (cc.loc.X - botLoc.X)*(cc.loc.X - botLoc.X) + (cc.loc.Y - botLoc.Y)*(cc.loc.Y - botLoc.Y);
+                                        if (dq < 4410000.0f) { frLocalSafe = false; break; }
+                                    }
+                                }
+                                if (frLocalSafe) {
+                                    if (HeroFocusQuery && JustMinionsQuery) {
+                                        UObject** frEqs = reinterpret_cast<UObject**>(reinterpret_cast<uintptr_t>(bot) + 0x0650);
+                                        if (*frEqs == HeroFocusQuery) { *frEqs = JustMinionsQuery; bot->K2_SetEnemy(nullptr); }
+                                    }
+                                    if (!ENABLE_FR_NO_MOVE_PROBE) {
+                                        ABP_HomeBasePad_C* frPad = g_homeBasePadDiscovered ? (bIsBlueTeam ? g_blueHomeBasePad : g_redHomeBasePad) : nullptr;
+                                        AActor* frTarget = frPad ? (AActor*)frPad : (AActor*)friendlyCore;
+                                        if (frTarget && MoveFunc) {
+                                            struct { class AActor* G; float R; bool S; bool P; bool C; uint8 Pad[1]; void* F; bool A; uint8 RV; uint8 Pad2[6]; } frMove{};
+                                            frMove.G = frTarget; frMove.R = 500.0f; frMove.S = true; frMove.P = true; frMove.C = true; frMove.A = true;
+                                            bot->ProcessEvent(MoveFunc, &frMove);
+                                            BotIdleTicks[bot] = 0;
+                                        }
+                                    }
+                                    continue;
+                                }
+                            }
+                            bool bNativeSafeToRecall = true;
+                            if (IsSafeToRecallFunc) {
+                                struct { bool RetVal; } safeParams{};
+                                bot->ProcessEvent(IsSafeToRecallFunc, &safeParams);
+                                bNativeSafeToRecall = safeParams.RetVal;
+                            }
+
+                            {
+                                AActor* hhNat = nullptr;
+                                if (GetEnemyCharacterFunc) {
+                                    struct { class AActor* ReturnValue; } hhp{};
+                                    hhp.ReturnValue = nullptr;
+                                    bot->ProcessEvent(GetEnemyCharacterFunc, &hhp);
+                                    hhNat = hhp.ReturnValue;
+                                }
+                                std::string hhNatName = "NULL";
+                                int hhIsHero = 0;
+                                if (hhNat) {
+                                    hhNatName = hhNat->GetFullName();
+                                    size_t sp = hhNatName.find(' '); if (sp != std::string::npos) hhNatName = hhNatName.substr(sp + 1);
+                                    size_t dt = hhNatName.rfind('.'); if (dt != std::string::npos) hhNatName = hhNatName.substr(dt + 1);
+                                    if (hhNatName.length() > 22) hhNatName = hhNatName.substr(0, 22);
+                                    hhIsHero = (hhNatName.find("Minion") == std::string::npos
+                                        && hhNatName.find("Tower") == std::string::npos
+                                        && hhNatName.find("Turret") == std::string::npos
+                                        && hhNatName.find("Jungl") == std::string::npos) ? 1 : 0;
+                                }
+                                UObject** hhOverridePtr = reinterpret_cast<UObject**>(reinterpret_cast<uintptr_t>(bot) + 0x0650);
+                                if (ENABLE_HIPHOP_TEST_CLEAR && hhIsHero) {
+                                    if (JustMinionsQuery) *hhOverridePtr = JustMinionsQuery;
+                                    bot->K2_SetEnemy(nullptr);
+                                }
+                            }
+
+                            if (g_homeBasePadDiscovered && MoveFunc) {
+                                ABP_HomeBasePad_C* wtpPad = bIsBlueTeam
+                                    ? g_blueHomeBasePad : g_redHomeBasePad;
+                                if (wtpPad) {
+                                    FVector padLoc = wtpPad->K2_GetActorLocation();
+                                    float distToPadSq = (padLoc.X - botLoc.X)*(padLoc.X - botLoc.X)
+                                                      + (padLoc.Y - botLoc.Y)*(padLoc.Y - botLoc.Y);
+                                    if (distToPadSq < 56250000.0f) {
+                                        if (BotIsBlind.count(bot) && BotIsBlind[bot]) {
+                                            bot->K2_SetIgnoreEnemies(false);
+                                            BotIsBlind[bot] = false;
+                                        }
+                                        g_brActiveUntil.erase(bot);
+                                g_svActiveUntil.erase(bot); g_svFireT.erase(bot); g_svFireHP.erase(bot); g_svTarget.erase(bot); g_svTgtIsWave.erase(bot); g_svMaxHoldT.erase(bot); g_pdyStartT.erase(bot); g_pdyStreak.erase(bot);
+                                g_wfbUntil.erase(bot); g_wfbTarget.erase(bot); g_wfbBestDistSq.erase(bot); g_wfbStall.erase(bot); g_wfbFireT.erase(bot); g_wfbEngineBlind.erase(bot); g_wfbTgtIsWave.erase(bot); g_wfbDefPath.erase(bot); g_wfbDefParity.erase(bot); g_wfbLpStall.erase(bot); g_ahbfOnT.erase(bot);
+                                g_p23Target.erase(bot); g_p23AccR.erase(bot); g_p23StartT.erase(bot); g_p23TgtIsWave.erase(bot); g_p23LogT.erase(bot);
+                                g_akpUntil.erase(bot);
+                                g_p23AdvLogT.erase(bot); g_advHoldOn.erase(bot);
+                                g_akoUntil.erase(bot); g_akoKill.erase(bot); g_akoStartT.erase(bot); g_akoLastT.erase(bot); g_akoRetreatSeenT.erase(bot); g_akoLogT.erase(bot); g_akoStartHP.erase(bot); g_akoStartHeroHP.erase(bot); g_akoMode.erase(bot);
+                                p5EraseWindows(bot); p6EraseRecall(bot);
+                                        struct {
+                                            class AActor* G; float R; bool S; bool P; bool C;
+                                            uint8 Pad[1]; void* F; bool A; uint8 RV; uint8 Pad2[6];
+                                        } wtpParams{};
+                                        wtpParams.G = wtpPad;
+                                        wtpParams.R = 500.0f;
+                                        wtpParams.S = true;
+                                        wtpParams.P = true;
+                                        wtpParams.C = true;
+                                        wtpParams.A = true;
+                                        bot->ProcessEvent(MoveFunc, &wtpParams);
+                                        BotIdleTicks[bot] = 0;
+                                        bIsFleeing = true;
+                                        if (LastMacroAction[bot] == "Gank"
+                                            && LastGankTargetPtr.count(bot) && LastGankTargetPtr[bot]) {
+                                            GankCooldownPerTarget[LastGankTargetPtr[bot]] = matchTimeB + 45.0f;
+                                            LastGankTargetPtr[bot] = nullptr;
+                                        }
+                                        LastMacroAction[bot] = "Recall";
+                                        LastMacroTargetName[bot] = "Base";
+
+                                        LastKnownObjective[bot] = *reinterpret_cast<UBotObjective**>(
+                                            reinterpret_cast<uintptr_t>(bot) + 0x0748);
+                                        continue;
+                                    }
+                                }
+                            }
+
+
+                            {
+                                UBotObjective* rwObj = *reinterpret_cast<UBotObjective**>(
+                                    reinterpret_cast<uintptr_t>(bot) + 0x0748);
+                                bool  rwSaw = (g_rjSawBigJump.count(bot) && g_rjSawBigJump[bot]);
+                                float rwElapsed = g_recallLifeStart.count(bot)
+                                    ? (matchTimeB - g_recallLifeStart[bot]) : -1.0f;
+                                bool rwHung = (LastMacroAction[bot] == "Recall")
+                                    && rwObj != nullptr
+                                    && g_recallLifeStart.count(bot)
+                                    && !g_forceRecallStart.count(bot)
+                                    && ( (!rwSaw && rwElapsed > 20.0f) || (rwElapsed > 35.0f) );
+
+                                bool bWdDiveYield = !bNeedsTacticalRecall
+                                    && bestEnemyHero && closestEnemyHeroDistSq < 4410000.0f
+                                    && closestFriendlyTowerDistSq > 1440000.0f;
+                                if (rwHung && MoveFunc && !bWdDiveYield) {
+                                    ABP_HomeBasePad_C* rwPad = g_homeBasePadDiscovered
+                                        ? (bIsBlueTeam ? g_blueHomeBasePad : g_redHomeBasePad)
+                                        : nullptr;
+                                    float rwPadDistSq = 1e18f;
+                                    if (rwPad) {
+                                        FVector p = rwPad->K2_GetActorLocation();
+                                        rwPadDistSq = (p.X-botLoc.X)*(p.X-botLoc.X)
+                                                    + (p.Y-botLoc.Y)*(p.Y-botLoc.Y);
+                                    }
+                                    float rwTwrDistSq = 1e18f;
+                                    if (closestFriendlyTower) {
+                                        FVector t = closestFriendlyTower->K2_GetActorLocation();
+                                        rwTwrDistSq = (t.X-botLoc.X)*(t.X-botLoc.X)
+                                                    + (t.Y-botLoc.Y)*(t.Y-botLoc.Y);
+                                    }
+
+                                    AActor* rwTarget = nullptr;
+                                    float rwAccR = 1500.0f;
+                                    const char* rwStage = "NONE";
+                                    if (rwPad && rwPadDistSq < 25000000.0f) {
+                                        rwTarget = rwPad; rwAccR = 500.0f; rwStage = "PAD";
+                                    } else if (closestFriendlyTower && rwTwrDistSq > 9000000.0f
+                                               && !(g_wdPadCommit.count(bot) && g_wdPadCommit[bot])) {
+                                        rwTarget = closestFriendlyTower; rwAccR = 1500.0f; rwStage = "TOWER";
+                                    } else if (rwPad) {
+                                        rwTarget = rwPad; rwAccR = 500.0f; rwStage = "PAD-FROM-TWR";
+                                        g_wdPadCommit[bot] = true;
+                                    } else if (closestFriendlyTower) {
+                                        rwTarget = closestFriendlyTower; rwAccR = 800.0f; rwStage = "TWR-HOLD";
+                                    } else if (friendlyCore) {
+                                        rwTarget = friendlyCore; rwAccR = 1500.0f; rwStage = "CORE-FB";
+                                    }
+
+                                    if (rwTarget) {
+                                        if (BotIsBlind.count(bot) && BotIsBlind[bot]) {
+                                            bot->K2_SetIgnoreEnemies(false);
+                                            BotIsBlind[bot] = false;
+                                        }
+                                        g_brActiveUntil.erase(bot);
+                                g_svActiveUntil.erase(bot); g_svFireT.erase(bot); g_svFireHP.erase(bot); g_svTarget.erase(bot); g_svTgtIsWave.erase(bot); g_svMaxHoldT.erase(bot); g_pdyStartT.erase(bot); g_pdyStreak.erase(bot);
+                                g_wfbUntil.erase(bot); g_wfbTarget.erase(bot); g_wfbBestDistSq.erase(bot); g_wfbStall.erase(bot); g_wfbFireT.erase(bot); g_wfbEngineBlind.erase(bot); g_wfbTgtIsWave.erase(bot); g_wfbDefPath.erase(bot); g_wfbDefParity.erase(bot); g_wfbLpStall.erase(bot); g_ahbfOnT.erase(bot);
+                                g_p23Target.erase(bot); g_p23AccR.erase(bot); g_p23StartT.erase(bot); g_p23TgtIsWave.erase(bot); g_p23LogT.erase(bot);
+                                g_akpUntil.erase(bot);
+                                g_p23AdvLogT.erase(bot); g_advHoldOn.erase(bot);
+                                g_akoUntil.erase(bot); g_akoKill.erase(bot); g_akoStartT.erase(bot); g_akoLastT.erase(bot); g_akoRetreatSeenT.erase(bot); g_akoLogT.erase(bot); g_akoStartHP.erase(bot); g_akoStartHeroHP.erase(bot); g_akoMode.erase(bot);
+                                p5EraseWindows(bot); p6EraseRecall(bot);
+                                        struct {
+                                            class AActor* G; float R; bool S; bool P; bool C;
+                                            uint8 Pad[1]; void* F; bool A; uint8 RV; uint8 Pad2[6];
+                                        } rwParams{};
+                                        rwParams.G = rwTarget;
+                                        rwParams.R = rwAccR;
+                                        rwParams.S = true;
+                                        rwParams.P = true;
+                                        rwParams.C = true;
+                                        rwParams.A = true;
+                                        bot->ProcessEvent(MoveFunc, &rwParams);
+                                        BotIdleTicks[bot] = 0;
+                                        bIsFleeing = true;
+                                        if (LastMacroAction[bot] == "Gank"
+                                            && LastGankTargetPtr.count(bot) && LastGankTargetPtr[bot]) {
+                                            GankCooldownPerTarget[LastGankTargetPtr[bot]] = matchTimeB + 45.0f;
+                                            LastGankTargetPtr[bot] = nullptr;
+                                        }
+                                        LastMacroAction[bot] = "Recall";
+                                        LastMacroTargetName[bot] = "Base";
+
+#if F4_LOG_LEVEL >= 1
+                                        static std::map<AOrionAIBot*, float> g_rwLastLog;
+                                        if (bIsBlueTeam && (matchTimeB - g_rwLastLog[bot]) > 5.0f) {
+                                            g_rwLastLog[bot] = matchTimeB;
+                                            int rwElapsed = (int)(matchTimeB - g_recallLifeStart[bot]);
+                                            int rwPadM = (rwPadDistSq < 1e17f) ? (int)(sqrt(rwPadDistSq)/100.0f) : -1;
+                                            int rwTwrM = (rwTwrDistSq < 1e17f) ? (int)(sqrt(rwTwrDistSq)/100.0f) : -1;
+                                            std::cout << "[RECALL-WATCHDOG] R=" << roleSlot
+                                                << " Stage=" << rwStage
+                                                << " Elapsed=" << rwElapsed << "s"
+                                                << " HP=" << (int)((currentHealth / maxHealth) * 100) << "%"
+                                                << " DistPad=" << rwPadM << "m"
+                                                << " DistTwr=" << rwTwrM << "m"
+                                                << " NeedsHeal=" << (BotNeedsHeal.count(bot) && BotNeedsHeal[bot] ? 1 : 0)
+                                                << " Tactical=" << bNeedsTacticalRecall
+                                                << " T=" << (int)matchTimeB << "s"
+                                                << std::endl;
+                                        }
+#endif
+                                        LastKnownObjective[bot] = *reinterpret_cast<UBotObjective**>(
+                                            reinterpret_cast<uintptr_t>(bot) + 0x0748);
+                                        continue;
+                                    }
+                                }
+                            }
+
+                            if (bInsideEnemyTurretGlobal && !bIsSafeToPush) {
+
+                                if (BotIsBlind.count(bot) && BotIsBlind[bot]) {
+                                    bot->K2_SetIgnoreEnemies(false);
+                                    BotIsBlind[bot] = false;
+                                }
+                                g_brActiveUntil.erase(bot);
+                                g_svActiveUntil.erase(bot); g_svFireT.erase(bot); g_svFireHP.erase(bot); g_svTarget.erase(bot); g_svTgtIsWave.erase(bot); g_svMaxHoldT.erase(bot); g_pdyStartT.erase(bot); g_pdyStreak.erase(bot);
+                                g_wfbUntil.erase(bot); g_wfbTarget.erase(bot); g_wfbBestDistSq.erase(bot); g_wfbStall.erase(bot); g_wfbFireT.erase(bot); g_wfbEngineBlind.erase(bot); g_wfbTgtIsWave.erase(bot); g_wfbDefPath.erase(bot); g_wfbDefParity.erase(bot); g_wfbLpStall.erase(bot); g_ahbfOnT.erase(bot);
+                                g_p23Target.erase(bot); g_p23AccR.erase(bot); g_p23StartT.erase(bot); g_p23TgtIsWave.erase(bot); g_p23LogT.erase(bot);
+                                g_akpUntil.erase(bot);
+                                g_p23AdvLogT.erase(bot); g_advHoldOn.erase(bot);
+                                g_akoUntil.erase(bot); g_akoKill.erase(bot); g_akoStartT.erase(bot); g_akoLastT.erase(bot); g_akoRetreatSeenT.erase(bot); g_akoLogT.erase(bot); g_akoStartHP.erase(bot); g_akoStartHeroHP.erase(bot); g_akoMode.erase(bot);
+                                p5EraseWindows(bot); p6EraseRecall(bot);
+                                moveTarget = closestFriendlyTower ? closestFriendlyTower : friendlyCore;
+                                accRadius = 1500.0f;
+                                bIsFleeing = true;
+                                if (moveTarget && MoveFunc) {
+                                    struct { class AActor* G; float R; bool S; bool P; bool C; uint8 Pad[1]; void* F; bool A; uint8 RV; uint8 Pad2[6]; } moveParams{};
+                                    moveParams.G = moveTarget; moveParams.R = accRadius; moveParams.S = true; moveParams.P = true; moveParams.C = true; moveParams.A = true;
+                                    bot->ProcessEvent(MoveFunc, &moveParams);
+                                    BotIdleTicks[bot] = 0;
+                                }
+                                if (LastMacroAction[bot] == "Gank"
+                                    && LastGankTargetPtr.count(bot) && LastGankTargetPtr[bot]) {
+                                    GankCooldownPerTarget[LastGankTargetPtr[bot]] = matchTimeB + 45.0f;
+                                    LastGankTargetPtr[bot] = nullptr;
+                                }
+                                LastKnownObjective[bot] = *reinterpret_cast<UBotObjective**>(
+                                    reinterpret_cast<uintptr_t>(bot) + 0x0748);
+                                {
+                                    const char* curPath = "A";
+                                    const std::string& prevPath = g_lastRecallPath[bot];
+                                    if (prevPath != curPath) {
+                                        g_lastRecallPath[bot] = curPath;
+                                    }
+                                }
+                                continue;
+                            }
+                            else if (!bNeedsTacticalRecall
+                                && ( (!bNativeSafeToRecall && (CombatTimer[bot] > 0.0f || (bestEnemyHero && closestEnemyHeroDistSq < 6250000.0f)))
+                                     || ( ((bestEnemyHero && closestEnemyHeroDistSq < 4410000.0f) || (bestEnemyMinion && closestEnemyMinionDistSq < 4410000.0f)) && closestFriendlyTowerDistSq > 1440000.0f) )) {
+
+
+                                if (BotIsBlind.count(bot) && BotIsBlind[bot]) {
+                                    bot->K2_SetIgnoreEnemies(false);
+                                    BotIsBlind[bot] = false;
+                                }
+                                g_brActiveUntil.erase(bot);
+                                g_svActiveUntil.erase(bot); g_svFireT.erase(bot); g_svFireHP.erase(bot); g_svTarget.erase(bot); g_svTgtIsWave.erase(bot); g_svMaxHoldT.erase(bot); g_pdyStartT.erase(bot); g_pdyStreak.erase(bot);
+                                g_wfbUntil.erase(bot); g_wfbTarget.erase(bot); g_wfbBestDistSq.erase(bot); g_wfbStall.erase(bot); g_wfbFireT.erase(bot); g_wfbEngineBlind.erase(bot); g_wfbTgtIsWave.erase(bot); g_wfbDefPath.erase(bot); g_wfbDefParity.erase(bot); g_wfbLpStall.erase(bot); g_ahbfOnT.erase(bot);
+                                g_p23Target.erase(bot); g_p23AccR.erase(bot); g_p23StartT.erase(bot); g_p23TgtIsWave.erase(bot); g_p23LogT.erase(bot);
+                                g_akpUntil.erase(bot);
+                                g_p23AdvLogT.erase(bot); g_advHoldOn.erase(bot);
+                                g_akoUntil.erase(bot); g_akoKill.erase(bot); g_akoStartT.erase(bot); g_akoLastT.erase(bot); g_akoRetreatSeenT.erase(bot); g_akoLogT.erase(bot); g_akoStartHP.erase(bot); g_akoStartHeroHP.erase(bot); g_akoMode.erase(bot);
+                                p5EraseWindows(bot); p6EraseRecall(bot);
+                                AActor* fleeTarget = closestFriendlyTower ? (AActor*)closestFriendlyTower : (AActor*)friendlyCore;
+                                moveTarget = fleeTarget;
+                                accRadius = 1500.0f;
+                                bIsFleeing = true;
+                                if (moveTarget && MoveFunc) {
+                                    struct { class AActor* G; float R; bool S; bool P; bool C; uint8 Pad[1]; void* F; bool A; uint8 RV; uint8 Pad2[6]; } moveParams{};
+                                    moveParams.G = moveTarget; moveParams.R = accRadius; moveParams.S = true; moveParams.P = true; moveParams.C = true; moveParams.A = true;
+                                    bot->ProcessEvent(MoveFunc, &moveParams);
+                                    BotIdleTicks[bot] = 0;
+                                }
+                                if (LastMacroAction[bot] == "Gank"
+                                    && LastGankTargetPtr.count(bot) && LastGankTargetPtr[bot]) {
+                                    GankCooldownPerTarget[LastGankTargetPtr[bot]] = matchTimeB + 45.0f;
+                                    LastGankTargetPtr[bot] = nullptr;
+                                }
+                                if (ENABLE_RECALL_CANCEL) {
+                                    uintptr_t rcChar = reinterpret_cast<uintptr_t>(botChar);
+                                    if (!IsBadReadPtr(reinterpret_cast<void*>(rcChar + 0x780), 8)) {
+                                        UAbilitySystemComponent* rcAsc = *reinterpret_cast<UAbilitySystemComponent**>(rcChar + 0x780);
+                                        if (rcAsc && IsValidUE4Object(rcAsc)) {
+                                            uintptr_t rcA = reinterpret_cast<uintptr_t>(rcAsc);
+                                            if (!IsBadReadPtr(reinterpret_cast<void*>(rcA + 0x520), 16)) {
+                                                uintptr_t rcData = *reinterpret_cast<uintptr_t*>(rcA + 0x520);
+                                                int32_t   rcNum  = *reinterpret_cast<int32_t*>(rcA + 0x528);
+                                                if (rcData && rcNum > 0 && rcNum <= 200) {
+                                                    UClass* rcCls = UGA_RecallToBase_C::StaticClass();
+                                                    for (int32_t rcI = 0; rcI < rcNum; ++rcI) {
+                                                        uintptr_t rcSpec = rcData + (uintptr_t)rcI * 0xC8;
+                                                        if (IsBadReadPtr(reinterpret_cast<void*>(rcSpec + 0x10), 8)) continue;
+                                                        UObject* rcAbil = *reinterpret_cast<UObject**>(rcSpec + 0x10);
+                                                        if (!rcAbil || IsBadReadPtr(rcAbil, 8) || !IsValidUE4Object(rcAbil)) continue;
+                                                        if (!rcCls || !rcAbil->IsA(rcCls)) continue;
+                                                        if (*reinterpret_cast<uint8_t*>(rcSpec + 0x28) == 0) break;
+                                                        UObject* rcInst = nullptr;
+                                                        uintptr_t rcArr[2] = { rcSpec + 0x60, rcSpec + 0x50 };
+                                                        for (int rk = 0; rk < 2 && !rcInst; ++rk) {
+                                                            if (IsBadReadPtr(reinterpret_cast<void*>(rcArr[rk]), 16)) continue;
+                                                            void*   iData = *reinterpret_cast<void**>(rcArr[rk]);
+                                                            int32_t iNum  = *reinterpret_cast<int32_t*>(rcArr[rk] + 8);
+                                                            if (!iData || iNum <= 0 || iNum > 100) continue;
+                                                            uintptr_t last = reinterpret_cast<uintptr_t>(iData) + (uintptr_t)(iNum - 1) * sizeof(void*);
+                                                            if (IsBadReadPtr(reinterpret_cast<void*>(last), sizeof(void*))) continue;
+                                                            UObject* cand = *reinterpret_cast<UObject**>(last);
+                                                            if (cand && !IsBadReadPtr(cand, 8) && IsValidUE4Object(cand)) rcInst = cand;
+                                                        }
+                                                        if (rcInst) {
+                                                            if (!IsBadReadPtr(reinterpret_cast<void*>(reinterpret_cast<uintptr_t>(rcInst) + 0xBD8), 1))
+                                                                *reinterpret_cast<uint8_t*>(reinterpret_cast<uintptr_t>(rcInst) + 0xBD8) = 0;
+                                                            static UFunction* fnRcCancel = nullptr;
+                                                            if (!fnRcCancel)
+                                                                fnRcCancel = UObject::FindObject<UFunction>("Function GameplayAbilities.GameplayAbility.K2_CancelAbility");
+                                                            if (fnRcCancel) rcInst->ProcessEvent(fnRcCancel, nullptr);
+#if F4_LOG_LEVEL >= 1
+                                                            if (bIsBlueTeam) {
+                                                                std::cout << "[RECALL-CANCEL] " << botChar->GetFullName().substr(0, 24)
+                                                                    << " R=" << roleSlot << " HP=" << (int)((currentHealth / maxHealth) * 100) << "%"
+                                                                    << " heroD=" << (bestEnemyHero ? (int)(sqrt(closestEnemyHeroDistSq) / 100.0f) : -1) << "m"
+                                                                    << " twrD=" << (closestFriendlyTower ? (int)(sqrt(closestFriendlyTowerDistSq) / 100.0f) : -1) << "m"
+                                                                    << " ActivePost=" << (int)*reinterpret_cast<uint8_t*>(rcSpec + 0x28)
+                                                                    << " fn=" << (fnRcCancel ? 1 : 0)
+                                                                    << " T=" << (int)matchTimeB << "s" << std::endl;
+                                                            }
+#endif
+                                                        }
+#if F4_LOG_LEVEL >= 1
+                                                        else if (bIsBlueTeam) {
+                                                            std::cout << "[RECALL-CANCEL] NO-INSTANCE " << botChar->GetFullName().substr(0, 24)
+                                                                << " R=" << roleSlot
+                                                                << " ActiveCount=" << (int)*reinterpret_cast<uint8_t*>(rcSpec + 0x28)
+                                                                << " T=" << (int)matchTimeB << "s" << std::endl;
+                                                        }
+#endif
+                                                        break;
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                                LastKnownObjective[bot] = *reinterpret_cast<UBotObjective**>(
+                                    reinterpret_cast<uintptr_t>(bot) + 0x0748);
+                                {
+                                    const char* curPath = "B";
+                                    const std::string& prevPath = g_lastRecallPath[bot];
+                                    if (prevPath != curPath) {
+                                        g_lastRecallPath[bot] = curPath;
+                                    }
+                                }
+                                if (closestFriendlyTower && closestFriendlyTowerDistSq > 1440000.0f
+                                    && bestEnemyHero && closestEnemyHeroDistSq < 90000.0f) {
+                                    UObject* pbMc = *reinterpret_cast<UObject**>(reinterpret_cast<uintptr_t>(botChar) + 0x0380);
+                                    float pbVel = 999.0f;
+                                    if (pbMc) { FVector* pbVp = reinterpret_cast<FVector*>(reinterpret_cast<uintptr_t>(pbMc) + 0x0104);
+                                                pbVel = sqrtf(pbVp->X * pbVp->X + pbVp->Y * pbVp->Y) / 100.0f; }
+                                    if (pbMc && pbVel < 2.0f && (!g_rfLaunchTime.count(bot) || (matchTimeB - g_rfLaunchTime[bot]) >= 2.0f)) {
+                                        g_rfLaunchTime[bot] = matchTimeB;
+                                        static UFunction* fnPbLaunch = nullptr;
+                                        if (!fnPbLaunch)
+                                            fnPbLaunch = UObject::FindObject<UFunction>("Function OrionGame.OrionCharMovementComponent.LaunchToPoint");
+                                        if (fnPbLaunch) {
+                                            FVector pbHeLoc = bestEnemyHero->K2_GetActorLocation();
+                                            float pbDirX = botLoc.X - pbHeLoc.X, pbDirY = botLoc.Y - pbHeLoc.Y;
+                                            float pbLen = sqrtf(pbDirX * pbDirX + pbDirY * pbDirY);
+                                            if (pbLen > 1.0f) {
+                                                struct LaunchPointParams { FVector EndPoint; float LaunchVelocityXY; bool bLockAirControl; uint8_t _pad11[3]; } pblp{};
+                                                pblp.EndPoint.X = botLoc.X + (pbDirX / pbLen) * 800.0f;
+                                                pblp.EndPoint.Y = botLoc.Y + (pbDirY / pbLen) * 800.0f;
+                                                pblp.EndPoint.Z = botLoc.Z;
+                                                pblp.LaunchVelocityXY = 700.0f;
+                                                pblp.bLockAirControl = false;
+                                                pbMc->ProcessEvent(fnPbLaunch, &pblp);
+#if F4_LOG_LEVEL >= 1
+                                                if (bIsBlueTeam)
+                                                    std::cout << "[PB-LAUNCH] " << botChar->GetFullName().substr(0, 24)
+                                                        << " R=" << roleSlot << " HP=" << (int)((currentHealth / maxHealth) * 100) << "%"
+                                                        << " heroD=" << (int)(sqrt(closestEnemyHeroDistSq) / 100.0f) << "m"
+                                                        << " twrD=" << (int)(sqrt(closestFriendlyTowerDistSq) / 100.0f) << "m"
+                                                        << " T=" << (int)matchTimeB << "s" << std::endl;
+#endif
+                                            }
+                                        }
+                                    }
+                                }
+                                if (ENABLE_RECALL_ESCAPE_JUMP) {
+                                    if (g_escapeJumpTime.count(bot) == 0) g_escapeJumpTime[bot] = matchTimeB - 2.0f;
+                                    bool ejHeroOK = (!bestEnemyHero || closestEnemyHeroDistSq >= 90000.0f);
+                                    if (closestFriendlyTower && closestFriendlyTowerDistSq > 1440000.0f
+                                        && ejHeroOK && (matchTimeB - g_escapeJumpTime[bot]) >= 4.0f) {
+                                        bool ejStall = false;
+                                        if (ENABLE_EJ_STALL_GATE) {
+                                            float ejgTwrM = sqrtf(closestFriendlyTowerDistSq) / 100.0f;
+                                            if (!g_ejgLastT.count(bot) || (matchTimeB - g_ejgLastT[bot]) > 8.0f) {
+                                                g_ejgStartTwrM[bot] = ejgTwrM; g_ejgMinTwrM[bot] = ejgTwrM; g_ejgJumps[bot] = 0;
+                                            }
+                                            if (!g_ejgMinTwrM.count(bot) || ejgTwrM < g_ejgMinTwrM[bot]) g_ejgMinTwrM[bot] = ejgTwrM;
+                                            g_ejgLastT[bot] = matchTimeB;
+                                            float ejgBest = g_ejgStartTwrM[bot] - g_ejgMinTwrM[bot];
+                                            ejStall = (g_ejgJumps[bot] >= EJ_STALL_JUMPS && ejgBest < EJ_STALL_MIN_PROGRESS_M);
+                                        }
+                                        UObject* ejMc = *reinterpret_cast<UObject**>(reinterpret_cast<uintptr_t>(botChar) + 0x0380);
+                                        if (ejMc) {
+                                            static UFunction* fnEjLaunch = nullptr;
+                                            if (!fnEjLaunch)
+                                                fnEjLaunch = UObject::FindObject<UFunction>("Function OrionGame.OrionCharMovementComponent.LaunchToPoint");
+                                            if (fnEjLaunch) {
+                                                FVector ejTw = fleeTarget->K2_GetActorLocation();
+                                                float dX = ejTw.X - botLoc.X, dY = ejTw.Y - botLoc.Y, L = sqrtf(dX * dX + dY * dY);
+                                                if (L > 1.0f) {
+                                                    struct LaunchPointParams { FVector EndPoint; float LaunchVelocityXY; bool bLockAirControl; uint8_t _pad11[3]; } ejlp{};
+                                                    ejlp.EndPoint.X = botLoc.X + (dX / L) * 600.0f;
+                                                    ejlp.EndPoint.Y = botLoc.Y + (dY / L) * 600.0f;
+                                                    ejlp.EndPoint.Z = botLoc.Z;
+                                                    ejlp.LaunchVelocityXY = 700.0f;
+                                                    ejlp.bLockAirControl = false;
+                                                    bool ejWallSkip = false;
+                                                    {
+                                                        static UFunction* fnEjRay = nullptr;
+                                                        if (!fnEjRay)
+                                                            fnEjRay = UObject::FindObject<UFunction>("Function Engine.NavigationSystem.NavigationRaycast");
+                                                        UObject* ejNavCDO = fnEjRay ? reinterpret_cast<UObject*>(SDK::UNavigationSystem::GetDefaultObj()) : nullptr;
+                                                        if (fnEjRay && ejNavCDO && IsValidUE4Object(ejNavCDO)) {
+                                                            SDK::Params::NavigationSystem_NavigationRaycast ejray{};
+                                                            ejray.WorldContextObject = botChar;
+                                                            ejray.RayStart = botLoc;
+                                                            ejray.RayEnd = ejlp.EndPoint;
+                                                            ejray.HitLocation = botLoc;
+                                                            ejray.Querier = reinterpret_cast<decltype(ejray.Querier)>(bot);
+                                                            ejNavCDO->ProcessEvent(fnEjRay, &ejray);
+                                                            float ejdhx = ejray.HitLocation.X - botLoc.X, ejdhy = ejray.HitLocation.Y - botLoc.Y;
+                                                            float ejdex = ejray.RayEnd.X - botLoc.X, ejdey = ejray.RayEnd.Y - botLoc.Y;
+                                                            float ejDistHit = sqrtf(ejdhx * ejdhx + ejdhy * ejdhy);
+                                                            float ejDistEnd = sqrtf(ejdex * ejdex + ejdey * ejdey);
+                                                            ejWallSkip = ejray.ReturnValue && (ejDistHit > 100.0f) && (ejDistHit < ejDistEnd - 150.0f);
+                                                        }
+                                                    }
+                                                    if (!ejWallSkip && !ejStall) {
+                                                        ejMc->ProcessEvent(fnEjLaunch, &ejlp);
+                                                        g_escapeJumpTime[bot] = matchTimeB;
+                                                        if (ENABLE_EJ_STALL_GATE) g_ejgJumps[bot]++;
+#if F4_LOG_LEVEL >= 1
+                                                        if (bIsBlueTeam) {
+                                                            std::cout << "[ESCAPE-JUMP] " << botChar->GetFullName().substr(0, 24)
+                                                                << " R=" << roleSlot << " HP=" << (int)((currentHealth / maxHealth) * 100) << "%"
+                                                                << " heroD=" << (bestEnemyHero ? (int)(sqrt(closestEnemyHeroDistSq) / 100.0f) : -1) << "m"
+                                                                << " twrD=" << (int)(sqrt(closestFriendlyTowerDistSq) / 100.0f) << "m"
+                                                                << " T=" << (int)matchTimeB << "s" << std::endl;
+                                                        }
+#endif
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                                continue;
+                            }
+                            else {
+
+                                if (LastMacroAction[bot] == "Gank"
+                                    && LastGankTargetPtr.count(bot) && LastGankTargetPtr[bot]) {
+                                    GankCooldownPerTarget[LastGankTargetPtr[bot]] = matchTimeB + 45.0f;
+                                    LastGankTargetPtr[bot] = nullptr;
+                                }
+                                if (BotIsBlind.count(bot) && BotIsBlind[bot]) {
+                                    bot->K2_SetIgnoreEnemies(false);
+                                    BotIsBlind[bot] = false;
+                                }
+                                g_brActiveUntil.erase(bot);
+                                g_svActiveUntil.erase(bot); g_svFireT.erase(bot); g_svFireHP.erase(bot); g_svTarget.erase(bot); g_svTgtIsWave.erase(bot); g_svMaxHoldT.erase(bot); g_pdyStartT.erase(bot); g_pdyStreak.erase(bot);
+                                g_wfbUntil.erase(bot); g_wfbTarget.erase(bot); g_wfbBestDistSq.erase(bot); g_wfbStall.erase(bot); g_wfbFireT.erase(bot); g_wfbEngineBlind.erase(bot); g_wfbTgtIsWave.erase(bot); g_wfbDefPath.erase(bot); g_wfbDefParity.erase(bot); g_wfbLpStall.erase(bot); g_ahbfOnT.erase(bot);
+                                g_p23Target.erase(bot); g_p23AccR.erase(bot); g_p23StartT.erase(bot); g_p23TgtIsWave.erase(bot); g_p23LogT.erase(bot);
+                                g_akpUntil.erase(bot);
+                                g_p23AdvLogT.erase(bot); g_advHoldOn.erase(bot);
+                                g_akoUntil.erase(bot); g_akoKill.erase(bot); g_akoStartT.erase(bot); g_akoLastT.erase(bot); g_akoRetreatSeenT.erase(bot); g_akoLogT.erase(bot); g_akoStartHP.erase(bot); g_akoStartHeroHP.erase(bot); g_akoMode.erase(bot);
+                                p5EraseWindows(bot); p6EraseRecall(bot);
+                                if (LastMacroAction[bot] != "Recall") {
+                                    if (StopMovementFunc) {
+                                        bot->ProcessEvent(StopMovementFunc, nullptr);
+                                    }
+
+                                    UBotObjective* existingObj = *reinterpret_cast<UBotObjective**>(
+                                        reinterpret_cast<uintptr_t>(bot) + 0x0748);
+                                    if (!existingObj || !RCClass || !existingObj->IsA(RCClass)) {
+                                        if (RCClass && StaticConstructObject) {
+                                            uint32_t* fl = reinterpret_cast<uint32_t*>(reinterpret_cast<uintptr_t>(RCClass) + 0xB4);
+                                            uint32_t sv = *fl; *fl &= ~0x01u;
+                                            UObject* nObj = StaticConstructObject(RCClass, CommanderObj, FName(), 0, 0, nullptr, false, nullptr, false);
+                                            *fl = sv;
+                                            if (nObj) {
+                                                existingObj = reinterpret_cast<UBotObjective*>(nObj);
+                                                *reinterpret_cast<UBotObjective**>(reinterpret_cast<uintptr_t>(bot) + 0x0748) = existingObj;
+                                                *reinterpret_cast<UObject**>(reinterpret_cast<uintptr_t>(existingObj) + 0x0128) = CommanderObj;
+                                            }
+                                        }
+                                    }
+                                    if (existingObj && BT_Recall) {
+                                        *reinterpret_cast<UObject**>(reinterpret_cast<uintptr_t>(existingObj) + 0x50) = BT_Recall;
+                                    }
+
+                                    if (existingObj && RecallTeleportQuery) {
+                                        *reinterpret_cast<UObject**>(reinterpret_cast<uintptr_t>(existingObj) + 0x0130) = RecallTeleportQuery;
+                                    }
+                                    bot->K2_SetEnemy(nullptr);
+                                    LastMacroAction[bot] = "Recall";
+                                    LastMacroTargetName[bot] = "Base";
+                                }
+                                moveTarget = nullptr;
+                                BotIdleTicks[bot] = 0;
+                                LastKnownObjective[bot] = *reinterpret_cast<UBotObjective**>(
+                                    reinterpret_cast<uintptr_t>(bot) + 0x0748);
+                                *reinterpret_cast<void**>(reinterpret_cast<uintptr_t>(bot) + 0x0640) = nullptr;
+
+                                {
+                                    if (!g_homeBasePadDiscovered && blueCore && redCore) {
+                                        auto allPads = SDKUtils::GetAllObjectsOfType<ABP_HomeBasePad_C>();
+                                        FVector bcLoc = blueCore->K2_GetActorLocation();
+                                        FVector rcLoc = redCore->K2_GetActorLocation();
+                                        for (ABP_HomeBasePad_C* pad : allPads) {
+                                            if (!pad) continue;
+                                            if (pad->GetFullName().find("Default__") != std::string::npos) continue;
+                                            FVector pLoc = pad->K2_GetActorLocation();
+                                            float dB = (pLoc.X - bcLoc.X)*(pLoc.X - bcLoc.X)
+                                                     + (pLoc.Y - bcLoc.Y)*(pLoc.Y - bcLoc.Y);
+                                            float dR = (pLoc.X - rcLoc.X)*(pLoc.X - rcLoc.X)
+                                                     + (pLoc.Y - rcLoc.Y)*(pLoc.Y - rcLoc.Y);
+                                            if (dB < dR) g_blueHomeBasePad = pad;
+                                            else         g_redHomeBasePad = pad;
+                                        }
+                                        if (g_blueHomeBasePad && g_redHomeBasePad) {
+                                            g_homeBasePadDiscovered = true;
+#if F4_LOG_LEVEL >= 2
+                                            FVector blueP = g_blueHomeBasePad->K2_GetActorLocation();
+                                            FVector redP = g_redHomeBasePad->K2_GetActorLocation();
+                                            std::cout << "[HOMEBASEPAD-DISC] BluePad pos=("
+                                                << (int)(blueP.X/100.0f) << "," << (int)(blueP.Y/100.0f) << ")"
+                                                << " RedPad pos=(" << (int)(redP.X/100.0f) << "," << (int)(redP.Y/100.0f) << ")"
+                                                << " T=" << (int)matchTimeB << "s" << std::endl;
+#endif
+                                        }
+                                    }
+
+                                    ABP_HomeBasePad_C* friendlyHomeBasePad = bIsBlueTeam
+                                        ? g_blueHomeBasePad : g_redHomeBasePad;
+
+                                    UBotObjective* postTpObj = *reinterpret_cast<UBotObjective**>(
+                                        reinterpret_cast<uintptr_t>(bot) + 0x0748);
+
+                                    if (postTpObj == nullptr && friendlyHomeBasePad && MoveFunc) {
+                                        struct {
+                                            class AActor* G; float R; bool S; bool P; bool C;
+                                            uint8 Pad[1]; void* F; bool A; uint8 RV; uint8 Pad2[6];
+                                        } postTpParams{};
+                                        postTpParams.G = friendlyHomeBasePad;
+                                        postTpParams.R = 500.0f;
+                                        postTpParams.S = true;
+                                        postTpParams.P = true;
+                                        postTpParams.C = true;
+                                        postTpParams.A = true;
+                                        bot->ProcessEvent(MoveFunc, &postTpParams);
+
+                                    }
+                                }
+
+                                {
+                                    const char* curPath = "C";
+                                    const std::string& prevPath = g_lastRecallPath[bot];
+                                    if (prevPath != curPath) {
+                                        g_lastRecallPath[bot] = curPath;
+                                    }
+                                }
+                                continue;
+                            }
+                        }
+                    }
+                    if (!g_lastRecallPath[bot].empty()) {
+                        g_lastRecallPath.erase(bot);
+                    }
+
+
+                    if (bDoingBoss && threatenedFriendlyTower != nullptr && bestThreatenedTowerTier >= 3) {
+                        if (BossAbortThreatStartTime.find(botTeam) == BossAbortThreatStartTime.end()) {
+                            BossAbortThreatStartTime[botTeam] = matchTimeB;
+                        }
+                        float threatDuration = matchTimeB - BossAbortThreatStartTime[botTeam];
+                        float requiredPersistence = (bestThreatenedTowerTier >= 4) ? 2.0f : 4.0f;
+
+                        if (threatDuration >= requiredPersistence) {
+                            bool bBossAlmostDead = false;
+                            if (activeBossTarget) {
+                                float bossHp = 1000.0f, bossMaxHp = 1000.0f;
+                                if (getHealthFunc) activeBossTarget->ProcessEvent(getHealthFunc, &bossHp);
+                                if (getMaxHealthFunc) activeBossTarget->ProcessEvent(getMaxHealthFunc, &bossMaxHp);
+                                float bossPct = (bossMaxHp > 0.0f) ? (bossHp / bossMaxHp) : 1.0f;
+                                if (activeBossTarget == orbPrime && bossPct < 0.05f) bBossAlmostDead = true;
+                                else if (activeBossTarget == fangtooth && bossPct < 0.10f) bBossAlmostDead = true;
+                            }
+                            if (bestThreatenedTowerTier >= 4) {
+                                bDoingBoss = false;
+                                BossWaitStartTime[bot] = 0.0f;
+                            }
+                            else if (!bBossAlmostDead) {
+                                bDoingBoss = false;
+                                BossWaitStartTime[bot] = 0.0f;
+                            }
+                        }
+                    }
+
+                    int currentDeadEnemyInhibs = bIsBlueTeam ? deadInhibitorsRed : deadInhibitorsBlue;
+                    int currentDeadEnemies = bIsBlueTeam ? deadRed : deadBlue;
+                    if (bDoingBoss && currentDeadEnemyInhibs > 0) {
+                        if (currentDeadEnemyInhibs >= 2 || (currentDeadEnemyInhibs == 1 && currentDeadEnemies >= 2)) {
+                            bDoingBoss = false;
+                            BossWaitStartTime[bot] = 0.0f;
+
+                        }
+                    }
+                    bool bHasRealEnemy = (bestEnemyHero && closestEnemyHeroDistSq < 6250000.0f) ||
+                        (bestEnemyMinion && closestEnemyMinionDistSq < 4840000.0f);
+
+                    if (!bIsFleeing) {
+
+                        if (bDoingBoss && activeBossTarget) {
+                            FVector bossLoc = activeBossTarget->K2_GetActorLocation();
+                            float distToBossSq = (bossLoc.X - botLoc.X) * (bossLoc.X - botLoc.X) +
+                                (bossLoc.Y - botLoc.Y) * (bossLoc.Y - botLoc.Y) +
+                                (bossLoc.Z - botLoc.Z) * (bossLoc.Z - botLoc.Z);
+
+                            std::string targetName = activeBossTarget->GetFullName();
+
+                            std::string bossCharName = botChar->GetFullName();
+                            bool bIsMeleeForBoss = (bossCharName.find("Steel") != std::string::npos
+                                || bossCharName.find("WarDrum") != std::string::npos
+                                || bossCharName.find("Chains") != std::string::npos
+                                || bossCharName.find("Kwang") != std::string::npos
+                                || bossCharName.find("Grux") != std::string::npos
+                                || bossCharName.find("Tomahawk") != std::string::npos
+                                || bossCharName.find("FallenAngel") != std::string::npos
+                                || bossCharName.find("Rampage") != std::string::npos
+                                || bossCharName.find("Vamp") != std::string::npos
+                                || bossCharName.find("Justice") != std::string::npos
+                                || bossCharName.find("Kurohane") != std::string::npos
+                                || bossCharName.find("Sword") != std::string::npos
+                                || bossCharName.find("Crunch") != std::string::npos
+                                || bossCharName.find("Mudang") != std::string::npos
+                                || bossCharName.find("Hammer") != std::string::npos
+                                || bossCharName.find("Wukong") != std::string::npos
+                                || bossCharName.find("Ice") != std::string::npos
+                                || bossCharName.find("Femme") != std::string::npos
+                                || bossCharName.find("ArcBlade") != std::string::npos);
+
+                            if (LastMacroAction[bot] != "Boss" || LastMacroTargetName[bot] != targetName) {
+
+                                UBotObjective* existingObj = *reinterpret_cast<UBotObjective**>(
+                                    reinterpret_cast<uintptr_t>(bot) + 0x0748);
+                                if (!existingObj || !JCClass || !existingObj->IsA(JCClass)) {
+                                    if (JCClass && StaticConstructObject) {
+                                        uint32_t* fl = reinterpret_cast<uint32_t*>(reinterpret_cast<uintptr_t>(JCClass) + 0xB4);
+                                        uint32_t sv = *fl; *fl &= ~0x01u;
+                                        UObject* nObj = StaticConstructObject(JCClass, CommanderObj, FName(), 0, 0, nullptr, false, nullptr, false);
+                                        *fl = sv;
+                                        if (nObj) {
+                                            existingObj = reinterpret_cast<UBotObjective*>(nObj);
+                                            *reinterpret_cast<UBotObjective**>(reinterpret_cast<uintptr_t>(bot) + 0x0748) = existingObj;
+                                            *reinterpret_cast<UObject**>(reinterpret_cast<uintptr_t>(existingObj) + 0x0128) = CommanderObj;
+                                        }
+                                    }
+                                }
+                                if (existingObj) {
+                                    *reinterpret_cast<UObject**>(reinterpret_cast<uintptr_t>(existingObj) + 0x50) = nullptr;
+                                    *reinterpret_cast<AActor**>(reinterpret_cast<uintptr_t>(existingObj) + 0x00A0) = activeBossTarget;
+                                }
+                                RotationTargetEnemy.erase(bot);
+                                RotationStartTime.erase(bot);
+                                LastMacroAction[bot] = "Boss"; LastMacroTargetName[bot] = targetName;
+                            }
+
+
+                            int requiredAllies = (activeBossTarget == orbPrime) ? 3 : 2;
+
+                            if (distToBossSq < 2560000.0f) {
+                                bIsRotatingToObjective = false;
+                                int alliesAtBossCheck = 0;
+
+                                for (AOrionChar* otherChar : AllChars) {
+                                    if (otherChar && otherChar->GetFullName().find("Default__") == std::string::npos) {
+
+                                        if (otherChar->GetHealth() > 0.0f && otherChar->TeamNum == botTeam) {
+
+                                            FVector otherLoc = otherChar->K2_GetActorLocation();
+                                            if (((otherLoc.X - bossLoc.X) * (otherLoc.X - bossLoc.X) +
+                                                (otherLoc.Y - bossLoc.Y) * (otherLoc.Y - bossLoc.Y) +
+                                                (otherLoc.Z - bossLoc.Z) * (otherLoc.Z - bossLoc.Z)) < 2890000.0f) {
+
+                                                alliesAtBossCheck++;
+                                            }
+                                        }
+                                    }
+                                }
+
+                                float currentBossHpCheck = 1000.0f, maxBossHpCheck = 1000.0f;
+                                if (getHealthFunc && getMaxHealthFunc) {
+                                    activeBossTarget->ProcessEvent(getHealthFunc, &currentBossHpCheck);
+                                    activeBossTarget->ProcessEvent(getMaxHealthFunc, &maxBossHpCheck);
+                                }
+                                float bossHpPct = (maxBossHpCheck > 0.0f) ? (currentBossHpCheck / maxBossHpCheck) : 1.0f;
+
+                                bool bBossLowHp = false;
+                                if (activeBossTarget == orbPrime && bossHpPct < 0.05f) bBossLowHp = true;
+                                else if (activeBossTarget == fangtooth && bossHpPct < 0.10f) bBossLowHp = true;
+
+                                if (bBossLowHp || alliesAtBossCheck >= requiredAllies) {
+                                    BossWaitStartTime[bot] = 0.0f;
+
+                                    bool bEnemyThreateningBoss = false;
+                                    if (bestEnemyHero && closestEnemyHeroDistSq < 4840000.0f) {
+                                        bEnemyThreateningBoss = true;
+                                    }
+
+                                    if (bEnemyThreateningBoss) {
+                                        bot->K2_SetIgnoreEnemies(false);
+                                        bIsActivelyFighting = true;
+                                        moveTarget = nullptr;
+                                        if (FlippedCreep.count(bot) && FlippedCreep[bot]) {
+                                            bool bAnyoneElseNeedsIt = false;
+                                            for (auto& fp : FlippedCreep) {
+                                                if (fp.first != bot && fp.second == FlippedCreep[bot]) {
+                                                    bAnyoneElseNeedsIt = true;
+                                                    break;
+                                                }
+                                            }
+                                            if (!bAnyoneElseNeedsIt) {
+                                                FlippedCreep[bot]->TeamNum = EOrionTeam::TeamCreep;
+                                            }
+                                            FlippedCreep[bot] = nullptr;
+                                        }
+                                        LastSetEnemyTarget[bot] = "";
+                                    }
+                                    else {
+                                        float currentBossHp = 1000.0f, maxBossHp = 1000.0f;
+                                        if (getHealthFunc && getMaxHealthFunc) {
+                                            activeBossTarget->ProcessEvent(getHealthFunc, &currentBossHp);
+                                            activeBossTarget->ProcessEvent(getMaxHealthFunc, &maxBossHp);
+                                        }
+                                        bool bBossIsAwake = (currentBossHp < maxBossHp);
+
+                                        if (!bBossIsAwake) {
+                                            if (distToBossSq > 250000.0f) {
+                                                if (bIsMeleeForBoss) {
+                                                    bot->K2_SetIgnoreEnemies(true);
+                                                    bIsRotatingToObjective = true;
+                                                    bIsActivelyFighting = false;
+                                                    moveTarget = activeBossTarget;
+                                                    accRadius = 200.0f;
+                                                    BotIdleTicks[bot] = 10;
+                                                }
+                                                else {
+                                                    bot->K2_SetIgnoreEnemies(false);
+                                                    bIsRotatingToObjective = false;
+                                                    bIsActivelyFighting = true;
+                                                    moveTarget = nullptr;
+                                                }
+
+                                                if (distToBossSq < 9000000.0f) {
+                                                    EOrionTeam curTeam = activeBossTarget->TeamNum;
+                                                    if (curTeam == EOrionTeam::TeamCreep) {
+                                                        activeBossTarget->TeamNum = enemyTeam;
+                                                        FlippedCreep[bot] = reinterpret_cast<AOrionChar*>(activeBossTarget);
+                                                    }
+                                                    else if (curTeam == enemyTeam) {
+                                                        FlippedCreep[bot] = reinterpret_cast<AOrionChar*>(activeBossTarget);
+                                                    }
+                                                    else if (curTeam == botTeam) {
+                                                        activeBossTarget->TeamNum = enemyTeam;
+                                                        FlippedCreep[bot] = reinterpret_cast<AOrionChar*>(activeBossTarget);
+                                                    }
+                                                }
+
+                                                if (!bIsMeleeForBoss) {
+                                                    AActor* currentNativeBossP1Sneak = nullptr;
+                                                    if (GetEnemyCharacterFunc) {
+                                                        struct { class AActor* ReturnValue; } gepBossP1S{};
+                                                        gepBossP1S.ReturnValue = nullptr;
+                                                        bot->ProcessEvent(GetEnemyCharacterFunc, &gepBossP1S);
+                                                        currentNativeBossP1Sneak = gepBossP1S.ReturnValue;
+                                                    }
+                                                    if (currentNativeBossP1Sneak != activeBossTarget) {
+                                                        bot->K2_SetEnemy(activeBossTarget);
+                                                        LastSetEnemyTarget[bot] = targetName;
+                                                        if (activeBossTarget
+                                                            && activeBossTarget->TeamNum == enemyTeam) {
+                                                            *reinterpret_cast<AOrionChar**>(
+                                                                reinterpret_cast<uintptr_t>(bot) + 0x0640) =
+                                                                reinterpret_cast<AOrionChar*>(activeBossTarget);
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                            else {
+                                                bot->K2_SetIgnoreEnemies(false);
+                                                bIsActivelyFighting = true;
+                                                moveTarget = nullptr;
+
+                                                {
+                                                    EOrionTeam curTeam = activeBossTarget->TeamNum;
+                                                    if (curTeam == EOrionTeam::TeamCreep) {
+                                                        activeBossTarget->TeamNum = enemyTeam;
+                                                        FlippedCreep[bot] = reinterpret_cast<AOrionChar*>(activeBossTarget);
+                                                    }
+                                                    else if (curTeam == enemyTeam) {
+                                                        FlippedCreep[bot] = reinterpret_cast<AOrionChar*>(activeBossTarget);
+                                                    }
+                                                    else if (curTeam == botTeam) {
+                                                        activeBossTarget->TeamNum = enemyTeam;
+                                                        FlippedCreep[bot] = reinterpret_cast<AOrionChar*>(activeBossTarget);
+                                                    }
+                                                }
+
+                                                AActor* currentNativeBossP1 = nullptr;
+                                                if (GetEnemyCharacterFunc) {
+                                                    struct { class AActor* ReturnValue; } gepBossP1{};
+                                                    gepBossP1.ReturnValue = nullptr;
+                                                    bot->ProcessEvent(GetEnemyCharacterFunc, &gepBossP1);
+                                                    currentNativeBossP1 = gepBossP1.ReturnValue;
+                                                }
+                                                if (currentNativeBossP1 != activeBossTarget) {
+                                                    bot->K2_SetEnemy(activeBossTarget);
+                                                    LastSetEnemyTarget[bot] = targetName;
+                                                    if (activeBossTarget
+                                                        && activeBossTarget->TeamNum == enemyTeam) {
+                                                        *reinterpret_cast<AOrionChar**>(
+                                                            reinterpret_cast<uintptr_t>(bot) + 0x0640) =
+                                                            reinterpret_cast<AOrionChar*>(activeBossTarget);
+                                                    }
+                                                }
+
+
+                                            }
+
+                                        }
+else {
+    bot->K2_SetIgnoreEnemies(false);
+    bIsActivelyFighting = true;
+
+
+    if (!bIsMeleeForBoss) {
+        moveTarget = nullptr;
+    }
+    else {
+        if (distToBossSq > 250000.0f) {
+            moveTarget = activeBossTarget;
+            accRadius = 200.0f;
+            BotIdleTicks[bot] = 10;
+        }
+        else {
+            moveTarget = nullptr;
+        }
+    }
+
+                                            {
+                                                EOrionTeam curTeam = activeBossTarget->TeamNum;
+                                                if (curTeam == EOrionTeam::TeamCreep) {
+                                                    activeBossTarget->TeamNum = enemyTeam;
+                                                    FlippedCreep[bot] = reinterpret_cast<AOrionChar*>(activeBossTarget);
+                                                }
+                                                else if (curTeam == enemyTeam) {
+                                                    FlippedCreep[bot] = reinterpret_cast<AOrionChar*>(activeBossTarget);
+                                                }
+                                                else if (curTeam == botTeam) {
+                                                    activeBossTarget->TeamNum = enemyTeam;
+                                                    FlippedCreep[bot] = reinterpret_cast<AOrionChar*>(activeBossTarget);
+                                                }
+                                            }
+
+
+                                            AActor* currentNativeBossP2 = nullptr;
+                                            if (GetEnemyCharacterFunc) {
+                                                struct { class AActor* ReturnValue; } gepBossP2{};
+                                                gepBossP2.ReturnValue = nullptr;
+                                                bot->ProcessEvent(GetEnemyCharacterFunc, &gepBossP2);
+                                                currentNativeBossP2 = gepBossP2.ReturnValue;
+                                            }
+                                            if (currentNativeBossP2 != activeBossTarget) {
+                                                bot->K2_SetEnemy(activeBossTarget);
+                                                LastSetEnemyTarget[bot] = targetName;
+                                                if (activeBossTarget
+                                                    && activeBossTarget->TeamNum == enemyTeam) {
+                                                    *reinterpret_cast<AOrionChar**>(
+                                                        reinterpret_cast<uintptr_t>(bot) + 0x0640) =
+                                                        reinterpret_cast<AOrionChar*>(activeBossTarget);
+                                                }
+                                            }
+
+          }
+
+                                        }
+
+                                }
+                                else {
+
+                                    bool bEmergencyWakeUp = (CombatTimer[bot] > 0.0f) || (bestEnemyHero && closestEnemyHeroDistSq < 4000000.0f);
+
+                                    if (bEmergencyWakeUp) {
+                                        bot->K2_SetIgnoreEnemies(false);
+                                        bIsActivelyFighting = true;
+                                        moveTarget = nullptr;
+                                    }
+                                    else {
+                                        bot->K2_SetIgnoreEnemies(true);
+                                        bIsRotatingToObjective = true;
+
+                                        if (BossWaitStartTime.find(bot) == BossWaitStartTime.end() || BossWaitStartTime[bot] == 0.0f) {
+                                            BossWaitStartTime[bot] = matchTimeB;
+                                        }
+
+                                        float waitTime = matchTimeB - BossWaitStartTime[bot];
+
+                                        int closestAllyDistM = 999;
+                                        for (AOrionChar* otherChar : AllChars) {
+                                            if (!otherChar || otherChar == botChar) continue;
+                                            if (otherChar->GetFullName().find("Default__") != std::string::npos) continue;
+                                            if (otherChar->GetHealth() <= 0.0f) continue;
+                                            if (otherChar->TeamNum != botTeam) continue;
+                                            AOrionAIBot* otherBot = reinterpret_cast<AOrionAIBot*>(otherChar->Controller);
+                                            if (otherBot) {
+                                                auto itAct = LastMacroAction.find(otherBot);
+                                                if (itAct != LastMacroAction.end() && itAct->second == "Recall") continue;
+                                            }
+                                            FVector oLoc = otherChar->K2_GetActorLocation();
+                                            float dx = oLoc.X - bossLoc.X;
+                                            float dy = oLoc.Y - bossLoc.Y;
+                                            int distM = (int)(sqrt(dx*dx + dy*dy) / 100.0f);
+                                            if (distM < closestAllyDistM) closestAllyDistM = distM;
+                                        }
+
+                                        float dynamicTimeout;
+                                        if (closestAllyDistM > 50)        dynamicTimeout = 30.0f;
+                                        else if (closestAllyDistM <= 20)  dynamicTimeout = 60.0f;
+                                        else {
+                                            float factor = (50.0f - (float)closestAllyDistM) / 30.0f;
+                                            dynamicTimeout = 30.0f + (30.0f * factor);
+                                        }
+                                        if (dynamicTimeout > 60.0f) dynamicTimeout = 60.0f;
+
+
+                                        if (waitTime > dynamicTimeout) {
+                                            bot->K2_SetIgnoreEnemies(false);
+
+                                            if (bIsBlueTeam) TeamBlueBossBanTimer = matchTimeB + 30.0f;
+                                            else TeamRedBossBanTimer = matchTimeB + 30.0f;
+
+                                            BossWaitStartTime[bot] = 0.0f;
+                                            bDoingBoss = false;
+
+                                            LastMacroAction[bot] = "";
+                                            LastMacroTargetName[bot] = "";
+#if F4_LOG_LEVEL >= 2
+                                            {
+                                                std::cout << "[BOSS-TIMEOUT-EXIT] bot=" << botChar->GetFullName().substr(0, 30) << " bIsRotating=" << bIsRotatingToObjective << std::endl;
+                                            }
+#endif
+                                        }
+                                        else {
+                                            moveTarget = activeBossTarget;
+                                            accRadius = bIsMeleeForBoss ? 800.0f : 1500.0f;
+                                        }
+                                    }
+                                }
+                            }
+                            else {
+
+                                bool bEmergencyWakeUp = (CombatTimer[bot] > 0.0f) || (bestEnemyHero && closestEnemyHeroDistSq < 4000000.0f);
+
+                                if (bEmergencyWakeUp) {
+                                    bot->K2_SetIgnoreEnemies(false);
+                                    bIsRotatingToObjective = false;
+                                    bIsActivelyFighting = true;
+                                    moveTarget = nullptr;
+                                }
+                                else {
+                                    bot->K2_SetIgnoreEnemies(true);
+
+                                    BossWaitStartTime[bot] = 0.0f;
+                                    bIsRotatingToObjective = true;
+                                    moveTarget = activeBossTarget;
+                                    accRadius = bIsMeleeForBoss ? 800.0f : 1400.0f;
+                                    BotIdleTicks[bot] = 10;
+
+                                }
+                            }
+
+                        }
+
+else if (bIsJungler) {
+
+                            float jglWhyCampPct  = -1.0f;
+                            int   jglWhyProgress = -1;
+                            float jglWhyStalled  = -1.0f;
+
+       if (LastMacroAction[bot] == "Gank"
+           && LastGankTargetPtr.count(bot) && LastGankTargetPtr[bot])
+       {
+           bool bGankWillBeInterrupted = bDoingBoss
+               || (threatenedFriendlyTower != nullptr)
+               || ((bLateGame || bestEnemyTowerTier == 0) && bestEnemyTower);
+           if (bGankWillBeInterrupted) {
+               GankCooldownPerTarget[LastGankTargetPtr[bot]] = matchTimeB + 45.0f;
+               LastGankTargetPtr[bot] = nullptr;
+               LastMacroAction[bot] = "";
+               LastMacroTargetName[bot] = "";
+           }
+       }
+
+                            bool bShouldDefend = false;
+
+                            if (threatenedFriendlyTower) {
+
+                                std::string threatName = threatenedFriendlyTower->GetFullName();
+
+                                std::transform(threatName.begin(), threatName.end(), threatName.begin(), ::tolower);
+
+                                int currentDefenders = TowerDefenders[threatenedFriendlyTower];
+
+                                int maxDefenders = (threatName.find("core") != std::string::npos) ? 5 :
+
+                                    (threatName.find("bluetower_") != std::string::npos || threatName.find("redtower_") != std::string::npos) ? 4 :
+
+                                    (bLateGame) ? 3 : 2;
+
+
+                                if (currentDefenders < maxDefenders) {
+
+                                    bShouldDefend = true; TowerDefenders[threatenedFriendlyTower]++;
+
+                                }
+
+                            }
+
+
+
+                            bool bEnemyUnderTower = false;
+
+                            float gankTargetHpPct = 1.0f;
+
+
+                            if (bestGankTarget) {
+
+
+                                float curHp = 0.0f, maxHp = 1000.0f;
+
+                                if (getHealthFunc) bestGankTarget->ProcessEvent(getHealthFunc, &curHp);
+
+                                if (getMaxHealthFunc) bestGankTarget->ProcessEvent(getMaxHealthFunc, &maxHp);
+
+                                if (maxHp > 0.0f) gankTargetHpPct = curHp / maxHp;
+
+
+                                FVector eLoc = bestGankTarget->K2_GetActorLocation();
+
+                                for (AOrionDamageableObjective_Base* t : AllTowers) {
+                                    if (!t) continue;
+
+                                    if (t->TeamNum == enemyTeam && t->GetHealth() > 0.0f) {
+
+                                        FVector tLoc = t->K2_GetActorLocation();
+
+                                        if (((tLoc.X - eLoc.X) * (tLoc.X - eLoc.X) + (tLoc.Y - eLoc.Y) * (tLoc.Y - eLoc.Y) + (tLoc.Z - eLoc.Z) * (tLoc.Z - eLoc.Z)) < 4000000.0f) {
+
+                                            bEnemyUnderTower = true; break;
+
+                                        }
+
+                                    }
+
+                                }
+
+                            }
+
+
+                            bool bCampCommitment = (bestJungleCreep && closestJungleDistSq < 4000000.0f);
+
+
+                            bool bWorthDiving = (bEnemyUnderTower && gankTargetHpPct < 0.35f);
+                            bool bAlreadyGanking = (LastMacroAction[bot] == "Gank" && bestGankTarget && bestGankTargetDistSq < 16000000.0f && (!bEnemyUnderTower || bWorthDiving));
+
+                            float requiredGankScore = bJunglerLanePhase ? 15.0f : 45.0f;
+                            bool bCanInterruptCamp = bJunglerLanePhase;
+                            bool q1dNow = bestGankTarget && q1dEligible(bestGankTarget, bestGankTargetDistSq);
+                            if (q1dNow) { requiredGankScore = 15.0f; bCanInterruptCamp = true; }
+                            bool bIsGankable = (matchTimeB > 90.0f) && (bAlreadyGanking ||
+                                (bestGankTarget && highestGankScore > requiredGankScore && !bEnemyUnderTower &&
+                                    (bCanInterruptCamp || !bCampCommitment)));
+                            if (q1dNow && bIsGankable) g_q1dGankTgt[bot] = bestGankTarget;
+
+
+
+
+                             if (bShouldDefend) {
+                                std::string targetName = threatenedFriendlyTower->GetFullName();
+                                if (LastMacroAction[bot] != "Defend" || LastMacroTargetName[bot] != targetName) {
+
+                                    UBotObjective* existingObj = *reinterpret_cast<UBotObjective**>(
+                                        reinterpret_cast<uintptr_t>(bot) + 0x0748);
+                                    if (!existingObj || !WLClass || !existingObj->IsA(WLClass)) {
+                                        if (WLClass && StaticConstructObject) {
+                                            uint32_t* fl = reinterpret_cast<uint32_t*>(reinterpret_cast<uintptr_t>(WLClass) + 0xB4);
+                                            uint32_t sv = *fl; *fl &= ~0x01u;
+                                            UObject* nObj = StaticConstructObject(WLClass, CommanderObj, FName(), 0, 0, nullptr, false, nullptr, false);
+                                            *fl = sv;
+                                            if (nObj) {
+                                                existingObj = reinterpret_cast<UBotObjective*>(nObj);
+                                                *reinterpret_cast<UBotObjective**>(reinterpret_cast<uintptr_t>(bot) + 0x0748) = existingObj;
+                                                *reinterpret_cast<UObject**>(reinterpret_cast<uintptr_t>(existingObj) + 0x0128) = CommanderObj;
+                                            }
+                                        }
+                                    }
+                                    if (existingObj) {
+                                        if (BT_DefendTower) *reinterpret_cast<UObject**>(reinterpret_cast<uintptr_t>(existingObj) + 0x50) = BT_DefendTower;
+                                        *reinterpret_cast<AActor**>(reinterpret_cast<uintptr_t>(existingObj) + 0x00A0) = threatenedFriendlyTower;
+                                        *reinterpret_cast<AOrionDamageableObjective_Base**>(reinterpret_cast<uintptr_t>(existingObj) + 0x0130) = threatenedFriendlyTower;
+                                    }
+
+                                    LastMacroAction[bot] = "Defend"; LastMacroTargetName[bot] = targetName;
+                                }
+                                moveTarget = threatenedFriendlyTower; accRadius = 800.0f;
+                                {
+                                    std::string cdLow = targetName;
+                                    std::transform(cdLow.begin(), cdLow.end(), cdLow.begin(), ::tolower);
+                                    bool cdInhib = (cdLow.find("bluetower_") != std::string::npos || cdLow.find("redtower_") != std::string::npos);
+                                    bool cdCore  = (cdLow.find("core") != std::string::npos);
+                                    if (cdInhib || cdCore) {
+                                        FVector cdLoc = threatenedFriendlyTower->K2_GetActorLocation();
+                                        float cdDistSq = (cdLoc.X - botLoc.X)*(cdLoc.X - botLoc.X) + (cdLoc.Y - botLoc.Y)*(cdLoc.Y - botLoc.Y) + (cdLoc.Z - botLoc.Z)*(cdLoc.Z - botLoc.Z);
+                                        bool cdFar = (cdDistSq > COLLAPSE_TRAVEL_DIST_SQ);
+                                        int cdDeadEnInh = bIsBlueTeam ? deadInhibitorsRed : deadInhibitorsBlue;
+                                        int cdDeadEn    = bIsBlueTeam ? deadRed : deadBlue;
+                                        bool cdV45Win   = (cdDeadEnInh >= 2) || (cdDeadEnInh >= 1 && cdDeadEn >= 2);
+                                        bool cdPoNR     = (bestEnemyTowerTier == 0) && cdV45Win && (closestEnemyTowerDistSq < 9000000.0f);
+                                        bool cdPersistOK = g_collapseThreatStart.count(threatenedFriendlyTower)
+                                                        && (matchTimeB - g_collapseThreatStart[threatenedFriendlyTower]) >= COLLAPSE_PERSIST_SEC;
+                                        bool cdContinue  = g_collapseStartTime.count(bot)
+                                                        && (matchTimeB - g_collapseStartTime[bot]) < COLLAPSE_COMMIT_SEC
+                                                        && cdFar && !cdPoNR;
+                                        bool cdReachable = (!ENABLE_COLLAPSE_DIST_CAP) || (cdDistSq < COLLAPSE_MAX_DIST_SQ);
+                                        int cdFrH18 = 0, cdEnH18 = 0;
+                                        bool cdActiveHeroFight = (CombatTimer.count(bot) && CombatTimer[bot] > 0.0f && bestEnemyHero && closestEnemyHeroDistSq < 3240000.0f);
+                                        if (ENABLE_COLLAPSE_FIGHT_GATE && cdActiveHeroFight) {
+                                            for (const CachedChar& cc : LiveChars) {
+                                                if (!cc.bIsHero || cc.bIsNeutral) continue;
+                                                if (cc.ptr == botChar) continue;
+                                                float cdqh = (cc.loc.X - botLoc.X)*(cc.loc.X - botLoc.X) + (cc.loc.Y - botLoc.Y)*(cc.loc.Y - botLoc.Y);
+                                                if (cdqh >= 3240000.0f) continue;
+                                                if (cc.team == botTeam) cdFrH18++; else cdEnH18++;
+                                            }
+                                        }
+                                        bool cdInWinningFight = ENABLE_COLLAPSE_FIGHT_GATE && cdActiveHeroFight && (cdFrH18 >= cdEnH18);
+                                        bool cdStart = cdFar && cdReachable && !cdInWinningFight && !cdPoNR && cdPersistOK;
+                                        if (cdStart || cdContinue) {
+                                            if (!cdContinue) g_collapseStartTime[bot] = matchTimeB;
+                                            if (!(BotIsBlind.count(bot) && BotIsBlind[bot])) bot->K2_SetIgnoreEnemies(true);
+                                            bIsRotatingToObjective = true;
+                                            bIsIdle = true; BotIdleTicks[bot] = 10;
+#if F4_LOG_LEVEL >= 1
+                                            {
+                                                static std::map<AOrionAIBot*, float> cdLastLog;
+                                                static std::map<AOrionAIBot*, int>   cdLastDistM;
+                                                int cdM = (int)(sqrt(cdDistSq) / 100.0f);
+                                                if (!cdLastLog.count(bot) || (matchTimeB - cdLastLog[bot]) > 2.0f) {
+                                                    int cdPrevM = cdLastDistM.count(bot) ? cdLastDistM[bot] : -1;
+                                                    std::string cdShort = targetName; size_t cdsp = cdShort.rfind('.');
+                                                    if (cdsp != std::string::npos) cdShort = cdShort.substr(cdsp + 1);
+                                                    if (cdShort.length() > 22) cdShort = cdShort.substr(0, 22);
+                                                    std::cout << "[COLLAPSE-DEFEND] bot=" << botChar->GetFullName().substr(0, 24)
+                                                        << " R=" << roleSlot << " Tier=" << (cdCore ? 4 : 3)
+                                                        << " distM=" << cdM << " prevM=" << cdPrevM
+                                                        << " deltaM=" << (cdPrevM >= 0 ? cdPrevM - cdM : 0)
+                                                        << " blind=" << ((BotIsBlind.count(bot) && BotIsBlind[bot]) ? 1 : 0)
+                                                        << " persistS=" << (int)(matchTimeB - g_collapseThreatStart[threatenedFriendlyTower])
+                                                        << " committed=" << (cdContinue ? 1 : 0)
+                                                        << " V44=" << (bV44Threatened ? 1 : 0)
+                                                        << " Twr=" << cdShort << " T=" << (int)matchTimeB << "s" << std::endl;
+                                                    cdLastLog[bot] = matchTimeB; cdLastDistM[bot] = cdM;
+                                                }
+                                            }
+#endif
+                                        } else {
+                                            bool cdWasCommitted = (g_collapseStartTime.count(bot) > 0);
+                                            g_collapseStartTime.erase(bot);
+#if F4_LOG_LEVEL >= 1
+                                            if (cdWasCommitted && !cdFar) {
+                                                std::cout << "[COLLAPSE-DEFEND] ARRIVE bot=" << botChar->GetFullName().substr(0, 24)
+                                                    << " R=" << roleSlot << " distM=" << (int)(sqrt(cdDistSq) / 100.0f)
+                                                    << " T=" << (int)matchTimeB << "s" << std::endl;
+                                            }
+#endif
+                                        }
+                                    }
+                                }
+                            }
+
+                             else if (LastMacroAction[bot] == "Gank" && !bIsGankable) {
+                                 if (LastGankTargetPtr.count(bot) && LastGankTargetPtr[bot]) {
+                                         GankCooldownPerTarget[LastGankTargetPtr[bot]] = matchTimeB + ((ENABLE_Q1E_SHORT_CD_NOARRIVE && !(g_gankArrived.count(bot) && g_gankArrived[bot])) ? Q1E_NOARRIVE_CD_S : 45.0f);
+                                 }
+                                 LastGankTargetPtr[bot] = nullptr;
+                                 g_gankArrived.erase(bot);
+                                 LastMacroAction[bot] = "";
+                                 LastMacroTargetName[bot] = "";
+                             }
+                            else if (bIsGankable) {
+                                std::string targetName = bestGankTarget->GetFullName();
+
+                                if (LastMacroAction[bot] != "Gank" || LastMacroTargetName[bot] != targetName) {
+                                    if (LastGankTargetPtr.count(bot) && LastGankTargetPtr[bot]
+                                        && LastGankTargetPtr[bot] != bestGankTarget) {
+                                        GankCooldownPerTarget[LastGankTargetPtr[bot]] = matchTimeB + 45.0f;
+                                    }
+                                    LastGankTargetPtr[bot] = bestGankTarget;
+                                    GankEngaged[bot] = false;
+                                    g_gankArrived.erase(bot);
+                                    g_gankJumpTime.erase(bot);
+
+
+                                    UBotObjective* existingObj = *reinterpret_cast<UBotObjective**>(
+                                        reinterpret_cast<uintptr_t>(bot) + 0x0748);
+                                    if (!existingObj || !GKClass || !existingObj->IsA(GKClass)) {
+                                        if (GKClass && StaticConstructObject) {
+                                            uint32_t* fl = reinterpret_cast<uint32_t*>(reinterpret_cast<uintptr_t>(GKClass) + 0xB4);
+                                            uint32_t sv = *fl; *fl &= ~0x01u;
+                                            UObject* nObj = StaticConstructObject(GKClass, CommanderObj, FName(), 0, 0, nullptr, false, nullptr, false);
+                                            *fl = sv;
+                                            if (nObj) {
+                                                existingObj = reinterpret_cast<UBotObjective*>(nObj);
+                                                *reinterpret_cast<UBotObjective**>(reinterpret_cast<uintptr_t>(bot) + 0x0748) = existingObj;
+                                                *reinterpret_cast<UObject**>(reinterpret_cast<uintptr_t>(existingObj) + 0x0128) = CommanderObj;
+                                            }
+                                        }
+                                    }
+                                    if (existingObj) {
+                                        if (BT_GoToObjective) *reinterpret_cast<UObject**>(reinterpret_cast<uintptr_t>(existingObj) + 0x50) = BT_GoToObjective;
+                                        AOrionCharHero* gankHero = reinterpret_cast<AOrionCharHero*>(bestGankTarget);
+                                        *reinterpret_cast<AActor**>(reinterpret_cast<uintptr_t>(existingObj) + 0x00A0) = bestGankTarget;
+                                        *reinterpret_cast<AOrionCharHero**>(reinterpret_cast<uintptr_t>(existingObj) + 0x0130) = gankHero;
+                                        *reinterpret_cast<AOrionCharHero**>(reinterpret_cast<uintptr_t>(existingObj) + 0x0138) = gankHero;
+                                    }
+
+                                    LastMacroAction[bot] = "Gank";
+                                    LastMacroTargetName[bot] = targetName;
+                                }
+
+                                UBotObjective* currentObj = *reinterpret_cast<UBotObjective**>(
+                                    reinterpret_cast<uintptr_t>(bot) + 0x0748);
+
+                                if (currentObj && GKClass && currentObj->IsA(GKClass)) {
+                                    AOrionCharHero* gankHero = reinterpret_cast<AOrionCharHero*>(bestGankTarget);
+                                    *reinterpret_cast<AOrionCharHero**>(
+                                        reinterpret_cast<uintptr_t>(currentObj) + 0x0130) = gankHero;
+                                    *reinterpret_cast<AOrionCharHero**>(
+                                        reinterpret_cast<uintptr_t>(currentObj) + 0x0138) = gankHero;
+                                }
+
+                                constexpr float GANK_ENGAGE_ENTER_SQ = 4840000.0f;
+                                constexpr float GANK_ENGAGE_EXIT_SQ  = 9000000.0f;
+                                bool gankWasEngaged = GankEngaged.count(bot) && GankEngaged[bot];
+                                bool gankEngaged = gankWasEngaged
+                                    ? (bestGankTargetDistSq <= GANK_ENGAGE_EXIT_SQ)
+                                    : (bestGankTargetDistSq <= GANK_ENGAGE_ENTER_SQ);
+                                GankEngaged[bot] = gankEngaged;
+                                if (gankEngaged) g_gankArrived[bot] = true;
+                                if (!gankEngaged) {
+                                    bIsRotatingToObjective = true;
+                                    BotIdleTicks[bot] = 10;
+                                    moveTarget = bestGankTarget;
+                                    accRadius = 100.0f;
+                                }
+                                else {
+                                    bIsActivelyFighting = true;
+                                    moveTarget = nullptr;
+
+                                    if (BotIsBlind.count(bot) && BotIsBlind[bot]) {
+                                        bot->K2_SetIgnoreEnemies(false);
+                                        BotIsBlind[bot] = false;
+                                    }
+
+                                    if (currentObj && BT_AttackObjective)
+                                        *reinterpret_cast<UObject**>(
+                                            reinterpret_cast<uintptr_t>(currentObj) + 0x50) = BT_AttackObjective;
+
+                                    AActor* currentNativeTarget = nullptr;
+                                    if (GetEnemyCharacterFunc) {
+                                        struct { class AActor* ReturnValue; } getEnemyParams{};
+                                        getEnemyParams.ReturnValue = nullptr;
+                                        bot->ProcessEvent(GetEnemyCharacterFunc, &getEnemyParams);
+                                        currentNativeTarget = getEnemyParams.ReturnValue;
+                                    }
+
+
+
+                                    if (currentNativeTarget != bestGankTarget) {
+                                        bot->K2_SetEnemy(bestGankTarget);
+                                    }
+
+                                    constexpr float GANK_JUMP_MIN_SQ = 90000.0f;
+                                    constexpr float GANK_JUMP_MAX_SQ = 3240000.0f;
+                                    constexpr float GANK_JUMP_CD     = 3.0f;
+                                    bool gjNeedsHeal = (BotNeedsHeal.count(bot) && BotNeedsHeal[bot]) || bNeedsTacticalRecall;
+                                    bool gjBlind     = (BotIsBlind.count(bot) && BotIsBlind[bot]);
+                                    if (g_gankJumpTime.count(bot) == 0) g_gankJumpTime[bot] = matchTimeB - GANK_JUMP_CD - 1.0f;
+                                    if (!gjNeedsHeal && !gjBlind
+                                        && bestGankTargetDistSq >= GANK_JUMP_MIN_SQ
+                                        && bestGankTargetDistSq <= GANK_JUMP_MAX_SQ
+                                        && (matchTimeB - g_gankJumpTime[bot]) >= GANK_JUMP_CD) {
+                                        UObject* gjMc = *reinterpret_cast<UObject**>(reinterpret_cast<uintptr_t>(botChar) + 0x0380);
+                                        if (gjMc) {
+                                            static UFunction* fnGjLaunch = nullptr;
+                                            if (!fnGjLaunch)
+                                                fnGjLaunch = UObject::FindObject<UFunction>("Function OrionGame.OrionCharMovementComponent.LaunchToPoint");
+                                            if (fnGjLaunch) {
+                                                FVector gjHero = bestGankTarget->K2_GetActorLocation();
+                                                float dX = gjHero.X - botLoc.X, dY = gjHero.Y - botLoc.Y, L = sqrtf(dX * dX + dY * dY);
+                                                if (L > 1.0f) {
+                                                    float gjJumpDist = L - 100.0f;
+                                                    if (gjJumpDist > 600.0f) gjJumpDist = 600.0f;
+                                                    if (gjJumpDist < 100.0f) gjJumpDist = 100.0f;
+                                                    struct LaunchPointParams { FVector EndPoint; float LaunchVelocityXY; bool bLockAirControl; uint8_t _pad11[3]; } gjlp{};
+                                                    gjlp.EndPoint.X = botLoc.X + (dX / L) * gjJumpDist;
+                                                    gjlp.EndPoint.Y = botLoc.Y + (dY / L) * gjJumpDist;
+                                                    gjlp.EndPoint.Z = botLoc.Z;
+                                                    gjlp.LaunchVelocityXY = 700.0f;
+                                                    gjlp.bLockAirControl = false;
+                                                    bool gjWallSkip = false;
+                                                    {
+                                                        static UFunction* fnGjRay = nullptr;
+                                                        if (!fnGjRay)
+                                                            fnGjRay = UObject::FindObject<UFunction>("Function Engine.NavigationSystem.NavigationRaycast");
+                                                        UObject* gjNavCDO = fnGjRay ? reinterpret_cast<UObject*>(SDK::UNavigationSystem::GetDefaultObj()) : nullptr;
+                                                        if (fnGjRay && gjNavCDO && IsValidUE4Object(gjNavCDO)) {
+                                                            SDK::Params::NavigationSystem_NavigationRaycast gjray{};
+                                                            gjray.WorldContextObject = botChar;
+                                                            gjray.RayStart = botLoc;
+                                                            gjray.RayEnd = gjlp.EndPoint;
+                                                            gjray.HitLocation = botLoc;
+                                                            gjray.Querier = reinterpret_cast<decltype(gjray.Querier)>(bot);
+                                                            gjNavCDO->ProcessEvent(fnGjRay, &gjray);
+                                                            float gjdhx = gjray.HitLocation.X - botLoc.X, gjdhy = gjray.HitLocation.Y - botLoc.Y;
+                                                            float gjdex = gjray.RayEnd.X - botLoc.X, gjdey = gjray.RayEnd.Y - botLoc.Y;
+                                                            float gjDistHit = sqrtf(gjdhx * gjdhx + gjdhy * gjdhy);
+                                                            float gjDistEnd = sqrtf(gjdex * gjdex + gjdey * gjdey);
+                                                            gjWallSkip = gjray.ReturnValue && (gjDistHit > 100.0f) && (gjDistHit < gjDistEnd - 150.0f);
+                                                        }
+                                                    }
+                                                    bool gjTowerSkip = false;
+                                                    for (AOrionDamageableObjective_Base* gjTwr : AllTowers) {
+                                                        if (!gjTwr || gjTwr->TeamNum != enemyTeam || gjTwr->GetHealth() <= 0.0f) continue;
+                                                        if (gjTwr->GetFullName().find("Default__") != std::string::npos) continue;
+                                                        FVector gjTwrLoc = gjTwr->K2_GetActorLocation();
+                                                        float gjtdx = gjTwrLoc.X - gjlp.EndPoint.X, gjtdy = gjTwrLoc.Y - gjlp.EndPoint.Y;
+                                                        if (gjtdx * gjtdx + gjtdy * gjtdy < 3240000.0f) { gjTowerSkip = true; break; }
+                                                    }
+                                                    if (!gjWallSkip && !gjTowerSkip) {
+                                                        gjMc->ProcessEvent(fnGjLaunch, &gjlp);
+                                                        g_gankJumpTime[bot] = matchTimeB;
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+
+
+                            }
+                            else if ((bLateGame || bestEnemyTowerTier == 0) && bestEnemyTower) {
+
+                                std::string targetName = bestEnemyTower->GetFullName();
+
+                                if (LastMacroAction[bot] != "Attack" || LastMacroTargetName[bot] != targetName) {
+
+                                    UBotObjective* existingObj = *reinterpret_cast<UBotObjective**>(
+                                        reinterpret_cast<uintptr_t>(bot) + 0x0748);
+                                    if (!existingObj || !WLClass || !existingObj->IsA(WLClass)) {
+                                        if (WLClass && StaticConstructObject) {
+                                            uint32_t* fl = reinterpret_cast<uint32_t*>(reinterpret_cast<uintptr_t>(WLClass) + 0xB4);
+                                            uint32_t sv = *fl; *fl &= ~0x01u;
+                                            UObject* nObj = StaticConstructObject(WLClass, CommanderObj, FName(), 0, 0, nullptr, false, nullptr, false);
+                                            *fl = sv;
+                                            if (nObj) {
+                                                existingObj = reinterpret_cast<UBotObjective*>(nObj);
+                                                *reinterpret_cast<UBotObjective**>(reinterpret_cast<uintptr_t>(bot) + 0x0748) = existingObj;
+                                                *reinterpret_cast<UObject**>(reinterpret_cast<uintptr_t>(existingObj) + 0x0128) = CommanderObj;
+                                            }
+                                        }
+                                    }
+                                    if (existingObj) {
+                                        if (BT_AttackTower) *reinterpret_cast<UObject**>(reinterpret_cast<uintptr_t>(existingObj) + 0x50) = BT_AttackTower;
+                                        *reinterpret_cast<AActor**>(reinterpret_cast<uintptr_t>(existingObj) + 0x00A0) = bestEnemyTower;
+                                        *reinterpret_cast<AOrionDamageableObjective_Base**>(reinterpret_cast<uintptr_t>(existingObj) + 0x0130) = bestEnemyTower;
+                                    }
+
+                                    LastMacroAction[bot] = "Attack"; LastMacroTargetName[bot] = targetName;
+                                }
+
+                                if (bInsideEnemyTurretGlobal && !bIsSafeToPush) {
+                                    moveTarget = closestFriendlyTower ? closestFriendlyTower : friendlyCore;
+                                    accRadius = 1500.0f;
+                                    bIsActivelyFighting = false;
+                                    bIsFleeing = true;
+                                }
+                                else if (!bIsSafeToPush) {
+                                    if (bestFriendlyEscortMinion && closestFriendlyMinionDistSq < 36000000.0f) {
+                                        moveTarget = bestFriendlyEscortMinion;
+                                        accRadius = 600.0f;
+                                    }
+                                    else {
+                                        moveTarget = bestEnemyTower;
+                                        accRadius = 1800.0f;
+                                    }
+                                    bIsActivelyFighting = false;
+                                }
+                                else {
+                                    if (!bHasRealEnemy) {
+                                        if (bestFriendlyEscortMinion) {
+                                            moveTarget = bestFriendlyEscortMinion;
+                                            accRadius = 300.0f;
+                                        }
+                                        else {
+                                            moveTarget = bestEnemyTower;
+                                            accRadius = 800.0f;
+                                        }
+                                        bIsActivelyFighting = false;
+                                    }
+                                    else {
+                                        bIsActivelyFighting = true;
+                                        moveTarget = nullptr;
+                                    }
+                                }
+                            }
+
+                            else if (bestJungleCreep && (closestJungleDistSq < 64000000.0f || distToFriendlyCoreSq < 36000000.0f || bQ1SideCamp)) {
+
+                                std::string targetName = bestJungleCreep->GetFullName();
+
+                                if (LastMacroAction[bot] != "Jungle" || LastMacroTargetName[bot] != targetName) {
+
+                                    UBotObjective* existingObj = *reinterpret_cast<UBotObjective**>(
+                                        reinterpret_cast<uintptr_t>(bot) + 0x0748);
+                                    if (!existingObj || !JCClass || !existingObj->IsA(JCClass)) {
+                                        if (JCClass && StaticConstructObject) {
+                                            uint32_t* fl = reinterpret_cast<uint32_t*>(reinterpret_cast<uintptr_t>(JCClass) + 0xB4);
+                                            uint32_t sv = *fl; *fl &= ~0x01u;
+                                            UObject* nObj = StaticConstructObject(JCClass, CommanderObj, FName(), 0, 0, nullptr, false, nullptr, false);
+                                            *fl = sv;
+                                            if (nObj) {
+                                                existingObj = reinterpret_cast<UBotObjective*>(nObj);
+                                                *reinterpret_cast<UBotObjective**>(reinterpret_cast<uintptr_t>(bot) + 0x0748) = existingObj;
+                                                *reinterpret_cast<UObject**>(reinterpret_cast<uintptr_t>(existingObj) + 0x0128) = CommanderObj;
+                                            }
+                                        }
+                                    }
+                                    if (existingObj) {
+                                        if (BT_AttackObjective) *reinterpret_cast<UObject**>(reinterpret_cast<uintptr_t>(existingObj) + 0x50) = BT_AttackObjective;
+                                        *reinterpret_cast<AActor**>(reinterpret_cast<uintptr_t>(existingObj) + 0x00A0) = bestJungleCreep;
+                                    }
+
+                                    LastMacroAction[bot] = "Jungle"; LastMacroTargetName[bot] = targetName;
+                                }
+
+
+
+                                float realDistSq = (bestJungleCreep->K2_GetActorLocation().X - botLoc.X) * (bestJungleCreep->K2_GetActorLocation().X - botLoc.X) +
+                                    (bestJungleCreep->K2_GetActorLocation().Y - botLoc.Y) * (bestJungleCreep->K2_GetActorLocation().Y - botLoc.Y) +
+                                    (bestJungleCreep->K2_GetActorLocation().Z - botLoc.Z) * (bestJungleCreep->K2_GetActorLocation().Z - botLoc.Z);
+
+
+                                if (realDistSq < 90000.0f) {
+                                    bool bRealHeroNearby = (bestEnemyHero && closestEnemyHeroDistSq < 6250000.0f);
+                                    std::string creepName = bestJungleCreep->GetFullName();
+
+                                    if (bRealHeroNearby) {
+                                        if (FlippedCreep.count(bot) && FlippedCreep[bot]) {
+                                            FlippedCreep[bot]->TeamNum = EOrionTeam::TeamCreep;
+                                            FlippedCreep[bot] = nullptr;
+                                        }
+                                        bot->K2_SetEnemy(bestEnemyHero);
+                                        bIsActivelyFighting = true;
+                                        moveTarget = nullptr;
+                                    }
+                                    else {
+                                        if (bestJungleCreep->TeamNum == EOrionTeam::TeamCreep) {
+                                            bestJungleCreep->TeamNum = enemyTeam;
+                                        }
+                                        FlippedCreep[bot] = bestJungleCreep;
+                                        if (LastSetEnemyTarget[bot] != creepName || !bHasNativeTarget) {
+                                            bot->K2_SetEnemy(bestJungleCreep);
+                                            LastSetEnemyTarget[bot] = creepName;
+                                        }
+                                        bIsActivelyFighting = true;
+                                        moveTarget = nullptr;
+
+                                        {
+                                            float wChp = 0.0f, wCmh = 1.0f;
+                                            if (getHealthFunc)    bestJungleCreep->ProcessEvent(getHealthFunc, &wChp);
+                                            if (getMaxHealthFunc) bestJungleCreep->ProcessEvent(getMaxHealthFunc, &wCmh);
+                                            jglWhyCampPct = (wCmh > 0.0f) ? (wChp / wCmh) : 1.0f;
+                                            bool wSame = JungleCampHpSnapPtr.count(bot)
+                                                && JungleCampHpSnapPtr[bot] == bestJungleCreep;
+                                            bool wHave = JungleCampHpSnap.count(bot);
+                                            jglWhyProgress = (wSame && wHave
+                                                && jglWhyCampPct < JungleCampHpSnap[bot] - 0.01f) ? 1 : 0;
+                                            if (wSame && wHave && JungleCampHpSnapTime.count(bot))
+                                                jglWhyStalled = matchTimeB - JungleCampHpSnapTime[bot];
+                                            if (!wSame || !wHave || jglWhyProgress == 1) {
+                                                JungleCampHpSnapPtr[bot]  = bestJungleCreep;
+                                                JungleCampHpSnap[bot]     = jglWhyCampPct;
+                                                JungleCampHpSnapTime[bot] = matchTimeB;
+                                            }
+                                        }
+
+                                        constexpr bool  JS_REPATH_ENABLED = true;
+                                        constexpr float JS_REPATH_STALL   = 4.0f;
+                                        constexpr float JS_REPATH_GAP     = 4.0f;
+                                        if (JS_REPATH_ENABLED && jglWhyStalled >= JS_REPATH_STALL
+                                            && (matchTimeB - (g_jglRepathT.count(bot) ? g_jglRepathT[bot] : -999.0f)) >= JS_REPATH_GAP) {
+                                            UObject* rpMc = *reinterpret_cast<UObject**>(reinterpret_cast<uintptr_t>(botChar) + 0x0380);
+                                            static UFunction* fnRpLaunch = nullptr;
+                                            if (!fnRpLaunch)
+                                                fnRpLaunch = UObject::FindObject<UFunction>("Function OrionGame.OrionCharMovementComponent.LaunchToPoint");
+                                            if (rpMc && fnRpLaunch) {
+                                                FVector campLoc = bestJungleCreep->K2_GetActorLocation();
+                                                float awX = botLoc.X - campLoc.X, awY = botLoc.Y - campLoc.Y, aL = sqrtf(awX * awX + awY * awY);
+                                                if (aL > 1.0f) {
+                                                    struct LaunchPointParams { FVector EndPoint; float LaunchVelocityXY; bool bLockAirControl; uint8_t _pad11[3]; } rplp{};
+                                                    rplp.EndPoint.X = botLoc.X + (awX / aL) * 400.0f;
+                                                    rplp.EndPoint.Y = botLoc.Y + (awY / aL) * 400.0f;
+                                                    rplp.EndPoint.Z = botLoc.Z;
+                                                    rplp.LaunchVelocityXY = 600.0f;
+                                                    rplp.bLockAirControl = false;
+                                                    bool rpWallSkip = false;
+                                                    {
+                                                        static UFunction* fnRpRay = nullptr;
+                                                        if (!fnRpRay)
+                                                            fnRpRay = UObject::FindObject<UFunction>("Function Engine.NavigationSystem.NavigationRaycast");
+                                                        UObject* rpNavCDO = fnRpRay ? reinterpret_cast<UObject*>(SDK::UNavigationSystem::GetDefaultObj()) : nullptr;
+                                                        if (fnRpRay && rpNavCDO && IsValidUE4Object(rpNavCDO)) {
+                                                            SDK::Params::NavigationSystem_NavigationRaycast rpray{};
+                                                            rpray.WorldContextObject = botChar;
+                                                            rpray.RayStart = botLoc;
+                                                            rpray.RayEnd = rplp.EndPoint;
+                                                            rpray.HitLocation = botLoc;
+                                                            rpray.Querier = reinterpret_cast<decltype(rpray.Querier)>(bot);
+                                                            rpNavCDO->ProcessEvent(fnRpRay, &rpray);
+                                                            float rdhx = rpray.HitLocation.X - botLoc.X, rdhy = rpray.HitLocation.Y - botLoc.Y;
+                                                            float rdex = rpray.RayEnd.X - botLoc.X, rdey = rpray.RayEnd.Y - botLoc.Y;
+                                                            float rDistHit = sqrtf(rdhx * rdhx + rdhy * rdhy);
+                                                            float rDistEnd = sqrtf(rdex * rdex + rdey * rdey);
+                                                            rpWallSkip = rpray.ReturnValue && (rDistHit > 100.0f) && (rDistHit < rDistEnd - 150.0f);
+                                                        }
+                                                    }
+                                                    if (!rpWallSkip) {
+                                                        rpMc->ProcessEvent(fnRpLaunch, &rplp);
+                                                        g_jglRepathT[bot] = matchTimeB;
+                                                    }
+                                                }
+                                            }
+                                        }
+
+                                    }
+                                }
+                                else {
+                                    if (FlippedCreep.count(bot) && FlippedCreep[bot] == bestJungleCreep) {
+                                        FlippedCreep[bot]->TeamNum = EOrionTeam::TeamCreep;
+                                        FlippedCreep[bot] = nullptr;
+                                    }
+                                    LastSetEnemyTarget[bot] = "";
+                                    moveTarget = bestJungleCreep;
+                                    accRadius = 200.0f;
+                                    BotIdleTicks[bot] = 10;
+                                }
+                                }
+                            else if (LastMacroAction[bot] == "Jungle") {
+                                LastMacroAction[bot] = "";
+                                LastMacroTargetName[bot] = "";
+                            }
+                            else if (closestFriendlyTower) {
+                                    moveTarget = closestFriendlyTower;
+                                    accRadius = 1500.0f;
+
+                                    }
+
+                        }
+                        else if (!bIsJungler) {
+
+                            int saFrM18 = 0, saFrH18 = 0, saEnM18 = 0;
+                            for (const CachedChar& cc : LiveChars) {
+                                if (cc.ptr == botChar || cc.bIsNeutral) continue;
+                                float sadx = cc.loc.X - botLoc.X, sady = cc.loc.Y - botLoc.Y;
+                                if (sadx * sadx + sady * sady >= 3240000.0f) continue;
+                                if (cc.team == botTeam)        { if (cc.bIsHero) saFrH18++; else saFrM18++; }
+                                else if (cc.team == enemyTeam) { if (!cc.bIsHero) saEnM18++; }
+                            }
+                            int saHpPct = (maxHealth > 0.0f) ? (int)(currentHealth / maxHealth * 100.0f) : -1;
+                            bool saDeepPos = closestFriendlyTower && (closestFriendlyTowerDistSq > 16000000.0f)
+                                          && (!bestEnemyHero || closestEnemyHeroDistSq > 12250000.0f)
+                                          && !bV44Threatened && !bDoingBoss && !bIsJungler
+                                          && LastMacroAction[bot] != "Recall" && LastMacroAction[bot] != "Boss"
+                                          && LastMacroAction[bot] != "Gank"   && LastMacroAction[bot] != "Defend"
+                                          && LastMacroAction[bot] != "Rotate";
+                            if (saDeepPos) { if (!g_attrEntryHP.count(bot)) g_attrEntryHP[bot] = saHpPct; }
+                            else g_attrEntryHP.erase(bot);
+                            int  saDrop = (saDeepPos && g_attrEntryHP.count(bot) && saHpPct >= 0) ? (g_attrEntryHP[bot] - saHpPct) : -1;
+                            bool saFinishExempt = (bestEnemyTowerTier == 0 || bestEnemyTowerTier == 3 || bestEnemyTowerTier == 4);
+                            bool bAttrAbort = saDeepPos && saFrM18 == 0 && saEnM18 == 0 && saFrH18 == 0
+                                           && (saDrop > 25) && !saFinishExempt;
+
+                            auto evalSiegeSafe = [&]() -> bool {
+                                bool ss =
+                                     !bLanePushVetoActive && !bHasRealEnemy && !bV44Threatened
+                                  && !bDoingBoss
+                                  && !BotNeedsHeal[bot] && !bNeedsTacticalRecall
+                                  && LastMacroAction[bot] != "Recall"
+                                  && (maxHealth > 0.0f && currentHealth / maxHealth > 0.55f)
+                                  && bestEnemyTower && closestEnemyTowerDistSq < 16000000.0f;
+                                if (!ss) return false;
+                                for (auto& lkp : LastSeenEnemyHeroTime) {
+                                    AOrionChar* th = lkp.first;
+                                    if (!th || th->TeamNum != enemyTeam || !th->PlayerState) continue;
+                                    float dt = matchTimeB - lkp.second;
+                                    if (dt > 15.0f && dt < 120.0f) {
+                                        FVector lp = LastKnownEnemyHeroPos[th];
+                                        float dsq = (lp.X - botLoc.X) * (lp.X - botLoc.X)
+                                                  + (lp.Y - botLoc.Y) * (lp.Y - botLoc.Y);
+                                        if (dsq < 25000000.0f) return false;
+                                    }
+                                }
+                                FVector ssTwr = bestEnemyTower->K2_GetActorLocation();
+                                for (const CachedChar& cc : LiveChars) {
+                                    if (cc.team != botTeam || cc.bIsHero || cc.bIsNeutral) continue;
+                                    if (cc.fullName.find("minion") == std::string::npos) continue;
+                                    float dx = cc.loc.X - ssTwr.X;
+                                    float dy = cc.loc.Y - ssTwr.Y;
+                                    float dz = cc.loc.Z - ssTwr.Z;
+                                    if (dx*dx + dy*dy + dz*dz < 6250000.0f) return true;
+                                }
+                                return false;
+                            };
+
+                            static std::map<AOrionAIBot*, bool> g_wegAActive;
+                            static std::map<AOrionAIBot*, float> lastAdvWaitOverextTime;
+                            static std::map<AOrionAIBot*, float> g_siegeAbortLockBreak;
+
+                            if (!bIsActivelyFighting && (roleSlot == 1 || roleSlot == 3) && PlaceWardFunc) {
+                                struct { bool RetVal; } wardParams{};
+                                bot->ProcessEvent(PlaceWardFunc, &wardParams);
+                            }
+                            if (LastMacroAction[bot] != "Rotate") {
+                                RotationTargetEnemy.erase(bot);
+                                RotationStartTime.erase(bot);
+                            }
+                            AOrionChar* frontMostLaneMinion = nullptr;
+                            AOrionChar* localFrontMinion = nullptr;
+                            float botToEnemyCoreSq = 0.0f;
+                            int anyLaneMinionInVoronoiPool = 0;
+                            {
+                                float localFrontToECoreSq = 1e10f;
+                                float bestFrontMinToBotSq = 1e10f;
+                                AOrionDamageableObjective_Base* myLaneAnchor =
+                                    (botPhysLane >= 0 && botPhysLane < 3)
+                                    ? frontFriendlyTowers[botPhysLane] : nullptr;
+
+                                if (myLaneAnchor && enemyCore) {
+                                    FVector anchorLoc = myLaneAnchor->K2_GetActorLocation();
+                                    FVector eCoreLoc = enemyCore->K2_GetActorLocation();
+                                    botToEnemyCoreSq =
+                                        (eCoreLoc.X - botLoc.X) * (eCoreLoc.X - botLoc.X) +
+                                        (eCoreLoc.Y - botLoc.Y) * (eCoreLoc.Y - botLoc.Y);
+
+                                    for (const CachedChar& cc : LiveChars) {
+                                        if (cc.team != botTeam) continue;
+                                        if (cc.bIsHero || cc.bIsNeutral) continue;
+                                        if (cc.fullName.find("bp_minion_lane_") == std::string::npos) continue;
+
+                                        float distToMyAnchorSq =
+                                            (cc.loc.X - anchorLoc.X) * (cc.loc.X - anchorLoc.X) +
+                                            (cc.loc.Y - anchorLoc.Y) * (cc.loc.Y - anchorLoc.Y);
+                                        bool bIsOnMyLane = true;
+                                        for (int otherLane = 0; otherLane < 3; otherLane++) {
+                                            if (otherLane == botPhysLane) continue;
+                                            if (!frontFriendlyTowers[otherLane]) continue;
+                                            FVector otherLoc = frontFriendlyTowers[otherLane]->K2_GetActorLocation();
+                                            float distToOtherSq =
+                                                (cc.loc.X - otherLoc.X) * (cc.loc.X - otherLoc.X) +
+                                                (cc.loc.Y - otherLoc.Y) * (cc.loc.Y - otherLoc.Y);
+                                            if (distToOtherSq < distToMyAnchorSq) {
+                                                bIsOnMyLane = false;
+                                                break;
+                                            }
+                                        }
+                                        if (!bIsOnMyLane) continue;
+
+                                        anyLaneMinionInVoronoiPool++;
+
+                                        float distToECoreSq =
+                                            (cc.loc.X - eCoreLoc.X) * (cc.loc.X - eCoreLoc.X) +
+                                            (cc.loc.Y - eCoreLoc.Y) * (cc.loc.Y - eCoreLoc.Y);
+                                        if (distToECoreSq >= botToEnemyCoreSq) continue;
+
+                                        float distToBotSq =
+                                            (cc.loc.X - botLoc.X) * (cc.loc.X - botLoc.X) +
+                                            (cc.loc.Y - botLoc.Y) * (cc.loc.Y - botLoc.Y);
+                                        if (distToBotSq < bestFrontMinToBotSq) {
+                                            bestFrontMinToBotSq = distToBotSq;
+                                            frontMostLaneMinion = cc.ptr;
+                                        }
+                                        if (distToBotSq < 6250000.0f && distToECoreSq < localFrontToECoreSq) {
+                                            localFrontToECoreSq = distToECoreSq;
+                                            localFrontMinion = cc.ptr;
+                                        }
+                                    }
+                                }
+                            }
+                            bool bStickyRetreat = false;
+                            if (ENABLE_HOLD_STICKY
+                                && ((lastThreatRetreatTime.count(bot) && (matchTimeB - lastThreatRetreatTime[bot] < 2.5f)))
+                                && LastMacroAction[bot] != "Rotate"
+                                && !(bestEnemyTowerTier == 0 || bestEnemyTowerTier == 3 || bestEnemyTowerTier == 4)) {
+                                bool bStickyAllyHeroNear = false;
+                                for (const CachedChar& cc : LiveChars) {
+                                    if (!cc.bIsHero || cc.bIsNeutral || cc.team != botTeam) continue;
+                                    if (cc.ptr == botChar) continue;
+                                    float dqh = (cc.loc.X - botLoc.X) * (cc.loc.X - botLoc.X)
+                                              + (cc.loc.Y - botLoc.Y) * (cc.loc.Y - botLoc.Y);
+                                    if (dqh < 6250000.0f) { bStickyAllyHeroNear = true; break; }
+                                }
+                                bStickyRetreat = !bStickyAllyHeroNear;
+                            }
+                            if (bStickyRetreat) {
+                                frontMostLaneMinion = nullptr;
+                                if (ENABLE_SOLO1V1_STICKY) localFrontMinion = nullptr;
+                            }
+                            bool bShouldDefend = false;
+
+                            if (threatenedFriendlyTower) {
+                                bool bIsValidDefense = true;
+
+                                if (!bLateGame) {
+                                    std::string tName = threatenedFriendlyTower->GetFullName();
+                                    std::string threatNameLower = tName;
+                                    std::transform(threatNameLower.begin(), threatNameLower.end(), threatNameLower.begin(), ::tolower);
+
+                                    bool bIsCore = (threatNameLower.find("core") != std::string::npos);
+                                    bool bIsInhibitor = (threatNameLower.find("bluetower_") != std::string::npos || threatNameLower.find("redtower_") != std::string::npos);
+                                    bool bIsCoreOrInhib = (bIsCore || bIsInhibitor);
+
+                                    bool bThreatIsBlue = (threatenedFriendlyTower->TeamNum == EOrionTeam::TeamBlue);
+                                    int threatTowerPhysLane = 1;
+
+                                    if (threatNameLower.find("_left_") != std::string::npos || threatNameLower.find("tower_0") != std::string::npos) {
+                                        threatTowerPhysLane = bThreatIsBlue ? 0 : 2;
+                                    }
+                                    else if (threatNameLower.find("_right_") != std::string::npos || threatNameLower.find("tower_2") != std::string::npos) {
+                                        threatTowerPhysLane = bThreatIsBlue ? 2 : 0;
+                                    }
+
+                                    bool bIsMyLaneTower = (botPhysLane == threatTowerPhysLane);
+
+                                    if (!bIsCoreOrInhib && !bIsMyLaneTower) {
+                                        FVector tLoc = threatenedFriendlyTower->K2_GetActorLocation();
+                                        float distToTowerSq = (tLoc.X - botLoc.X) * (tLoc.X - botLoc.X) + (tLoc.Y - botLoc.Y) * (tLoc.Y - botLoc.Y) + (tLoc.Z - botLoc.Z) * (tLoc.Z - botLoc.Z);
+                                        if (distToTowerSq > 64000000.0f) {
+                                            bIsValidDefense = false;
+                                        }
+                                        int laneDiffCD = botPhysLane - threatTowerPhysLane; if (laneDiffCD < 0) laneDiffCD = -laneDiffCD;
+                                        if (laneDiffCD >= 2) bIsValidDefense = false;
+                                    }
+                                }
+
+                                if (bIsValidDefense) {
+                                    std::string threatName = threatenedFriendlyTower->GetFullName();
+                                    std::transform(threatName.begin(), threatName.end(), threatName.begin(), ::tolower);
+
+                                    bool bDefendIsCore = (threatName.find("core") != std::string::npos);
+                                    bool bDefendIsInhib = (threatName.find("bluetower_") != std::string::npos ||
+                                        threatName.find("redtower_") != std::string::npos);
+
+                                    if (bLateGame && !bDefendIsCore && !bDefendIsInhib) {
+                                        bIsValidDefense = false;
+                                    }
+
+                                    if (bIsValidDefense) {
+                                        int currentDefenders = TowerDefenders[threatenedFriendlyTower];
+
+                                        int maxDefenders;
+                                        if (bDefendIsCore) {
+                                            maxDefenders = 4;
+                                        }
+                                        else if (bDefendIsInhib) {
+                                            maxDefenders = bLateGame ? 3 : 4;
+                                        }
+                                        else {
+                                            maxDefenders = 2;
+                                        }
+
+                                        if (currentDefenders < maxDefenders) {
+                                            bShouldDefend = true;
+                                            TowerDefenders[threatenedFriendlyTower]++;
+                                        }
+                                    }
+                                }
+                            }
+                            int         rF3Want = 0;
+                            AActor*     rF3Tgt  = nullptr;
+                            float       rF3AccR = RWH_ACCR;
+                            const char* rF3Kind = "none";
+                            int   rF3FrM18 = -1, rF3EnM18 = -1, rF3HeroHP = -1;
+                            int   rOffEnH = -1, rOffFrH = -1, rOffHeroTwrM = -1;
+                            float rOffStopBehindM = -999.0f;
+                            AOrionChar* rOffTgtHero = nullptr;
+                            float       rOffTgtSq   = -1.0f;
+                            int         rOffBindHP  = -1;
+                            auto rCnt18 = [&](int& frM, int& enM, int& frH, int& enH) {
+                                frM = 0; enM = 0; frH = 0; enH = 0;
+                                for (const CachedChar& cc : LiveChars) {
+                                    if (cc.ptr == botChar) continue;
+                                    float sx = cc.loc.X - botLoc.X, sy = cc.loc.Y - botLoc.Y;
+                                    if (sx * sx + sy * sy >= 3240000.0f) continue;
+                                    if (cc.bIsHero) { if (cc.team == enemyTeam) enH++; else if (cc.team == botTeam) frH++; }
+                                    else if (!cc.bIsNeutral) { if (cc.team == botTeam) frM++; else if (cc.team == enemyTeam) enM++; }
+                                }
+                            };
+                            auto rMiaCount = [&]() -> int {
+                                int n = 0;
+                                for (auto& lkp : LastSeenEnemyHeroTime) {
+                                    AOrionChar* th = lkp.first;
+                                    if (!th || th->TeamNum != enemyTeam || !th->PlayerState) continue;
+                                    float dt = matchTimeB - lkp.second;
+                                    if (dt > ROFF_MIA_MIN_S && dt < ROFF_MIA_MAX_S) {
+                                        FVector lp = LastKnownEnemyHeroPos[th];
+                                        float dsq = (lp.X - botLoc.X) * (lp.X - botLoc.X) + (lp.Y - botLoc.Y) * (lp.Y - botLoc.Y);
+                                        if (dsq < ROFF_MIA_SQ) n++;
+                                    }
+                                }
+                                return n;
+                            };
+                            auto rPartnerRetreating = [&](AOrionChar* pc) -> bool {
+                                if (!pc || !pc->Controller) return false;
+                                AOrionAIBot* pb = reinterpret_cast<AOrionAIBot*>(pc->Controller);
+                                return (BotIsBlind.count(pb) && BotIsBlind[pb]) || (g_wfbUntil.count(pb) && matchTimeB < g_wfbUntil[pb])
+                                    || RRetreatRecent(pb, matchTimeB, nullptr);
+                            };
+                            if ((ENABLE_R_WAVE_HOLD || ENABLE_R_TOWER_DIST || ENABLE_R_OFFENSE) && !bIsMeleeChar && !bIsJungler && botChar && enemyCore && maxHealth > 0.0f) {
+                                int f3FrH = 0, f3EnH = 0;
+                                for (const CachedChar& cc : LiveChars) {
+                                    if (!cc.bIsHero || cc.ptr == botChar) continue;
+                                    float sx = cc.loc.X - botLoc.X, sy = cc.loc.Y - botLoc.Y;
+                                    if (sx * sx + sy * sy >= 3240000.0f) continue;
+                                    if (cc.team == enemyTeam) f3EnH++; else if (cc.team == botTeam) f3FrH++;
+                                }
+                                int f3HeroHP = -1;
+                                if (bestEnemyHero) for (const CachedChar& mc : LiveChars) { if (mc.ptr != bestEnemyHero) continue; f3HeroHP = (mc.maxHealth > 0.0f) ? (int)((mc.health / mc.maxHealth) * 100.0f) : -1; break; }
+                                float f3BotHP  = (currentHealth / maxHealth) * 100.0f;
+                                bool  f3Kill   = RKillLage(AllTowers, bestEnemyHero, f3HeroHP, f3BotHP, f3EnH > f3FrH + 1, closestEnemyHeroDistSq);
+                                bool  f3Hero18 = bestEnemyHero && closestEnemyHeroDistSq <= RBR_HERO_MAX_SQ;
+                                bool  f3Hero8  = bestEnemyHero && closestEnemyHeroDistSq <= RWH_HERO_RSB_SQ;
+                                int f3FrM18 = 0, f3EnM18 = 0, f3FrHc = 0, f3EnHc = 0;
+                                rCnt18(f3FrM18, f3EnM18, f3FrHc, f3EnHc);
+                                rF3FrM18 = f3FrM18; rF3EnM18 = f3EnM18; rF3HeroHP = f3HeroHP;
+                                const char* f3RecentSrc = "-";
+                                bool f3Recent = RRetreatRecent(bot, matchTimeB, &f3RecentSrc);
+                                bool  f3TierOk = bestEnemyTower && (bestEnemyTowerTier == 1 || bestEnemyTowerTier == 2);
+                                bool  f3WfbWin = ENABLE_WAVE_FALLBACK && g_wfbUntil.count(bot) && matchTimeB < g_wfbUntil[bot];
+                                bool  f3Free   = (LastMacroAction[bot] == "TowerObjective") && !(BotIsBlind.count(bot) && BotIsBlind[bot]) && !f3WfbWin
+                                              && !bV44Threatened && !bDoingBoss && !bIsRotatingToObjective;
+                                AOrionChar* f3Deep = nullptr; float f3DeepSq = 0.0f;
+                                if (rearWaveAnchor && rwAnchorSub >= RWH_MIN_SUB) {
+                                    float f3TipCoreM = sqrtf((rearWaveAnchorLoc.X - enemyCoreLoc.X) * (rearWaveAnchorLoc.X - enemyCoreLoc.X)
+                                                           + (rearWaveAnchorLoc.Y - enemyCoreLoc.Y) * (rearWaveAnchorLoc.Y - enemyCoreLoc.Y));
+                                    AOrionDamageableObjective_Base* f3LaneTwr = (botPhysLane >= 0 && botPhysLane < 3) ? frontFriendlyTowers[botPhysLane] : nullptr;
+                                    FVector f3LaneLoc = f3LaneTwr ? f3LaneTwr->K2_GetActorLocation() : FVector();
+                                    for (const CachedChar& cc : LiveChars) {
+                                        if (cc.team != botTeam || cc.bIsHero || cc.bIsNeutral) continue;
+                                        if (cc.fullName.find("bp_minion_lane_") == std::string::npos) continue;
+                                        float cCoreM = sqrtf((cc.loc.X - enemyCoreLoc.X) * (cc.loc.X - enemyCoreLoc.X) + (cc.loc.Y - enemyCoreLoc.Y) * (cc.loc.Y - enemyCoreLoc.Y));
+                                        if (cCoreM - f3TipCoreM < RWH_DEEP_MIN_CM) continue;
+                                        float bx = cc.loc.X - botLoc.X, by = cc.loc.Y - botLoc.Y;
+                                        float dSq = bx * bx + by * by;
+                                        if (dSq > 16000000.0f) continue;
+                                        if (f3LaneTwr) {
+                                            float toMineSq = (cc.loc.X - f3LaneLoc.X) * (cc.loc.X - f3LaneLoc.X) + (cc.loc.Y - f3LaneLoc.Y) * (cc.loc.Y - f3LaneLoc.Y);
+                                            bool onMyLane = true;
+                                            for (int oL = 0; oL < 3; oL++) {
+                                                if (oL == botPhysLane || !frontFriendlyTowers[oL]) continue;
+                                                FVector oLoc = frontFriendlyTowers[oL]->K2_GetActorLocation();
+                                                if ((cc.loc.X - oLoc.X) * (cc.loc.X - oLoc.X) + (cc.loc.Y - oLoc.Y) * (cc.loc.Y - oLoc.Y) < toMineSq) { onMyLane = false; break; }
+                                            }
+                                            if (!onMyLane) continue;
+                                        }
+                                        if (!f3Deep || dSq < f3DeepSq) { f3Deep = cc.ptr; f3DeepSq = dSq; }
+                                    }
+                                }
+                                bool f3WhDanger = f3Hero18 || (bestEnemyMinion && closestEnemyMinionDistSq <= RWH_ENMIN_SQ)
+                                               || (f3TierOk && closestEnemyTowerDistSq < RWH_ENTWR_SQ);
+                                bool f3WhPos    = rearWaveAnchor && rwAnchorSub >= RWH_MIN_SUB && rwAheadM25 == 0 && rearWaveAnchorDistSq >= RWH_TIP_MIN_SQ;
+                                bool f3OwnUe    = ENABLE_R_OWNUE_SELF ? ROwnHeroUe(f3FrH, f3EnH) : (f3FrH >= f3EnH + 1);
+                                bool f3MinNow    = (f3FrM18 >= f3EnM18 + 1);
+                                bool f3FreeCons  = g_rwhFreeT.count(bot) && (matchTimeB - g_rwhFreeT[bot]) <= 1.5f;
+                                g_rwhFreeN[bot]  = f3MinNow ? ((f3FreeCons && g_rwhFreeN.count(bot)) ? (g_rwhFreeN[bot] + 1) : 1) : 0;
+                                g_rwhFreeT[bot]  = matchTimeB;
+                                bool f3TwrExempt = RWH_MINGATE_TWR_EXEMPT && f3TierOk && closestEnemyTowerDistSq < RWH_ENTWR_SQ;
+                                bool f3MinFree   = ENABLE_R_WH_MINGATE && g_rwhFreeN[bot] >= RWH_FREE_TICKS && !f3TwrExempt && !f3Recent;
+                                bool f3TradeBase  = ENABLE_R_WH_TRADE && bestEnemyHero && f3HeroHP >= 0 && (float)f3HeroHP <= RWH_TRADE_HERO_HP
+                                                 && f3BotHP >= (float)f3HeroHP + RWH_TRADE_LEAD && !(f3EnH > f3FrH + 1)
+                                                 && closestEnemyTowerDistSq >= TOWER_SAFE_SQ && !f3Recent
+                                                 && (g_rwhOnT.count(bot) || (f3Free && f3TierOk && f3WhPos));
+                                bool f3TradeMin   = f3FrM18 >= f3EnM18;
+                                bool f3TradeXWant = ENABLE_R_WH_ESCALATE && RWHX_TRADE_GUARD && f3Hero18 && !f3TradeMin;
+                                bool f3Trade = false, f3TradeX = false;
+                                if (f3TradeBase && (f3TradeMin || f3TradeXWant) && GetEnemyCharacterFunc
+                                    && RHeroOwnTowerSq(AllTowers, bestEnemyHero) > RKILL_HERO_TWR_SQ) {
+                                    struct { class AActor* ReturnValue; } f3Tp{}; f3Tp.ReturnValue = nullptr;
+                                    bot->ProcessEvent(GetEnemyCharacterFunc, &f3Tp);
+                                    bool f3TpHero = (f3Tp.ReturnValue != nullptr && f3Tp.ReturnValue == static_cast<AActor*>(bestEnemyHero));
+                                    if (f3TradeMin) f3Trade = f3TpHero; else f3TradeX = f3TpHero;
+                                }
+                                rF3TradeX = (f3Trade || f3TradeX) && f3Hero18;
+                                bool f3WhLage   = ENABLE_R_WAVE_HOLD && f3Free && f3TierOk && f3WhPos && f3WhDanger
+                                               && !f3Kill && !f3OwnUe && !f3Hero8 && f3Deep && !f3MinFree && !f3Trade;
+                                const char* f3WhWhy = nullptr;
+                                if (g_rwhOnT.count(bot)) {
+                                    if (f3WhDanger) g_rwhDangerT[bot] = matchTimeB;
+                                    g_rwhAheadN[bot] = (rwAheadM25 >= 1) ? (g_rwhAheadN[bot] + 1) : 0;
+                                    if (!g_rwhOwnT.count(bot) || (matchTimeB - g_rwhOwnT[bot]) > 1.5f)     f3WhWhy = "owner";
+                                    else if (!f3Free)                                                         f3WhWhy = "free";
+                                    else if (f3Kill)                                                          f3WhWhy = "kill";
+                                    else if (f3Trade)                                                         f3WhWhy = "trade";
+                                    else if (f3OwnUe)                                                         f3WhWhy = "ownUe";
+                                    else if (f3Hero8)                                                         f3WhWhy = "hero8";
+                                    else if (f3MinFree)                                                       f3WhWhy = (f3EnM18 == 0) ? "enM0" : "minUe";
+                                    else if (g_rwhAheadN[bot] >= 2)                                           f3WhWhy = "wave";
+                                    else if ((matchTimeB - g_rwhDangerT[bot]) >= RWH_DANGER_GONE_S)           f3WhWhy = "safe";
+                                    else if (!f3Deep)                                                         f3WhWhy = "tgtGone";
+                                    else if ((matchTimeB - g_rwhOnT[bot]) >= RWH_TIMEOUT_S)                   f3WhWhy = "timeout";
+                                    if (f3WhWhy) {
+#if F4_LOG_LEVEL >= 1
+                                        AActor* f3Nat = nullptr;
+                                        if (GetEnemyCharacterFunc) { struct { class AActor* ReturnValue; } np{}; np.ReturnValue = nullptr; bot->ProcessEvent(GetEnemyCharacterFunc, &np); f3Nat = np.ReturnValue; }
+                                        std::cout << "[R-WH] END bot=" << botChar->GetFullName() << " Team=" << (bIsBlueTeam ? "B" : "R") << " R=" << roleSlot
+                                            << " why=" << f3WhWhy << " heldS=" << (int)(matchTimeB - g_rwhOnT[bot])
+                                            << " tipM=" << (rearWaveAnchor ? (int)(sqrtf(rearWaveAnchorDistSq) / 100.0f) : -1) << " ahead=" << rwAheadM25 << " sub=" << rwAnchorSub
+                                            << " heroM=" << (bestEnemyHero ? (int)(sqrtf(closestEnemyHeroDistSq) / 100.0f) : -1)
+                                            << " enTwrM=" << (bestEnemyTower ? (int)(sqrtf(closestEnemyTowerDistSq) / 100.0f) : -1)
+                                            << " natTgt=" << (f3Nat == nullptr ? "NULL" : (static_cast<AActor*>(bestEnemyHero) == f3Nat ? "Hero" : "other"))
+                                            << " inTurret=" << (bInsideEnemyTurretGlobal ? 1 : 0)
+                                            << " FrM18/EnM18=" << f3FrM18 << "/" << f3EnM18 << " freeN=" << g_rwhFreeN[bot] << " FrH18/EnH18=" << f3FrH << "/" << f3EnH
+                                            << " heroHP=" << f3HeroHP << " trade=" << (f3Trade ? 1 : 0) << " recent=" << f3RecentSrc
+                                            << " HP=" << (int)f3BotHP << " T=" << (int)matchTimeB << "s" << std::endl;
+#endif
+                                        g_rwhOnT.erase(bot); g_rwhWroteT.erase(bot); g_rwhOwnT.erase(bot); g_rwhAheadN.erase(bot); g_rwhDangerT.erase(bot);
+                                        g_rwhEndT[bot] = matchTimeB;
+                                    }
+                                }
+                                bool f3WhArmed = false;
+                                if (!g_rwhOnT.count(bot)) {
+                                    bool f3WhCool = !g_rwhEndT.count(bot) || (matchTimeB - g_rwhEndT[bot]) >= RWH_COOLDOWN_S;
+                                    if (f3WhLage && f3WhCool && !f3WhWhy && rF3Want == 0) {
+                                        bool f3Consec = g_rwhArmT.count(bot) && (matchTimeB - g_rwhArmT[bot]) <= 1.5f;
+                                        g_rwhArmN[bot] = f3Consec ? (g_rwhArmN[bot] + 1) : 1;
+                                        g_rwhArmT[bot] = matchTimeB;
+                                        f3WhArmed = (g_rwhArmN[bot] >= RWH_ARM_TICKS);
+                                    } else { g_rwhArmN.erase(bot); g_rwhArmT.erase(bot); }
+                                }
+                                if (rF3Want == 0 && f3Deep && (g_rwhOnT.count(bot) || f3WhArmed)) {
+                                    if (g_rwhOnT.count(bot) && g_rwhAheadN[bot] >= 1) g_rwhOwnT[bot] = matchTimeB;
+                                    else { rF3Want = 1; rF3Tgt = static_cast<AActor*>(f3Deep); rF3AccR = RWH_ACCR; rF3Kind = "deep"; }
+                                }
+                                if (ENABLE_R_OFFENSE) {
+                                    bool roffOpen = g_roffOnT.count(bot) > 0;
+                                    int  roffEnH = 0, roffFrH = 0;
+                                    bool roffMelee12 = false;
+                                    for (const CachedChar& cc : LiveChars) {
+                                        if (!cc.bIsHero || !cc.ptr || cc.ptr == botChar) continue;
+                                        float hx = cc.loc.X - botLoc.X, hy = cc.loc.Y - botLoc.Y;
+                                        float hSq = hx * hx + hy * hy;
+                                        if (hSq > ROFF_HEROCNT_SQ) continue;
+                                        if (cc.team == enemyTeam) {
+                                            roffEnH++;
+                                            if (hSq <= ROFF_MELEE_SQ && RIsMeleeHeroName(cc.ptr->GetFullName())) roffMelee12 = true;
+                                        }
+                                        else if (cc.team == botTeam && hSq <= ROFF_PARTNER_SQ && !rPartnerRetreating(cc.ptr)) roffFrH++;
+                                    }
+                                    rOffEnH = roffEnH; rOffFrH = roffFrH;
+                                    AOrionChar* roffH   = bestEnemyHero;
+                                    float       roffHSq = closestEnemyHeroDistSq;
+                                    int         roffHHP = f3HeroHP;
+                                    if (ENABLE_R_OFF_BIND && roffOpen && g_roffTgt.count(bot) && g_roffTgt[bot] != bestEnemyHero) {
+                                        for (const CachedChar& bc : LiveChars) {
+                                            if (bc.ptr != g_roffTgt[bot]) continue;
+                                            if (bc.bIsHero && bc.team == enemyTeam && bc.maxHealth > 0.0f) {
+                                                float bx = bc.loc.X - botLoc.X, by = bc.loc.Y - botLoc.Y, bz = bc.loc.Z - botLoc.Z;
+                                                float bSq = bx * bx + by * by + bz * bz;
+                                                int   bhp = (int)((bc.health / bc.maxHealth) * 100.0f);
+                                                if ((float)bhp <= ROFF_BIND_HP && bSq <= ROFF_HERO_KEEP_SQ && RHeroOwnTowerSq(AllTowers, bc.ptr) > ROFF_HERO_TWR_SQ) {
+                                                    roffH = bc.ptr; roffHSq = bSq; roffHHP = bhp; rOffBindHP = bhp;
+                                                }
+                                            }
+                                            break;
+                                        }
+                                    }
+                                    rOffTgtHero = roffH; rOffTgtSq = roffH ? roffHSq : -1.0f;
+                                    int  roffFreeN   = g_rwhFreeN.count(bot) ? g_rwhFreeN[bot] : 0;
+                                    int  roffDefN    = 0;
+                                    if (ENABLE_R_OFF_MINDEF && roffOpen) { roffDefN = (f3FrM18 < f3EnM18) ? ((g_roffDefN.count(bot) ? g_roffDefN[bot] : 0) + 1) : 0; g_roffDefN[bot] = roffDefN; }
+                                    bool roffMinTerm = roffOpen ? (ENABLE_R_OFF_MINDEF ? (roffDefN < ROFF_MINDEF_TICKS) : (roffFreeN >= 1)) : (roffFreeN >= RWH_FREE_TICKS);
+                                    bool roffHeroMelee = bestEnemyHero && RIsMeleeHeroName(bestEnemyHero->GetFullName());
+                                    bool roffCheap = f3Free && f3TierOk && roffH && rwAheadM25 >= 1 && roffMinTerm
+                                                  && (ENABLE_R_OFF_HOLD || roffHSq > ROFF_END_POKE_SQ)
+                                                  && roffHSq <= (roffOpen ? ROFF_HERO_KEEP_SQ : ROFF_HERO_MAX_SQ)
+                                                  && (roffOpen || roffHSq >= (ENABLE_R_OFF_HOLD ? ROFF_HOLD_START_MIN_SQ : ROFF_HERO_MIN_SQ))
+                                                  && closestEnemyTowerDistSq > ROFF_BOT_ENTWR_SQ
+                                                  && f3BotHP >= ROFF_MIN_HP && roffHHP >= 0 && f3BotHP >= (float)roffHHP
+                                                  && roffEnH <= roffFrH + 1 && !roffMelee12 && !f3Recent
+                                                  && !(ENABLE_R_TOWER_HOLD && g_rtrBStartT.count(bot) > 0);
+                                    bool roffMia = false, roffHeroTwrOk = false, roffTipOk = false, roffStopTwrOk = false;
+                                    if (roffCheap) {
+                                        roffMia = rMiaCount() >= 1;
+                                        float roffHeroTwrSq = RHeroOwnTowerSq(AllTowers, roffH);
+                                        roffHeroTwrOk = roffHeroTwrSq > ROFF_HERO_TWR_SQ;
+                                        rOffHeroTwrM  = (roffHeroTwrSq < 1e17f) ? (int)(sqrtf(roffHeroTwrSq) / 100.0f) : -1;
+                                        FVector rhl = roffH->K2_GetActorLocation();
+                                        float tipCoreSq = 1e18f;
+                                        for (const CachedChar& cc : LiveChars) {
+                                            if (cc.team != botTeam || cc.bIsHero || cc.bIsNeutral) continue;
+                                            if (cc.fullName.find("bp_minion_lane_") == std::string::npos) continue;
+                                            float bx = cc.loc.X - botLoc.X, by = cc.loc.Y - botLoc.Y;
+                                            if (bx * bx + by * by >= 6250000.0f) continue;
+                                            float cx = enemyCoreLoc.X - cc.loc.X, cy = enemyCoreLoc.Y - cc.loc.Y;
+                                            if (cx * cx + cy * cy < tipCoreSq) tipCoreSq = cx * cx + cy * cy;
+                                        }
+                                        float hbx = botLoc.X - rhl.X, hby = botLoc.Y - rhl.Y;
+                                        float hb  = sqrtf(hbx * hbx + hby * hby);
+                                        if (tipCoreSq < 1e17f && hb > 1.0f) {
+                                            float px = rhl.X + hbx / hb * ROFF_POKE_ACCR, py = rhl.Y + hby / hb * ROFF_POKE_ACCR;
+                                            float pCore = sqrtf((enemyCoreLoc.X - px) * (enemyCoreLoc.X - px) + (enemyCoreLoc.Y - py) * (enemyCoreLoc.Y - py));
+                                            float tCore = sqrtf(tipCoreSq);
+                                            rOffStopBehindM = (pCore - tCore) / 100.0f;
+                                            roffTipOk = (pCore - tCore) >= ((ENABLE_R_OFF_TIPHYST && roffOpen) ? ROFF_TIP_END_CM : ROFF_TIP_MARGIN_CM);
+                                            FVector etl = bestEnemyTower->K2_GetActorLocation();
+                                            roffStopTwrOk = ((px - etl.X) * (px - etl.X) + (py - etl.Y) * (py - etl.Y)) > ROFF_STOP_ENTWR_SQ;
+                                        }
+                                    }
+                                    bool roffLage = roffCheap && !roffMia && roffHeroTwrOk && roffTipOk && roffStopTwrOk;
+                                    const char* roffWhy = nullptr;
+                                    if (roffOpen) {
+                                        if (ENABLE_R_OFF_HOLD) {
+                                            bool roffFarNow = g_roffHoldN.count(bot) && g_roffHoldN[bot] >= 1 && (!roffH || roffHSq > ROFF_FAR_SQ);
+                                            g_roffFarN[bot] = roffFarNow ? ((g_roffFarN.count(bot) ? g_roffFarN[bot] : 0) + 1) : 0;
+                                        }
+                                        float roffOwnT = g_roffWroteT.count(bot) ? g_roffWroteT[bot] : -1.0e9f;
+                                        if (ENABLE_R_OFF_HOLD && g_roffHoldT.count(bot) && g_roffHoldT[bot] > roffOwnT) roffOwnT = g_roffHoldT[bot];
+                                        if ((matchTimeB - roffOwnT) > 1.5f)                                                                          roffWhy = "owner";
+                                        else if (!f3Free)                                                            roffWhy = "free";
+                                        else if (!roffH || roffHSq > ROFF_HERO_KEEP_SQ)                              roffWhy = "heroGone";
+                                        else if (ENABLE_R_OFF_HOLD && bestEnemyHero && closestEnemyHeroDistSq <= RWH_HERO_RSB_SQ)                   roffWhy = "hero8";
+                                        else if (ENABLE_R_OFF_HOLD && g_roffFarN.count(bot) && g_roffFarN[bot] >= ROFF_FAR_TICKS)                  roffWhy = "far";
+                                        else if (!ENABLE_R_OFF_HOLD && roffHSq <= ROFF_END_POKE_SQ)                                                roffWhy = "poke";
+                                        else if (rwAheadM25 == 0 || (roffCheap && !roffTipOk))                       roffWhy = "tip";
+                                        else if (!roffMinTerm)                                                       roffWhy = "minion";
+                                        else if (f3Recent)                                                           roffWhy = "recent";
+                                        else if (!roffCheap)                                                         roffWhy = "lage";
+                                        else if (roffMia)                                                            roffWhy = "mia";
+                                        else if (!roffHeroTwrOk)                                                     roffWhy = "heroTwr";
+                                        else if (!roffStopTwrOk)                                                     roffWhy = "stopTwr";
+                                        else if (rF3Want != 0)                                                       roffWhy = "slot";
+                                        else if ((matchTimeB - g_roffOnT[bot]) >= (ENABLE_R_OFF_HOLD ? ROFF_HOLD_CAP_S : ROFF_CAP_S))              roffWhy = "cap";
+                                        if (roffWhy) {
+                                            std::string roffWhyS(roffWhy);
+                                            bool    roffRet    = ROFF_END_RETURN && roffWhyS != "owner" && roffWhyS != "free" && roffWhyS != "poke" && roffWhyS != "slot"
+                                                              && roffWhyS != "hero8";
+                                            AActor* roffRetTgt = f3Deep ? static_cast<AActor*>(f3Deep) : static_cast<AActor*>(rearWaveAnchor);
+                                            const char* roffRetKind = f3Deep ? "deep" : rearWaveAnchor ? "anchor" : "-";
+                                            if (roffRet && !roffRetTgt) {
+                                                float roffLqSq = 6250000.0f;
+                                                for (const CachedChar& cc : LiveChars) {
+                                                    if (cc.team != botTeam || cc.bIsHero || cc.bIsNeutral) continue;
+                                                    if (cc.fullName.find("bp_minion_lane_") == std::string::npos) continue;
+                                                    float mx = cc.loc.X - botLoc.X, my = cc.loc.Y - botLoc.Y;
+                                                    if (mx * mx + my * my < roffLqSq) { roffLqSq = mx * mx + my * my; roffRetTgt = static_cast<AActor*>(cc.ptr); roffRetKind = "lane25"; }
+                                                }
+                                            }
+                                            bool roffStopDirect = roffRet && (!roffRetTgt || rF3Want != 0) && MeleeLockbreakStopFn;
+#if F4_LOG_LEVEL >= 1
+                                            std::cout << "[R-OFF] END bot=" << botChar->GetFullName() << " Team=" << (bIsBlueTeam ? "B" : "R") << " R=" << roleSlot
+                                                << " why=" << roffWhy << " heldS=" << (int)(matchTimeB - g_roffOnT[bot])
+                                                << " heroM=" << (bestEnemyHero ? (int)(sqrtf(closestEnemyHeroDistSq) / 100.0f) : -1)
+                                                << " heroM0=" << (g_roffStartHeroM.count(bot) ? g_roffStartHeroM[bot] : -1) << " heroMelee=" << (roffHeroMelee ? 1 : 0)
+                                                << " heroHP=" << f3HeroHP << " heroHP0=" << (g_roffStartHeroHP.count(bot) ? g_roffStartHeroHP[bot] : -1)
+                                                << " HP=" << (int)f3BotHP << " HP0=" << (g_roffStartHP.count(bot) ? g_roffStartHP[bot] : -1)
+                                                << " FrM18/EnM18=" << f3FrM18 << "/" << f3EnM18 << " freeN=" << roffFreeN << " FrH25/EnH25=" << roffFrH << "/" << roffEnH
+                                                << " ahead=" << rwAheadM25 << " stopBehindM=" << (int)rOffStopBehindM << " heroTwrM=" << rOffHeroTwrM
+                                                << " enTwrM=" << (bestEnemyTower ? (int)(sqrtf(closestEnemyTowerDistSq) / 100.0f) : -1)
+                                                << " mia=" << (roffMia ? 1 : 0) << " recent=" << f3RecentSrc
+                                                << " k2n=" << (g_roffK2N.count(bot) ? g_roffK2N[bot] : 0) << " V44=" << (bV44Threatened ? 1 : 0)
+                                                << " holdN=" << (g_roffHoldN.count(bot) ? g_roffHoldN[bot] : 0) << " farN=" << (g_roffFarN.count(bot) ? g_roffFarN[bot] : 0)
+                                                << " phN=" << (g_roffPhaseN.count(bot) ? g_roffPhaseN[bot] : 0) << " bindN=" << (g_roffBindN.count(bot) ? g_roffBindN[bot] : 0)
+                                                << " stopN=" << (g_roffStopN.count(bot) ? g_roffStopN[bot] : 0) << " tgtM=" << (roffH ? (int)(sqrtf(roffHSq) / 100.0f) : -1)
+                                                << " defN=" << roffDefN << " bindK2Done=" << (g_roffBindK2Done.count(bot) ? g_roffBindK2Done[bot] : 0)
+                                                << " ret=" << (roffRet ? (roffRetTgt ? roffRetKind : "none") : "-")
+                                                << " T=" << (int)matchTimeB << "s" << std::endl;
+#endif
+                                            g_roffOnT.erase(bot); g_roffWroteT.erase(bot); g_roffTgt.erase(bot); g_roffK2N.erase(bot);
+                                            g_roffStartHP.erase(bot); g_roffStartHeroHP.erase(bot); g_roffStartHeroM.erase(bot); g_roffPrevPos.erase(bot);
+                                            g_roffEndT[bot] = matchTimeB; roffOpen = false;
+                                            g_roffHoldT.erase(bot); g_roffHoldN.erase(bot); g_roffFarN.erase(bot); g_roffPhaseK.erase(bot); g_roffPhaseN.erase(bot); g_roffK2Ph.erase(bot); g_roffBindN.erase(bot);
+                                            g_roffOutN.erase(bot); g_roffStopN.erase(bot);
+                                            g_roffBindK2Done.erase(bot); g_roffDefN.erase(bot);
+                                            if (roffRet && rF3Want == 0 && roffRetTgt) { rF3Want = 4; rF3Tgt = roffRetTgt; rF3AccR = ROFF_RETURN_ACCR; rF3Kind = "ret"; }
+                                            if (roffStopDirect) bot->ProcessEvent(MeleeLockbreakStopFn, nullptr);
+                                        }
+                                    }
+                                    bool roffCool = !g_roffEndT.count(bot) || (matchTimeB - g_roffEndT[bot]) >= ROFF_COOLDOWN_S;
+                                    bool roffNew  = !roffOpen && !roffWhy && roffLage && roffCool && rF3Want == 0;
+                                    if (roffOpen || roffNew) {
+                                        int roffKind = 3;
+                                        if (ENABLE_R_OFF_HOLD && roffH) {
+                                            bool roffWasHold = g_roffHoldN.count(bot) && g_roffHoldN[bot] >= 1;
+                                            int  roffOut     = (roffWasHold && roffHSq > ROFF_END_POKE_SQ) ? ((g_roffOutN.count(bot) ? g_roffOutN[bot] : 0) + 1) : 0;
+                                            g_roffOutN[bot]  = roffOut;
+                                            if (roffHSq <= ROFF_END_POKE_SQ) roffKind = 5;
+                                            else if (roffWasHold && (roffHSq > ROFF_FAR_SQ || (roffHSq <= ROFF_REAPPROACH_SQ && roffOut < ROFF_REAPPROACH_TICKS))) roffKind = 5;
+                                        }
+                                        if (ROFF_ACTION) { rF3Want = roffKind; rF3Tgt = static_cast<AActor*>(roffH); rF3AccR = ROFF_POKE_ACCR; rF3Kind = (roffKind == 5) ? "hold" : "hero"; }
+                                    }
+                                }
+                            }
+                            auto rOffApply = [&](int kind) {
+                                if (kind == 4) {
+                                    moveTarget = rF3Tgt; accRadius = rF3AccR;
+                                    bIsIdle = true; BotIdleTicks[bot] = 10;
+                                    bR51Lockbreak = true; g_roffPostT[bot] = matchTimeB;
+                                    return;
+                                }
+                                AOrionChar* tgtH = rOffTgtHero ? rOffTgtHero : bestEnemyHero;
+                                int  roffTgtHP  = (rOffBindHP >= 0) ? rOffBindHP : rF3HeroHP;
+                                bool fresh  = (g_roffOnT.count(bot) == 0);
+                                bool tgtChg = !fresh && (!g_roffTgt.count(bot) || g_roffTgt[bot] != tgtH);
+                                bool phChg  = !g_roffPhaseK.count(bot) || g_roffPhaseK[bot] != kind;
+                                int  phN    = (g_roffPhaseN.count(bot) ? g_roffPhaseN[bot] : 0) + (phChg ? 1 : 0);
+                                int  stopN  = g_roffStopN.count(bot) ? g_roffStopN[bot] : 0;
+                                bool stopHold = ENABLE_R_OFF_HOLD && ROFF_HOLD_STOP && kind == 5 && stopN < ROFF_HOLD_STOP_MAX
+                                             && (fresh || (g_roffPhaseK.count(bot) && g_roffPhaseK[bot] == 3));
+                                bool bindStart = ENABLE_R_OFF_BIND && ROFF_BIND_K2 && rOffBindHP >= 0
+                                              && !(g_roffBindK2Done.count(bot) && g_roffBindK2Done[bot] != 0);
+                                g_roffPhaseN[bot] = phN; g_roffPhaseK[bot] = kind;
+                                if (kind == 5) {
+                                    g_roffHoldT[bot] = matchTimeB;
+                                    if (rOffTgtSq >= 0.0f && rOffTgtSq <= ROFF_END_POKE_SQ) g_roffHoldN[bot] = (g_roffHoldN.count(bot) ? g_roffHoldN[bot] : 0) + 1;
+                                    if (stopHold && MeleeLockbreakStopFn) { bot->ProcessEvent(MeleeLockbreakStopFn, nullptr); g_roffStopN[bot] = stopN + 1; }
+                                } else {
+                                    moveTarget = rF3Tgt; accRadius = rF3AccR;
+                                    bIsIdle = true; BotIdleTicks[bot] = 10;
+                                    g_roffWroteT[bot] = matchTimeB;
+                                }
+                                bool k2Gate = tgtH && roffTgtHP >= 0 && (float)roffTgtHP <= ROFF_K2_HERO_HP;
+                                bool gapOk  = fresh || !g_roffK2T.count(bot) || (matchTimeB - g_roffK2T[bot]) >= ROFF_K2_MIN_GAP_S;
+                                bool k2Ok   = ENABLE_R_OFF_HOLD
+                                            ? (k2Gate && gapOk && (bindStart || ((fresh || (tgtChg && kind == 3)) && (!g_roffK2Ph.count(bot) || g_roffK2Ph[bot] != phN))))
+                                            : (k2Gate && gapOk && (fresh || tgtChg));
+                                AActor* natB = nullptr;
+                                if (k2Ok && GetEnemyCharacterFunc) { struct { class AActor* ReturnValue; } np{}; np.ReturnValue = nullptr; bot->ProcessEvent(GetEnemyCharacterFunc, &np); natB = np.ReturnValue; }
+                                int k2 = 0;
+                                if (k2Ok && natB != static_cast<AActor*>(tgtH)) { bot->K2_SetEnemy(tgtH); k2 = 1; g_roffK2T[bot] = matchTimeB; g_roffK2Ph[bot] = phN; }
+                                if (bindStart && k2Ok && (k2 || natB == static_cast<AActor*>(tgtH))) g_roffBindK2Done[bot] = 1;
+                                g_roffTgt[bot] = tgtH;
+                                if (rOffBindHP >= 0) g_roffBindN[bot] = (g_roffBindN.count(bot) ? g_roffBindN[bot] : 0) + 1;
+                                if (fresh) {
+                                    g_roffOnT[bot] = matchTimeB; g_roffK2N[bot] = 0;
+                                    g_roffStartHP[bot] = (int)((currentHealth / maxHealth) * 100.0f); g_roffStartHeroHP[bot] = rF3HeroHP;
+                                    g_roffStartHeroM[bot] = (int)(sqrtf(closestEnemyHeroDistSq) / 100.0f);
+                                }
+                                if (k2) g_roffK2N[bot]++;
+#if F4_LOG_LEVEL >= 1
+                                if (kind == 5 || fresh || tgtChg || !g_roffLogT.count(bot) || (matchTimeB - g_roffLogT[bot]) >= 2.0f) {
+                                    g_roffLogT[bot] = matchTimeB;
+                                    float rOffMoved = -1.0f;
+                                    if (!fresh && g_roffPrevPos.count(bot)) { FVector pp = g_roffPrevPos[bot];
+                                        rOffMoved = sqrtf((botLoc.X - pp.X) * (botLoc.X - pp.X) + (botLoc.Y - pp.Y) * (botLoc.Y - pp.Y)) / 100.0f; }
+                                    g_roffPrevPos[bot] = botLoc;
+                                    AActor* rOffNat = natB;
+                                    if (!k2Ok && GetEnemyCharacterFunc) { struct { class AActor* ReturnValue; } np2{}; np2.ReturnValue = nullptr; bot->ProcessEvent(GetEnemyCharacterFunc, &np2); rOffNat = np2.ReturnValue; }
+                                    if (k2) rOffNat = static_cast<AActor*>(tgtH);
+                                    std::string rOffHn = tgtH ? tgtH->GetFullName() : std::string("NULL");
+                                    size_t rOffDot = rOffHn.rfind('.'); if (rOffDot != std::string::npos) rOffHn = rOffHn.substr(rOffDot + 1);
+                                    std::cout << "[R-OFF] " << (fresh ? "FIRE" : kind == 5 ? "HOLD" : tgtChg ? "RETGT" : "TRACE") << " bot=" << botChar->GetFullName()
+                                        << " Team=" << (bIsBlueTeam ? "B" : "R") << " R=" << roleSlot << " hero=" << rOffHn
+                                        << " heroMelee=" << ((tgtH && RIsMeleeHeroName(tgtH->GetFullName())) ? 1 : 0)
+                                        << " heroM=" << (bestEnemyHero ? (int)(sqrtf(closestEnemyHeroDistSq) / 100.0f) : -1) << " heroHP=" << rF3HeroHP
+                                        << " tgtM=" << (rOffTgtSq >= 0.0f ? (int)(sqrtf(rOffTgtSq) / 100.0f) : -1) << " roffTgtHP=" << roffTgtHP
+                                        << " heroTwrM=" << rOffHeroTwrM << " enTwrM=" << (bestEnemyTower ? (int)(sqrtf(closestEnemyTowerDistSq) / 100.0f) : -1)
+                                        << " ahead=" << rwAheadM25 << " stopBehindM=" << (int)rOffStopBehindM
+                                        << " FrM18/EnM18=" << rF3FrM18 << "/" << rF3EnM18 << " FrH25/EnH25=" << rOffFrH << "/" << rOffEnH
+                                        << " k2=" << k2 << " k2gate=" << (k2Gate ? 1 : 0) << " k2n=" << (g_roffK2N.count(bot) ? g_roffK2N[bot] : 0)
+                                        << " natBefore=" << (!k2Ok ? "-" : natB == nullptr ? "NULL" : (static_cast<AActor*>(tgtH) == natB ? "Hero" : "other"))
+                                        << " kind=" << kind << " phN=" << phN << " holdN=" << (g_roffHoldN.count(bot) ? g_roffHoldN[bot] : 0) << " stopHold=" << (stopHold ? 1 : 0)
+                                        << " stopN=" << (g_roffStopN.count(bot) ? g_roffStopN[bot] : 0) << " outN=" << (g_roffOutN.count(bot) ? g_roffOutN[bot] : 0)
+                                        << " bindHP=" << rOffBindHP << " bindK2=" << (bindStart && k2 ? 1 : 0)
+                                        << " defN=" << (g_roffDefN.count(bot) ? g_roffDefN[bot] : 0)
+                                        << " natTgt=" << (rOffNat == nullptr ? "NULL" : rOffNat == static_cast<AActor*>(tgtH) ? "Tgt"
+                                                          : (bestEnemyHero && rOffNat == static_cast<AActor*>(bestEnemyHero)) ? "Hero" : "other")
+                                        << " movedM=" << rOffMoved << " HP=" << (int)((currentHealth / maxHealth) * 100.0f)
+                                        << " T=" << (int)matchTimeB << "s" << std::endl;
+                                }
+#endif
+                            };
+                            auto rF3Apply = [&](int kind) {
+                                if (kind == 3 || kind == 4 || kind == 5) { rOffApply(kind); return; }
+                                moveTarget = rF3Tgt; accRadius = rF3AccR;
+                                bIsIdle = true; BotIdleTicks[bot] = 10;
+                                bool fresh = (kind == 1) ? (g_rwhOnT.count(bot) == 0) : (g_rtdOnT.count(bot) == 0);
+                                AActor* natB = nullptr;
+                                if (fresh && GetEnemyCharacterFunc) { struct { class AActor* ReturnValue; } np{}; np.ReturnValue = nullptr; bot->ProcessEvent(GetEnemyCharacterFunc, &np); natB = np.ReturnValue; }
+                                int k2 = 0;
+                                if (kind == 1) {
+                                    g_rwhWroteT[bot] = matchTimeB; g_rwhOwnT[bot] = matchTimeB;
+                                    if (fresh) {
+                                        g_rwhOnT[bot] = matchTimeB; g_rwhAheadN[bot] = 0; g_rwhDangerT[bot] = matchTimeB;
+                                        g_rwhArmN.erase(bot); g_rwhArmT.erase(bot);
+                                        if (natB != static_cast<AActor*>(bestEnemyHero)) { bot->K2_SetEnemy(nullptr); k2 = 1; }
+                                    }
+                                }
+#if F4_LOG_LEVEL >= 1
+                                std::map<AOrionAIBot*, float>&   f3LogT = (kind == 1) ? g_rwhLogT : g_rtdLogT;
+                                std::map<AOrionAIBot*, FVector>& f3Prev = (kind == 1) ? g_rwhPrevPos : g_rtdPrevPos;
+                                if (fresh || !f3LogT.count(bot) || (matchTimeB - f3LogT[bot]) >= 2.0f) {
+                                    f3LogT[bot] = matchTimeB;
+                                    float f3Moved = -1.0f;
+                                    if (!fresh && f3Prev.count(bot)) { FVector pp = f3Prev[bot];
+                                        f3Moved = sqrtf((botLoc.X - pp.X) * (botLoc.X - pp.X) + (botLoc.Y - pp.Y) * (botLoc.Y - pp.Y)) / 100.0f; }
+                                    f3Prev[bot] = botLoc;
+                                    FVector f3TL = rF3Tgt->K2_GetActorLocation();
+                                    float f3TgtM = sqrtf((f3TL.X - botLoc.X) * (f3TL.X - botLoc.X) + (f3TL.Y - botLoc.Y) * (f3TL.Y - botLoc.Y)) / 100.0f;
+                                    std::cout << (kind == 1 ? "[R-WH] " : "[R-TD] ") << (fresh ? "FIRE" : "TRACE") << " bot=" << botChar->GetFullName()
+                                        << " Team=" << (bIsBlueTeam ? "B" : "R") << " R=" << roleSlot << " tgt=" << rF3Kind << " tgtM=" << (int)f3TgtM
+                                        << " tipM=" << (rearWaveAnchor ? (int)(sqrtf(rearWaveAnchorDistSq) / 100.0f) : -1) << " ahead=" << rwAheadM25 << " sub=" << rwAnchorSub
+                                        << " enTwrM=" << (bestEnemyTower ? (int)(sqrtf(closestEnemyTowerDistSq) / 100.0f) : -1)
+                                        << " heroM=" << (bestEnemyHero ? (int)(sqrtf(closestEnemyHeroDistSq) / 100.0f) : -1)
+                                        << " enMinM=" << (bestEnemyMinion ? (int)(sqrtf(closestEnemyMinionDistSq) / 100.0f) : -1)
+                                        << " inTurret=" << (bInsideEnemyTurretGlobal ? 1 : 0)
+                                        << " k2=" << k2 << " natBefore=" << (!fresh ? "-" : natB == nullptr ? "NULL" : (static_cast<AActor*>(bestEnemyHero) == natB ? "Hero" : "other"))
+                                        << " movedM=" << f3Moved << " FrM18/EnM18=" << rF3FrM18 << "/" << rF3EnM18 << " heroHP=" << rF3HeroHP
+                                        << " HP=" << (int)((currentHealth / maxHealth) * 100.0f)
+                                        << " T=" << (int)matchTimeB << "s" << std::endl;
+                                }
+#endif
+                            };
+                            auto rAwRanged = [&](int site) {
+                                int awFrM = 0, awEnM = 0, awFrH = 0, awEnH = 0;
+                                rCnt18(awFrM, awEnM, awFrH, awEnH);
+                                float awHP     = (maxHealth > 0.0f) ? (currentHealth / maxHealth) * 100.0f : 100.0f;
+                                bool  awHero18 = bestEnemyHero && closestEnemyHeroDistSq < 3240000.0f;
+                                bool  awHero30 = bestEnemyHero && closestEnemyHeroDistSq <= RAW_HERO30_SQ;
+                                bool  awOutnum = (awEnH >= awFrH + 2);
+                                bool  awMinDef = (awEnM >= awFrM + 2);
+                                bool  awWov    = bestEnemyMinion && closestEnemyMinionDistSq < 1000000.0f && closestFriendlyMinionDistSq > 6250000.0f
+                                             && (!bestEnemyHero || closestEnemyHeroDistSq > 3240000.0f) && awFrM == 0 && awEnM >= 2;
+                                bool  awDanger = (awHero18 && (awOutnum || awHP <= RAW_HP_LOW || awMinDef)) || awHP <= RAW_HP_CRIT;
+                                bool  awCrit   = (bestEnemyTowerTier == 0 || bestEnemyTowerTier == 3 || bestEnemyTowerTier == 4);
+                                bool  awRot    = (LastMacroAction[bot] == "Rotate");
+                                bool  awFree   = !awCrit && !awRot;
+                                bool  awDeb    = g_rawPullT.count(bot) && (matchTimeB - g_rawPullT[bot]) < RAW_DEBOUNCE_S;
+                                bool  awWaveBehind = (frontMostLaneMinion == nullptr && anyLaneMinionInVoronoiPool > 0 && botToEnemyCoreSq > 0.0f);
+                                int   awMiaN   = rMiaCount();
+                                bool  awMia    = awMiaN >= 1;
+                                bool  awMia2   = awMiaN >= 2;
+                                bool  awPartnerPull = false;
+                                for (const CachedChar& cc : LiveChars) {
+                                    if (!cc.bIsHero || !cc.ptr || cc.ptr == botChar || cc.team != botTeam || !cc.ptr->Controller) continue;
+                                    float px = cc.loc.X - botLoc.X, py = cc.loc.Y - botLoc.Y;
+                                    if (px * px + py * py > RAW_PARTNER_SQ) continue;
+                                    AOrionAIBot* pb = reinterpret_cast<AOrionAIBot*>(cc.ptr->Controller);
+                                    if (g_rawPullAnyT.count(pb) && (matchTimeB - g_rawPullAnyT[pb]) <= 1.5f) { awPartnerPull = true; break; }
+                                }
+                                AOrionChar* awFarWave = nullptr; float awFarSq = -1.0f;
+                                if (awFree && !rearWaveAnchor && (awHero18 || awMia || awWov) && enemyCore && botPhysLane >= 0 && botPhysLane < 3 && frontFriendlyTowers[botPhysLane]) {
+                                    FVector awAL = frontFriendlyTowers[botPhysLane]->K2_GetActorLocation();
+                                    float awBotCoreSq = (enemyCoreLoc.X - botLoc.X) * (enemyCoreLoc.X - botLoc.X) + (enemyCoreLoc.Y - botLoc.Y) * (enemyCoreLoc.Y - botLoc.Y);
+                                    for (const CachedChar& wf : LiveChars) {
+                                        if (wf.bIsHero || wf.bIsNeutral || wf.team != botTeam) continue;
+                                        if (wf.fullName.find("bp_minion_lane_") == std::string::npos) continue;
+                                        float ex = wf.loc.X - enemyCoreLoc.X, ey = wf.loc.Y - enemyCoreLoc.Y;
+                                        if (ex * ex + ey * ey <= awBotCoreSq) continue;
+                                        float bx = wf.loc.X - botLoc.X, by = wf.loc.Y - botLoc.Y;
+                                        float dSq = bx * bx + by * by;
+                                        if (dSq > WFB_WAVE_MAX_SQ) continue;
+                                        float toMineSq = (wf.loc.X - awAL.X) * (wf.loc.X - awAL.X) + (wf.loc.Y - awAL.Y) * (wf.loc.Y - awAL.Y);
+                                        bool onMyLane = true;
+                                        for (int oL = 0; oL < 3; oL++) {
+                                            if (oL == botPhysLane || !frontFriendlyTowers[oL]) continue;
+                                            FVector oLoc = frontFriendlyTowers[oL]->K2_GetActorLocation();
+                                            if ((wf.loc.X - oLoc.X) * (wf.loc.X - oLoc.X) + (wf.loc.Y - oLoc.Y) * (wf.loc.Y - oLoc.Y) < toMineSq) { onMyLane = false; break; }
+                                        }
+                                        if (!onMyLane) continue;
+                                        if (!awFarWave || dSq < awFarSq) { awFarWave = wf.ptr; awFarSq = dSq; }
+                                    }
+                                }
+                                bool awKill = false;
+                                if (awFarWave && awHero18) {
+                                    int awHeroHP = -1;
+                                    for (const CachedChar& mc : LiveChars) { if (mc.ptr != bestEnemyHero) continue; awHeroHP = (mc.maxHealth > 0.0f) ? (int)((mc.health / mc.maxHealth) * 100.0f) : -1; break; }
+                                    awKill = RKillLage(AllTowers, bestEnemyHero, awHeroHP, awHP, awEnH > awFrH + 1, closestEnemyHeroDistSq);
+                                }
+                                int awPrev = (g_rawMode.count(bot) && g_rawModeT.count(bot) && (matchTimeB - g_rawModeT[bot]) <= 1.5f) ? g_rawMode[bot] : 0;
+                                const char* awMode = "FWD"; const char* awWhy = "free";
+                                if (awFree && closestFriendlyTower && (awDanger || awDeb || bStickyRetreat)) {
+                                    awMode = "PULL";
+                                    awWhy  = !awDanger ? (awDeb ? "debounce" : "sticky")
+                                           : (awHP <= RAW_HP_CRIT) ? "hp35" : (awHero18 && awOutnum) ? "outnum" : (awHero18 && awHP <= RAW_HP_LOW) ? "hp50"
+                                           : "minDef";
+                                    if (awDanger) g_rawPullT[bot] = matchTimeB;
+                                    moveTarget = closestFriendlyTower; accRadius = 1500.0f;
+                                    bIsIdle = true; BotIdleTicks[bot] = 10;
+                                }
+                                else if (awFree && awWov && (rearWaveAnchor || awFarWave)) {
+                                    awMode = "WAVE"; awWhy = "wovWave";
+                                    moveTarget = rearWaveAnchor ? static_cast<AActor*>(rearWaveAnchor) : static_cast<AActor*>(awFarWave); accRadius = RAW_WAVE_ACCR;
+                                    bIsIdle = true; BotIdleTicks[bot] = 10;
+                                }
+                                else if (awFree && awWov && closestFriendlyTower) {
+                                    awMode = "PULL"; awWhy = "wov"; g_rawPullT[bot] = matchTimeB;
+                                    moveTarget = closestFriendlyTower; accRadius = 1500.0f;
+                                    bIsIdle = true; BotIdleTicks[bot] = 10;
+                                }
+                                else if (awFree && rearWaveAnchor) {
+                                    awMode = "WAVE"; awWhy = awMia ? "mia" : awWaveBehind ? "waveBehind" : awHero18 ? "hero18" : "anchor";
+                                    moveTarget = rearWaveAnchor; accRadius = RAW_WAVE_ACCR;
+                                    if (awMia) { bIsIdle = true; BotIdleTicks[bot] = 10; }
+                                }
+                                else if (awFree && awFarWave && !awKill) {
+                                    awMode = "WAVE"; awWhy = awMia ? "miaFar" : "hero18Far";
+                                    moveTarget = awFarWave; accRadius = RAW_WAVE_ACCR;
+                                    bIsIdle = true; BotIdleTicks[bot] = 10;
+                                }
+                                else if (awFree && awMia2 && closestFriendlyTower) {
+                                    awMode = "PULL"; awWhy = "mia";
+                                    moveTarget = closestFriendlyTower; accRadius = 1500.0f;
+                                    bIsIdle = true; BotIdleTicks[bot] = 10;
+                                }
+                                else if (awFree && (awWaveBehind || awHero18 || awHero30 || awPartnerPull || awEnM >= 1)) {
+                                    awMode = "HOLD";
+                                    awWhy  = awKill ? "kill" : awPartnerPull ? "partnerPull" : awHero18 ? "hero18" : awHero30 ? "hero30" : awWaveBehind ? "waveFar" : "enMin";
+                                    moveTarget = nullptr;
+                                }
+                                else {
+                                    moveTarget = bestEnemyTower; accRadius = 3500.0f;
+                                    awWhy = awCrit ? "crit" : awRot ? "rotate" : "free";
+                                }
+                                int awModeId = (awMode[0] == 'P') ? 1 : (awMode[0] == 'W') ? 2 : (awMode[0] == 'H') ? 3 : 4;
+                                if (awModeId == 1) g_rawPullAnyT[bot] = matchTimeB;
+                                bool awStop = RAW_STOP_ON_EXIT && MeleeLockbreakStopFn
+                                         && ((awPrev == 1 && awModeId != 1) || (awPrev == 4 && awModeId == 3));
+                                if (awStop) bot->ProcessEvent(MeleeLockbreakStopFn, nullptr);
+                                g_rawMode[bot] = awModeId; g_rawModeT[bot] = matchTimeB;
+                            };
+
+
+                            if (!bShouldDefend && bestJungleCreep && !bLateGame && bestEnemyTowerTier > 0
+                                && !bHasRealEnemy && (BotIdleTicks[bot] >= 2 || LastMacroAction[bot] == "")) {
+                                FVector creepLoc = bestJungleCreep->K2_GetActorLocation();
+                                float realDistSq = (creepLoc.X - botLoc.X) * (creepLoc.X - botLoc.X) + (creepLoc.Y - botLoc.Y) * (creepLoc.Y - botLoc.Y) + (creepLoc.Z - botLoc.Z) * (creepLoc.Z - botLoc.Z);
+
+                                if (realDistSq < 2250000.0f) {
+                                    if (BotIdleTicks[bot] >= 1) {
+                                        AActor* currentNativeTarget = nullptr;
+                                        if (GetEnemyCharacterFunc) {
+                                            struct { class AActor* ReturnValue; } getEnemyParams{};
+                                            getEnemyParams.ReturnValue = nullptr;
+                                            bot->ProcessEvent(GetEnemyCharacterFunc, &getEnemyParams);
+                                            currentNativeTarget = getEnemyParams.ReturnValue;
+                                        }
+                                        if (currentNativeTarget != bestJungleCreep) {
+                                            bot->K2_SetEnemy(bestJungleCreep);
+                                        }
+                                        BotIdleTicks[bot] = 0;
+                                    }
+                                    bIsActivelyFighting = true;
+                                    moveTarget = nullptr;
+                                }
+                                else {
+                                    moveTarget = bestJungleCreep;
+                                    accRadius = 250.0f;
+                                }
+
+                                std::string targetName = bestJungleCreep->GetFullName();
+
+
+                                if (LastMacroAction[bot] != "Jungle" || LastMacroTargetName[bot] != targetName) {
+
+                                    UBotObjective* existingObj = *reinterpret_cast<UBotObjective**>(
+                                        reinterpret_cast<uintptr_t>(bot) + 0x0748);
+                                    if (!existingObj || !JCClass || !existingObj->IsA(JCClass)) {
+                                        if (JCClass && StaticConstructObject) {
+                                            uint32_t* fl = reinterpret_cast<uint32_t*>(reinterpret_cast<uintptr_t>(JCClass) + 0xB4);
+                                            uint32_t sv = *fl; *fl &= ~0x01u;
+                                            UObject* nObj = StaticConstructObject(JCClass, CommanderObj, FName(), 0, 0, nullptr, false, nullptr, false);
+                                            *fl = sv;
+                                            if (nObj) {
+                                                existingObj = reinterpret_cast<UBotObjective*>(nObj);
+                                                *reinterpret_cast<UBotObjective**>(reinterpret_cast<uintptr_t>(bot) + 0x0748) = existingObj;
+                                                *reinterpret_cast<UObject**>(reinterpret_cast<uintptr_t>(existingObj) + 0x0128) = CommanderObj;
+                                            }
+                                        }
+                                    }
+                                    if (existingObj) {
+                                        if (BT_AttackObjective) *reinterpret_cast<UObject**>(reinterpret_cast<uintptr_t>(existingObj) + 0x50) = BT_AttackObjective;
+                                        *reinterpret_cast<AActor**>(reinterpret_cast<uintptr_t>(existingObj) + 0x00A0) = bestJungleCreep;
+                                    }
+
+                                    LastMacroAction[bot] = "Jungle"; LastMacroTargetName[bot] = targetName;
+                                }
+                            }
+                            else if (bShouldDefend) {
+                                std::string targetName = threatenedFriendlyTower->GetFullName();
+
+
+                                if (LastMacroAction[bot] != "Defend" || LastMacroTargetName[bot] != targetName) {
+
+                                    UBotObjective* existingObj = *reinterpret_cast<UBotObjective**>(
+                                        reinterpret_cast<uintptr_t>(bot) + 0x0748);
+                                    if (!existingObj || !WLClass || !existingObj->IsA(WLClass)) {
+                                        if (WLClass && StaticConstructObject) {
+                                            uint32_t* fl = reinterpret_cast<uint32_t*>(reinterpret_cast<uintptr_t>(WLClass) + 0xB4);
+                                            uint32_t sv = *fl; *fl &= ~0x01u;
+                                            UObject* nObj = StaticConstructObject(WLClass, CommanderObj, FName(), 0, 0, nullptr, false, nullptr, false);
+                                            *fl = sv;
+                                            if (nObj) {
+                                                existingObj = reinterpret_cast<UBotObjective*>(nObj);
+                                                *reinterpret_cast<UBotObjective**>(reinterpret_cast<uintptr_t>(bot) + 0x0748) = existingObj;
+                                                *reinterpret_cast<UObject**>(reinterpret_cast<uintptr_t>(existingObj) + 0x0128) = CommanderObj;
+                                            }
+                                        }
+                                    }
+                                    if (existingObj) {
+                                        if (BT_DefendTower) *reinterpret_cast<UObject**>(reinterpret_cast<uintptr_t>(existingObj) + 0x50) = BT_DefendTower;
+                                        *reinterpret_cast<AActor**>(reinterpret_cast<uintptr_t>(existingObj) + 0x00A0) = threatenedFriendlyTower;
+                                        *reinterpret_cast<AOrionDamageableObjective_Base**>(reinterpret_cast<uintptr_t>(existingObj) + 0x0130) = threatenedFriendlyTower;
+                                    }
+
+                                    LastMacroAction[bot] = "Defend"; LastMacroTargetName[bot] = targetName;
+                                }
+                                moveTarget = threatenedFriendlyTower; accRadius = 800.0f;
+                                {
+                                    std::string cdLow = targetName;
+                                    std::transform(cdLow.begin(), cdLow.end(), cdLow.begin(), ::tolower);
+                                    bool cdInhib = (cdLow.find("bluetower_") != std::string::npos || cdLow.find("redtower_") != std::string::npos);
+                                    bool cdCore  = (cdLow.find("core") != std::string::npos);
+                                    if (cdInhib || cdCore) {
+                                        FVector cdLoc = threatenedFriendlyTower->K2_GetActorLocation();
+                                        float cdDistSq = (cdLoc.X - botLoc.X)*(cdLoc.X - botLoc.X) + (cdLoc.Y - botLoc.Y)*(cdLoc.Y - botLoc.Y) + (cdLoc.Z - botLoc.Z)*(cdLoc.Z - botLoc.Z);
+                                        bool cdFar = (cdDistSq > COLLAPSE_TRAVEL_DIST_SQ);
+                                        int cdDeadEnInh = bIsBlueTeam ? deadInhibitorsRed : deadInhibitorsBlue;
+                                        int cdDeadEn    = bIsBlueTeam ? deadRed : deadBlue;
+                                        bool cdV45Win   = (cdDeadEnInh >= 2) || (cdDeadEnInh >= 1 && cdDeadEn >= 2);
+                                        bool cdPoNR     = (bestEnemyTowerTier == 0) && cdV45Win && (closestEnemyTowerDistSq < 9000000.0f);
+                                        bool cdPersistOK = g_collapseThreatStart.count(threatenedFriendlyTower)
+                                                        && (matchTimeB - g_collapseThreatStart[threatenedFriendlyTower]) >= COLLAPSE_PERSIST_SEC;
+                                        bool cdContinue  = g_collapseStartTime.count(bot)
+                                                        && (matchTimeB - g_collapseStartTime[bot]) < COLLAPSE_COMMIT_SEC
+                                                        && cdFar && !cdPoNR;
+                                        bool cdReachable = (!ENABLE_COLLAPSE_DIST_CAP) || (cdDistSq < COLLAPSE_MAX_DIST_SQ);
+                                        int cdFrH18 = 0, cdEnH18 = 0;
+                                        bool cdActiveHeroFight = (CombatTimer.count(bot) && CombatTimer[bot] > 0.0f && bestEnemyHero && closestEnemyHeroDistSq < 3240000.0f);
+                                        if (ENABLE_COLLAPSE_FIGHT_GATE && cdActiveHeroFight) {
+                                            for (const CachedChar& cc : LiveChars) {
+                                                if (!cc.bIsHero || cc.bIsNeutral) continue;
+                                                if (cc.ptr == botChar) continue;
+                                                float cdqh = (cc.loc.X - botLoc.X)*(cc.loc.X - botLoc.X) + (cc.loc.Y - botLoc.Y)*(cc.loc.Y - botLoc.Y);
+                                                if (cdqh >= 3240000.0f) continue;
+                                                if (cc.team == botTeam) cdFrH18++; else cdEnH18++;
+                                            }
+                                        }
+                                        bool cdInWinningFight = ENABLE_COLLAPSE_FIGHT_GATE && cdActiveHeroFight && (cdFrH18 >= cdEnH18);
+                                        bool cdStart = cdFar && cdReachable && !cdInWinningFight && !cdPoNR && cdPersistOK;
+                                        if (cdStart || cdContinue) {
+                                            if (!cdContinue) g_collapseStartTime[bot] = matchTimeB;
+                                            if (!(BotIsBlind.count(bot) && BotIsBlind[bot])) bot->K2_SetIgnoreEnemies(true);
+                                            bIsRotatingToObjective = true;
+                                            bIsIdle = true; BotIdleTicks[bot] = 10;
+#if F4_LOG_LEVEL >= 1
+                                            {
+                                                static std::map<AOrionAIBot*, float> cdLastLog;
+                                                static std::map<AOrionAIBot*, int>   cdLastDistM;
+                                                int cdM = (int)(sqrt(cdDistSq) / 100.0f);
+                                                if (!cdLastLog.count(bot) || (matchTimeB - cdLastLog[bot]) > 2.0f) {
+                                                    int cdPrevM = cdLastDistM.count(bot) ? cdLastDistM[bot] : -1;
+                                                    std::string cdShort = targetName; size_t cdsp = cdShort.rfind('.');
+                                                    if (cdsp != std::string::npos) cdShort = cdShort.substr(cdsp + 1);
+                                                    if (cdShort.length() > 22) cdShort = cdShort.substr(0, 22);
+                                                    std::cout << "[COLLAPSE-DEFEND] bot=" << botChar->GetFullName().substr(0, 24)
+                                                        << " R=" << roleSlot << " Tier=" << (cdCore ? 4 : 3)
+                                                        << " distM=" << cdM << " prevM=" << cdPrevM
+                                                        << " deltaM=" << (cdPrevM >= 0 ? cdPrevM - cdM : 0)
+                                                        << " blind=" << ((BotIsBlind.count(bot) && BotIsBlind[bot]) ? 1 : 0)
+                                                        << " persistS=" << (int)(matchTimeB - g_collapseThreatStart[threatenedFriendlyTower])
+                                                        << " committed=" << (cdContinue ? 1 : 0)
+                                                        << " V44=" << (bV44Threatened ? 1 : 0)
+                                                        << " Twr=" << cdShort << " T=" << (int)matchTimeB << "s" << std::endl;
+                                                    cdLastLog[bot] = matchTimeB; cdLastDistM[bot] = cdM;
+                                                }
+                                            }
+#endif
+                                        } else {
+                                            bool cdWasCommitted = (g_collapseStartTime.count(bot) > 0);
+                                            g_collapseStartTime.erase(bot);
+#if F4_LOG_LEVEL >= 1
+                                            if (cdWasCommitted && !cdFar) {
+                                                std::cout << "[COLLAPSE-DEFEND] ARRIVE bot=" << botChar->GetFullName().substr(0, 24)
+                                                    << " R=" << roleSlot << " distM=" << (int)(sqrt(cdDistSq) / 100.0f)
+                                                    << " T=" << (int)matchTimeB << "s" << std::endl;
+                                            }
+#endif
+                                        }
+                                    }
+
+                                    if (ENABLE_LANE_RETURN && !cdInhib && !cdCore && !bIsJungler && !bLateGame
+                                            && (bestThreatenedTowerTier == 1 || bestThreatenedTowerTier == 2)
+                                            && gThreatTowerIsMyLane) {
+                                        bool lrInner = (bestThreatenedTowerTier == 2);
+                                        FVector lrLoc = threatenedFriendlyTower->K2_GetActorLocation();
+                                        float lrDistSq = (lrLoc.X - botLoc.X)*(lrLoc.X - botLoc.X)
+                                                       + (lrLoc.Y - botLoc.Y)*(lrLoc.Y - botLoc.Y)
+                                                       + (lrLoc.Z - botLoc.Z)*(lrLoc.Z - botLoc.Z);
+                                        bool lrS0Case = false;
+                                        bool lrS0Raw  = false;
+                                        if ((ENABLE_LR_S0_COVER || ENABLE_LR_WAKE_S0_GUARD) && bIsMeleeChar && bestEnemyHero
+                                            && closestEnemyHeroDistSq < 3240000.0f) {
+                                            int lrS0FrM = 0, lrS0EnM = 0, lrS0FrH = 0;
+                                            for (const CachedChar& cc : LiveChars) {
+                                                if (cc.ptr == botChar) continue;
+                                                float sx = cc.loc.X - botLoc.X, sy = cc.loc.Y - botLoc.Y;
+                                                if (sx * sx + sy * sy >= 3240000.0f) continue;
+                                                if (cc.bIsHero)          { if (cc.team == botTeam) lrS0FrH++; }
+                                                else if (!cc.bIsNeutral) { if (cc.team == botTeam) lrS0FrM++; else if (cc.team == enemyTeam) lrS0EnM++; }
+                                            }
+                                            lrS0Raw  = (lrS0FrH == 0) && (lrS0EnM > lrS0FrM + 1);
+                                            lrS0Case = ENABLE_LR_S0_COVER && lrS0Raw;
+                                        }
+                                        const float lrStopSq = lrS0Case ? LR_TOWER_COVER_SQ : COLLAPSE_TRAVEL_DIST_SQ;
+                                        bool lrFar = (lrDistSq > lrStopSq);
+
+                                        bool  lrHeroPush = gThreatTowerHeroThreat;
+                                        float lrPersist  = g_laneThreatStart.count(threatenedFriendlyTower)
+                                                         ? (matchTimeB - g_laneThreatStart[threatenedFriendlyTower]) : 0.0f;
+                                        int   lrNet      = gThreatTowerNetThreat;
+                                        int   lrDef      = TowerDefenders.count(threatenedFriendlyTower)
+                                                         ? TowerDefenders[threatenedFriendlyTower] : 0;
+                                        bool  lrStartGate = false; const char* lrReason = "Commit";
+                                        if (lrHeroPush)   { lrStartGate = true; lrReason = "HeroPush"; }
+                                        else if (lrInner) { if (lrNet >= LANE_RETURN_NETTHREAT_INNER
+                                                                && lrPersist >= LANE_RETURN_PERSIST_INNER_SEC)
+                                                                { lrStartGate = true; lrReason = "MinInner"; } }
+                                        else              { if (lrPersist >= LANE_RETURN_PERSIST_OUTER_SEC
+                                                                || lrNet >= LANE_RETURN_NETTHREAT_OUTER || lrDef <= 1)
+                                                                { lrStartGate = true; lrReason = "MinOuter"; } }
+
+                                        bool lrActiveFight = (CombatTimer.count(bot) && CombatTimer[bot] > 0.0f
+                                                              && bestEnemyHero && closestEnemyHeroDistSq < 3240000.0f);
+                                        int lrFrH = 0, lrEnH = 0;
+                                        if (lrActiveFight) for (const CachedChar& cc : LiveChars) {
+                                            if (!cc.bIsHero || cc.bIsNeutral || cc.ptr == botChar) continue;
+                                            float dq = (cc.loc.X - botLoc.X)*(cc.loc.X - botLoc.X) + (cc.loc.Y - botLoc.Y)*(cc.loc.Y - botLoc.Y);
+                                            if (dq < 3240000.0f) { if (cc.team == botTeam) lrFrH++; else lrEnH++; }
+                                        }
+                                        bool lrWinFight = lrActiveFight && (lrFrH >= lrEnH);
+
+                                        bool lrCommit = g_laneReturnStartTime.count(bot)
+                                                      && (matchTimeB - g_laneReturnStartTime[bot]) < LANE_RETURN_COMMIT_SEC && lrFar;
+                                        bool lrFire = lrFar && (lrCommit || (lrStartGate && !lrWinFight));
+
+                                        bool lrHeroBlocking = bestEnemyHero && closestEnemyHeroDistSq < 640000.0f;
+                                        bool lrS0Guard = ENABLE_LR_WAKE_S0_GUARD
+                                                       && (lrS0Raw || (g_lrS0Latch.count(bot) && g_lrS0Latch[bot]));
+                                        bool lrWakeFight    = lrFar && lrCommit && lrHeroBlocking && !lrS0Guard;
+
+                                        if (lrWakeFight) {
+                                            bot->K2_SetIgnoreEnemies(false);
+                                            bIsActivelyFighting = true;
+                                            moveTarget = nullptr;
+                                            p7Wake = "LR";
+                                        }
+                                        else if (lrFire) {
+                                            if (!lrCommit) g_laneReturnStartTime[bot] = matchTimeB;
+                                            if (ENABLE_LR_WAKE_S0_GUARD && lrS0Raw) g_lrS0Latch[bot] = true;
+                                            if (!lrCommit || !(BotIsBlind.count(bot) && BotIsBlind[bot]))
+                                                bot->K2_SetIgnoreEnemies(true);
+                                            bIsRotatingToObjective = true;
+                                            bIsIdle = true; BotIdleTicks[bot] = 10;
+#if F4_LOG_LEVEL >= 1
+                                            {
+                                                static std::map<AOrionAIBot*, float> lrLastLog;
+                                                static std::map<AOrionAIBot*, int>   lrLastM;
+                                                int lrM = (int)(sqrt(lrDistSq) / 100.0f);
+                                                if (!lrLastLog.count(bot) || (matchTimeB - lrLastLog[bot]) > 2.0f) {
+                                                    int lrPrevM = lrLastM.count(bot) ? lrLastM[bot] : -1;
+                                                    std::string s = targetName; size_t p = s.rfind('.');
+                                                    if (p != std::string::npos) s = s.substr(p + 1);
+                                                    if (s.length() > 22) s = s.substr(0, 22);
+                                                    std::cout << "[LANE-RETURN] bot=" << botChar->GetFullName() << " Team=" << (bIsBlueTeam ? "B" : "R")
+                                                        << " R=" << roleSlot << " tier=" << (lrInner ? 2 : 1) << " twr=" << s
+                                                        << " distM=" << lrM << " prevM=" << lrPrevM
+                                                        << " deltaM=" << (lrPrevM >= 0 ? lrPrevM - lrM : 0)
+                                                        << " reason=" << ((lrCommit && !lrStartGate) ? "Commit" : lrReason)
+                                                        << " persistS=" << (int)lrPersist << " net=" << lrNet << " def=" << lrDef
+                                                        << " blind=" << ((BotIsBlind.count(bot) && BotIsBlind[bot]) ? 1 : 0)
+                                                        << " committed=" << (lrCommit ? 1 : 0)
+                                                        << " s0=" << (lrS0Case ? 1 : 0)
+                                                        << " s0g=" << ((ENABLE_LR_WAKE_S0_GUARD && (lrS0Raw || (g_lrS0Latch.count(bot) && g_lrS0Latch[bot]))) ? 1 : 0)
+                                                        << " stopM=" << (int)(sqrtf(lrStopSq) / 100.0f)
+                                                        << " T=" << (int)matchTimeB << "s" << std::endl;
+                                                    lrLastLog[bot] = matchTimeB; lrLastM[bot] = lrM;
+                                                }
+                                            }
+#endif
+                                        }
+                                        else {
+                                            bool lrWas = (g_laneReturnStartTime.count(bot) > 0);
+                                            g_laneReturnStartTime.erase(bot);
+                                            g_lrS0Latch.erase(bot);
+#if F4_LOG_LEVEL >= 1
+                                            if (lrWas && !lrFar) {
+                                                std::cout << "[LANE-RETURN] ARRIVE bot=" << botChar->GetFullName() << " Team=" << (bIsBlueTeam ? "B" : "R")
+                                                    << " R=" << roleSlot << " distM=" << (int)(sqrt(lrDistSq) / 100.0f)
+                                                    << " s0=" << (lrS0Case ? 1 : 0)
+                                                    << " stopM=" << (int)(sqrtf(lrStopSq) / 100.0f)
+                                                    << " heroM=" << (bestEnemyHero ? (int)(sqrtf(closestEnemyHeroDistSq) / 100.0f) : -1)
+                                                    << " HP=" << (maxHealth > 0.0f ? (int)((currentHealth / maxHealth) * 100.0f) : -1) << "%"
+                                                    << " T=" << (int)matchTimeB << "s" << std::endl;
+                                            }
+#endif
+                                        }
+                                    }
+                                }
+                                if (ENABLE_R_TOWER_RADIUS && !bIsMeleeChar && !bIsJungler && botChar && maxHealth > 0.0f) {
+                                    bool rtrOpen = g_rtrAStartT.count(bot) > 0;
+                                    const char* rtrEv = nullptr; const char* rtrWhy = nullptr; int rtrAgeLog = -1;
+                                    if (rtrOpen && g_rtrALastT.count(bot) && (matchTimeB - g_rtrALastT[bot]) > 1.5f) {
+                                        rtrAgeLog = (int)(matchTimeB - g_rtrAStartT[bot]);
+                                        g_rtrAStartT.erase(bot); g_rtrAWakeT.erase(bot); g_rtrAFrMN.erase(bot); g_rtrANoHeroN.erase(bot); g_rtrAIn16N.erase(bot);
+                                        g_rtrAEndT[bot] = matchTimeB; rtrOpen = false; rtrEv = "END"; rtrWhy = "gap";
+                                    }
+                                    g_rtrALastT[bot] = matchTimeB;
+                                    bool rtrWasBlind = BotIsBlind.count(bot) && BotIsBlind[bot];
+                                    int  rtrFrM = 0, rtrEnM = 0, rtrFrH = 0, rtrEnH = 0;
+                                    bool rtrMelee8 = false, rtrMelee12 = false, rtrHero4 = false;
+                                    for (const CachedChar& cc : LiveChars) {
+                                        if (cc.ptr == botChar) continue;
+                                        float sx = cc.loc.X - botLoc.X, sy = cc.loc.Y - botLoc.Y;
+                                        float sSq = sx * sx + sy * sy;
+                                        if (sSq >= 3240000.0f) continue;
+                                        if (cc.bIsHero) {
+                                            if (cc.team == enemyTeam) {
+                                                rtrEnH++;
+                                                if (sSq < RTR_WAKE_ANY_SQ) rtrHero4 = true;
+                                                if (sSq <= RTR_REBLIND_MELEE_SQ && RIsMeleeHeroName(cc.ptr->GetFullName())) {
+                                                    rtrMelee12 = true;
+                                                    if (sSq <= RTR_WAKE_MELEE_SQ) rtrMelee8 = true;
+                                                }
+                                            }
+                                            else if (cc.team == botTeam) rtrFrH++;
+                                        }
+                                        else if (!cc.bIsNeutral) { if (cc.team == botTeam) rtrFrM++; else if (cc.team == enemyTeam) rtrEnM++; }
+                                    }
+                                    bool  rtrOutnum = (rtrEnH > rtrFrH + 1);
+                                    int   rtrHeroHP = -1;
+                                    if (bestEnemyHero) for (const CachedChar& mc : LiveChars) { if (mc.ptr != bestEnemyHero) continue; rtrHeroHP = (mc.maxHealth > 0.0f) ? (int)((mc.health / mc.maxHealth) * 100.0f) : -1; break; }
+                                    float rtrBotHP  = (currentHealth / maxHealth) * 100.0f;
+                                    bool  rtrKill   = RKillLage(AllTowers, bestEnemyHero, rtrHeroHP, rtrBotHP, rtrOutnum, closestEnemyHeroDistSq);
+                                    bool  rtrHero18 = bestEnemyHero && closestEnemyHeroDistSq <= RBR_HERO_MAX_SQ;
+                                    float rtrD      = closestThreatenedTowerDistSq;
+                                    bool  rtrBase   = threatenedFriendlyTower && threatenedFriendlyTower == closestFriendlyTower && gThreatTowerIsMyLane
+                                                   && (bestThreatenedTowerTier == 1 || bestThreatenedTowerTier == 2)
+                                                   && moveTarget == static_cast<AActor*>(threatenedFriendlyTower)
+                                                   && !bIsRotatingToObjective && !bDoingBoss && !bLateGame;
+                                    bool  rtrLage   = rtrBase && rtrD > TOWER_SAFE_SQ && rtrD <= RDC_INNER_SQ
+                                                   && rtrHero18 && rtrFrH == 0 && (rtrFrM == 0 || rtrOutnum);
+                                    bool  rtrWake   = rtrMelee8 || rtrHero4;
+                                    bool  rtrRdc    = ENABLE_R_DEFEND_CARRY && g_rdcStartT.count(bot) > 0;
+                                    bool  rtrHandoff = g_rtrAHandoffT.count(bot) && (matchTimeB - g_rtrAHandoffT[bot]) <= 1.5f;
+                                    if (rtrOpen) {
+                                        float rtrAge = matchTimeB - g_rtrAStartT[bot];
+                                        g_rtrAFrMN[bot]    = (rtrFrM >= 1 && !rtrOutnum) ? (g_rtrAFrMN[bot] + 1) : 0;
+                                        g_rtrANoHeroN[bot] = rtrHero18 ? 0 : (g_rtrANoHeroN[bot] + 1);
+                                        g_rtrAIn16N[bot]   = (rtrD <= TOWER_SAFE_SQ) ? (g_rtrAIn16N[bot] + 1) : 0;
+                                        bool rtrToB = false;
+                                        if (!rtrBase)                                   rtrWhy = bIsRotatingToObjective ? "lr" : "owner";
+                                        else if (rtrD <= RTR_A_ARRIVE_SQ)               { rtrWhy = "arrive"; rtrToB = true; }
+                                        else if (g_rtrAIn16N[bot] >= RTR_A_IN16_TICKS)  { rtrWhy = "in16";   rtrToB = true; }
+                                        else if (rtrD > RDC_INNER_SQ)                   rtrWhy = "band";
+                                        else if (rtrKill)                               rtrWhy = "kill";
+                                        else if (rtrFrH >= 1)                           rtrWhy = "frH";
+                                        else if (rtrRdc)                                rtrWhy = "rdc";
+                                        else if (g_rtrAFrMN[bot] >= 2)                  rtrWhy = "wave";
+                                        else if (g_rtrANoHeroN[bot] >= 2)               rtrWhy = "heroGone";
+                                        else if (rtrAge >= RTR_A_CAP_S)                 rtrWhy = "cap";
+                                        else if (rtrAge >= RTR_A_COMMIT_S && !rtrLage)  rtrWhy = "lage";
+                                        if (rtrWhy) {
+                                            if (rtrToB) g_rtrBHandoffT[bot] = matchTimeB;
+                                            else        g_rtrAEndT[bot]     = matchTimeB;
+                                            rtrAgeLog = (int)rtrAge;
+                                            g_rtrAStartT.erase(bot); g_rtrAWakeT.erase(bot); g_rtrAFrMN.erase(bot); g_rtrANoHeroN.erase(bot); g_rtrAIn16N.erase(bot);
+                                            rtrOpen = false; rtrEv = "END";
+                                        }
+                                    }
+                                    bool rtrStartOk = !rtrOpen && !rtrWhy && rtrLage && !rtrWake && !rtrMelee12 && !rtrKill && !rtrRdc
+                                                   && (rtrHandoff || !g_rtrAEndT.count(bot) || (matchTimeB - g_rtrAEndT[bot]) >= RTR_COOLDOWN_S);
+                                    if (rtrStartOk) {
+                                        bool rtrConsec = g_rtrAStreakT.count(bot) && (matchTimeB - g_rtrAStreakT[bot]) <= 1.5f;
+                                        g_rtrAStreak[bot] = rtrConsec ? (g_rtrAStreak[bot] + 1) : 1;
+                                        g_rtrAStreakT[bot] = matchTimeB;
+                                    } else if (!rtrOpen) { g_rtrAStreak.erase(bot); g_rtrAStreakT.erase(bot); }
+                                    int  rtrEnter = (rtrWasBlind || rtrHandoff) ? 1 : RTR_A_ENTER_TICKS;
+                                    bool rtrFresh = false;
+                                    if (rtrStartOk && g_rtrAStreak[bot] >= rtrEnter) {
+                                        g_rtrAStartT[bot] = matchTimeB; g_rtrAFrMN[bot] = 0; g_rtrANoHeroN[bot] = 0; g_rtrAIn16N[bot] = 0; g_rtrAWakeT.erase(bot);
+                                        g_rtrAStreak.erase(bot); g_rtrAStreakT.erase(bot); g_rtrAHandoffT.erase(bot);
+                                        rtrOpen = true; rtrFresh = true; rtrEv = "FIRE";
+                                    }
+                                    if (!rtrHandoff) g_rtrAHandoffT.erase(bot);
+                                    if (rtrOpen) {
+                                        if (g_rtrAWakeT.count(bot)) {
+                                            bool rtrReblind = !rtrMelee12 && !rtrHero4 && rtrD > TOWER_SAFE_SQ
+                                                           && (matchTimeB - g_rtrAWakeT[bot]) >= RTR_REBLIND_MIN_S;
+                                            if (rtrReblind) { g_rtrAWakeT.erase(bot); if (!rtrEv) rtrEv = "REBLIND"; }
+                                            else { bIsActivelyFighting = true; moveTarget = nullptr; }
+                                        }
+                                        else if (rtrWake) {
+                                            if (rtrWasBlind) bot->K2_SetIgnoreEnemies(false);
+                                            bIsActivelyFighting = true; moveTarget = nullptr;
+                                            g_rtrAWakeT[bot] = matchTimeB; if (!rtrEv) rtrEv = "WAKE";
+                                        }
+                                        if (!g_rtrAWakeT.count(bot)) {
+                                            if (rtrFresh || !rtrWasBlind) bot->K2_SetIgnoreEnemies(true);
+                                            bIsRotatingToObjective = true;
+                                            bIsIdle = true; BotIdleTicks[bot] = 10;
+                                            accRadius = RTR_A_ACCR;
+                                        }
+                                    }
+                                    bool rtrSee = false; const char* rtrSeeKind = nullptr;
+                                    if (ENABLE_R_TR_A_SEE && threatenedFriendlyTower && rtrD > TOWER_SAFE_SQ && rtrD <= RDC_INNER_SQ) {
+                                        if (rtrOpen && g_rtrAWakeT.count(bot))                                                        rtrSeeKind = "wake";
+                                        else if (!rtrOpen && !rtrWhy && rtrLage && (rtrMelee12 || rtrWake) && !rtrKill && !rtrRdc)     rtrSeeKind = "melee12";
+                                        if (rtrSeeKind) {
+                                            moveTarget = static_cast<AActor*>(threatenedFriendlyTower); accRadius = RTR_ASEE_ACCR;
+                                            bIsIdle = true; BotIdleTicks[bot] = 10;
+                                            if (RTR_ASEE_STOP) bR51Lockbreak = true;
+                                            rtrSee = true;
+                                        }
+                                    }
+                                    if (g_rtrASeeT.count(bot) && (!g_rtrASeeLastT.count(bot) || (matchTimeB - g_rtrASeeLastT[bot]) > 1.5f)) g_rtrASeeT.erase(bot);
+                                    if (rtrSee) g_rtrASeeLastT[bot] = matchTimeB;
+                                    bool rtrSeeWas    = g_rtrASeeT.count(bot) > 0;
+                                    if (rtrSee && !rtrSeeWas) g_rtrASeeT[bot] = matchTimeB;
+                                    if (!rtrSee && rtrSeeWas) { g_rtrASeeT.erase(bot); g_rRetEndT[bot] = matchTimeB; }
+                                    if (rtrEv && std::string(rtrEv) == "END") g_rRetEndT[bot] = matchTimeB;
+#if F4_LOG_LEVEL >= 1
+                                    if (rtrEv || (rtrOpen && (!g_rtrALogT.count(bot) || (matchTimeB - g_rtrALogT[bot]) >= 2.0f))) {
+                                        g_rtrALogT[bot] = matchTimeB;
+                                        float rtrMoved = -1.0f;
+                                        if (!rtrFresh && g_rtrAPrevPos.count(bot)) { FVector pp = g_rtrAPrevPos[bot];
+                                            rtrMoved = sqrtf((botLoc.X - pp.X) * (botLoc.X - pp.X) + (botLoc.Y - pp.Y) * (botLoc.Y - pp.Y)) / 100.0f; }
+                                        g_rtrAPrevPos[bot] = botLoc;
+                                        std::cout << "[R-TR] " << (rtrEv ? rtrEv : "TRACE") << " mode=A bot=" << botChar->GetFullName()
+                                            << " Team=" << (bIsBlueTeam ? "B" : "R") << " R=" << roleSlot << " why=" << (rtrWhy ? rtrWhy : "-")
+                                            << " dM=" << (int)(sqrtf(rtrD) / 100.0f)
+                                            << " heroM=" << (bestEnemyHero ? (int)(sqrtf(closestEnemyHeroDistSq) / 100.0f) : -1)
+                                            << " melee8=" << (rtrMelee8 ? 1 : 0) << " melee12=" << (rtrMelee12 ? 1 : 0) << " hero4=" << (rtrHero4 ? 1 : 0)
+                                            << " FrM18/EnM18=" << rtrFrM << "/" << rtrEnM << " FrH18/EnH18=" << rtrFrH << "/" << rtrEnH << " outnum=" << (rtrOutnum ? 1 : 0)
+                                            << " blindPrev=" << (rtrWasBlind ? 1 : 0) << " wake=" << (g_rtrAWakeT.count(bot) ? 1 : 0) << " handoff=" << (rtrHandoff ? 1 : 0)
+                                            << " ageS=" << (rtrOpen ? (int)(matchTimeB - g_rtrAStartT[bot]) : rtrAgeLog) << " movedM=" << rtrMoved
+                                            << " HP=" << (int)rtrBotHP << " heroHP=" << rtrHeroHP << " kill=" << (rtrKill ? 1 : 0) << " rdc=" << (rtrRdc ? 1 : 0) << " see=" << (rtrSee ? 1 : 0)
+                                            << " tier=" << bestThreatenedTowerTier << " T=" << (int)matchTimeB << "s" << std::endl;
+                                    }
+                                    if (!rtrOpen) g_rtrAPrevPos.erase(bot);
+#endif
+                                }
+                                if (ENABLE_P3_DEFEND_YIELD && bIsMeleeChar && !bIsJungler && !bDoingBoss
+                                    && threatenedFriendlyTower
+                                    && moveTarget == static_cast<AActor*>(threatenedFriendlyTower)
+                                    && (bestThreatenedTowerTier == 1 || bestThreatenedTowerTier == 2)
+                                    && !bIsRotatingToObjective
+                                    && maxHealth > 0.0f)
+                                {
+                                    FVector pdyTL = threatenedFriendlyTower->K2_GetActorLocation();
+                                    float pdyTwrSq = (pdyTL.X - botLoc.X) * (pdyTL.X - botLoc.X) + (pdyTL.Y - botLoc.Y) * (pdyTL.Y - botLoc.Y);
+                                    int pdyFrM = 0, pdyEnM = 0, pdyFrH = 0, pdyEnH = 0;
+                                    for (const CachedChar& cc : LiveChars) {
+                                        if (cc.ptr == botChar) continue;
+                                        float sx = cc.loc.X - botLoc.X, sy = cc.loc.Y - botLoc.Y;
+                                        if (sx * sx + sy * sy >= 3240000.0f) continue;
+                                        if (cc.bIsHero)          { if (cc.team == enemyTeam) pdyEnH++; else if (cc.team == botTeam) pdyFrH++; }
+                                        else if (!cc.bIsNeutral) { if (cc.team == botTeam)   pdyFrM++; else if (cc.team == enemyTeam) pdyEnM++; }
+                                    }
+                                    bool pdyAlone    = (pdyFrM == 0 && pdyEnH >= 1);
+                                    bool pdyDeficit  = (pdyEnM >= pdyFrM + 2) && (pdyEnH >= 1);
+                                    bool pdyOutnum   = (pdyEnH > pdyFrH + 1);
+                                    bool pdyHeroNear = bestEnemyHero && (closestEnemyHeroDistSq < 3240000.0f);
+                                    bool pdyHeroPB   = bestEnemyHero && (closestEnemyHeroDistSq < PDY_WAKE_HERO_SQ);
+                                    bool pdyPred     = (pdyFrH == 0) && pdyHeroNear && (pdyAlone || pdyDeficit || pdyOutnum);
+                                    bool pdyOutside  = (pdyTwrSq > (ENABLE_I3_TWR16 ? I3_TWR16_SQ : PDY_OUTSIDE_SQ));
+                                    bool pdyInCap    = (pdyTwrSq <= PDY_MAX_SQ);
+                                    bool pdyArrived  = (pdyTwrSq <= PDY_COVER_SQ);
+                                    bool  j1Depth = false, j1Ep = false;
+                                    int   j1HeroHP = -1;
+                                    float j1HeroTwrM = -1.0f;
+                                    bool  l3AfterDe = false;
+                                    bool  dpyCase = false, dpyWalk = false, dpyHold = false, dpyRanged = false;
+                                    const char* dpyEnd = "";
+                                    if (ENABLE_DEF_POKE_YIELD2 && bestEnemyHero) {
+                                        g_dpyEvalT[bot] = matchTimeB;
+                                        FVector dpyHL = bestEnemyHero->K2_GetActorLocation();
+                                        float dpyHeroTwrSq = (pdyTL.X - dpyHL.X) * (pdyTL.X - dpyHL.X) + (pdyTL.Y - dpyHL.Y) * (pdyTL.Y - dpyHL.Y);
+                                        bool  dpyWasOn = g_dpyOnT.count(bot) > 0;
+                                        bool  p8DpyHadArrived = g_dpyArrT.count(bot) > 0;
+                                        {
+                                            std::string dpyN = bestEnemyHero->GetFullName();
+                                            dpyRanged = !(dpyN.find("Steel") != std::string::npos || dpyN.find("WarDrum") != std::string::npos || dpyN.find("Chains") != std::string::npos || dpyN.find("Kwang") != std::string::npos || dpyN.find("Grux") != std::string::npos || dpyN.find("Tomahawk") != std::string::npos || dpyN.find("FallenAngel") != std::string::npos || dpyN.find("Rampage") != std::string::npos || dpyN.find("Vamp") != std::string::npos || dpyN.find("Justice") != std::string::npos || dpyN.find("Kurohane") != std::string::npos || dpyN.find("Sword") != std::string::npos || dpyN.find("Crunch") != std::string::npos || dpyN.find("Mudang") != std::string::npos || dpyN.find("Hammer") != std::string::npos || dpyN.find("Wukong") != std::string::npos || dpyN.find("Ice") != std::string::npos || dpyN.find("Femme") != std::string::npos || dpyN.find("ArcBlade") != std::string::npos);
+                                        }
+                                        bool dpyCool  = g_dpyCoolT.count(bot) && (matchTimeB - g_dpyCoolT[bot]) < DPY_COOLDOWN_S;
+                                        const float p8DpyInSq  = ENABLE_P8_DPY_FIX ? P8_DPY_HERO_TWR_IN_SQ  : DPY_HERO_TWR_IN_SQ;
+                                        const float p8DpyOutSq = ENABLE_P8_DPY_FIX ? P8_DPY_HERO_TWR_OUT_SQ : DPY_HERO_TWR_OUT_SQ;
+                                        bool dpyHeroOut = dpyHeroTwrSq > (dpyWasOn ? p8DpyOutSq : p8DpyInSq);
+                                        int   i1HeroHP = -1;
+                                        if (ENABLE_I1_POKE_DEEP && bestEnemyHero)
+                                            for (const CachedChar& i1c : LiveChars) { if (i1c.ptr != bestEnemyHero) continue; i1HeroHP = (i1c.maxHealth > 0.0f) ? (int)((i1c.health / i1c.maxHealth) * 100.0f) : -1; break; }
+                                        float i1BotHP  = (maxHealth > 0.0f) ? (currentHealth / maxHealth) * 100.0f : -1.0f;
+                                        bool  i1DeBusy = (g_deEngagedLastTick.count(bot) && g_deEngagedLastTick[bot]);
+                                        const char* i1Why = nullptr;
+                                        if      (!ENABLE_I1_POKE_DEEP)                                             i1Why = "off";
+                                        else if (bLateGame)                                                        i1Why = "late";
+                                        else if (trLose3s == -999 || trHeroLoss3s == -999)                         i1Why = "trUnknown";
+                                        else if (trLose3s < I1_LOSE_NET)                                           i1Why = "lose";
+                                        else if (trHeroLoss3s > I1_HERO_LOSS_MAX)                                  i1Why = "heroLoss";
+                                        else if (i1HeroHP < 0 || i1BotHP < 0.0f)                                   i1Why = "hpUnknown";
+                                        else if (i1BotHP >= (float)i1HeroHP + I1_LEAD_MAX)                         i1Why = "lead";
+                                        else if (ENABLE_I2_KILL_ENTRY && i1HeroHP <= (int)I1_KILL_SKIP_HP)          i1Why = "kill";
+                                        else if (pdyFrH != 0)                                                      i1Why = "frH";
+                                        else if (dpyHeroTwrSq > DPY_HERO_TWR_MAX_SQ)                               i1Why = "heroTwr";
+                                        else if (i1DeBusy)                                                         i1Why = "deBusy";
+                                        else if (g_akoUntil.count(bot))                                            i1Why = "akoOn";
+                                        bool  i1Poke = (i1Why == nullptr);
+                                        bool  i1Ep   = ENABLE_I1_POKE_DEEP && dpyWasOn && g_i1EpT.count(bot) && g_dpyOnT.count(bot) && g_i1EpT[bot] == g_dpyOnT[bot];
+                                        bool  d1Orig = (!ENABLE_D1_DPY_MINION_TERM) || pdyAlone || pdyDeficit || pdyOutnum;
+                                        bool d1MinOK = d1Orig || i1Poke || i1Ep;
+                                        bool dpyEnterRaw = dpyRanged && !dpyCool && dpyHeroOut
+                                                     && (dpyHeroTwrSq <= DPY_HERO_TWR_MAX_SQ || bTradeLosing)
+                                                     && dpyHeroTwrSq < DPY_HERO_FAR_SQ
+                                                     && closestEnemyHeroDistSq <= DPY_HERO_BOT_SQ
+                                                     && pdyTwrSq > DPY_BOT_MIN_SQ && pdyInCap
+                                                     && (CombatTimer.count(bot) && CombatTimer[bot] > 0.0f)
+                                                     && (pdyEnH >= pdyFrH)
+                                                     && !(ENABLE_P8_DPY_FIX && trLose3s != -999 && trLose3s <= DPY_TRADE_WIN && trHeroLoss3s >= P8_DPY_HERO_LOSS_MIN);
+                                        bool dpyEnter = dpyEnterRaw && d1MinOK;
+                                        if (dpyWasOn) {
+                                            bool dpyTradeWon = (trLose3s != -999) && (trLose3s <= DPY_TRADE_WIN)
+                                                             && (!ENABLE_P8_DPY_FIX || trHeroLoss3s >= P8_DPY_HERO_LOSS_MIN);
+                                            bool dpyCap      = (matchTimeB - g_dpyOnT[bot]) >= DPY_MAX_S;
+                                            if      (!dpyRanged || dpyHeroTwrSq <= (i1Ep ? p8DpyInSq : p8DpyOutSq)) dpyEnd = "heroInTwr";
+                                            else if (dpyHeroTwrSq >= DPY_HERO_FAR_SQ)                   dpyEnd = "heroFar";
+                                            else if (dpyTradeWon)                                       dpyEnd = "tradeWon";
+                                            else if (dpyCap)                                            dpyEnd = "cap";
+                                            dpyCase = (dpyEnd[0] == '\0');
+                                        } else {
+                                            dpyCase = dpyEnter;
+                                            if (dpyCase) g_dpyOnT[bot] = matchTimeB;
+                                            if (dpyCase) {
+                                                if (ENABLE_I1_POKE_DEEP && i1Poke && !d1Orig) g_i1EpT[bot] = g_dpyOnT[bot]; else g_i1EpT.erase(bot);
+                                            }
+                                        }
+                                        if (dpyCase) {
+                                            if (pdyTwrSq <= DPY_ARRIVE_SQ) {
+                                                if (!g_dpyArrT.count(bot)) { g_dpyArrT[bot] = matchTimeB; g_pdyStartT.erase(bot); }
+                                                dpyHold = true;
+                                            } else if (!g_dpyArrT.count(bot)) {
+                                                dpyWalk = true;
+                                            } else {
+                                                dpyHold = true;
+                                            }
+                                            if (DPY_ACTION && dpyWalk && (!ENABLE_D1_DPY_HIJACK_GATE || d1MinOK)) { pdyPred = true; pdyOutside = true; pdyArrived = false; }
+                                        } else if (dpyWasOn) {
+                                            g_i1EpT.erase(bot);
+                                            g_dpyOnT.erase(bot); g_dpyArrT.erase(bot);
+                                            g_dpyCoolT[bot] = matchTimeB;
+                                            if (ENABLE_P8_DPY_FIX && !p8DpyHadArrived) g_pdyStartT.erase(bot);
+                                        }
+                                    } else if (g_dpyOnT.count(bot)) {
+                                        g_dpyOnT.erase(bot); g_dpyArrT.erase(bot); g_i1EpT.erase(bot);
+                                    }
+                                    bool pdyWasBlind = (BotIsBlind.count(bot) && BotIsBlind[bot]);
+                                    if (pdyPred && pdyOutside && pdyInCap) g_pdyStreak[bot] = (g_pdyStreak.count(bot) ? g_pdyStreak[bot] : 0) + 1;
+                                    else                                   g_pdyStreak[bot] = 0;
+                                    int  pdyEnter  = (pdyWasBlind || (l3AfterDe && j1Depth)) ? 1 : PDY_ENTER_TICKS;
+                                    bool pdyCommit = g_pdyStartT.count(bot) && (matchTimeB - g_pdyStartT[bot]) < PDY_COMMIT_SEC;
+                                    bool pdyS0     = ENABLE_PDY_WAKE_S0_GUARD && (pdyAlone || pdyDeficit);
+                                    bool pdyFire   = !pdyArrived && pdyInCap && (pdyCommit || (g_pdyStreak[bot] >= pdyEnter && (!pdyHeroPB || pdyS0)));
+                                    int  pdyPhaseNow = 0;
+                                    if (!pdyFire) {
+                                        g_pdyStartT.erase(bot);
+                                        if (pdyArrived && pdyWasBlind) {
+                                            pdyPhaseNow = 4;
+                                        }
+                                    }
+                                    else if (pdyHeroPB && pdyCommit && !pdyS0) {
+                                        bot->K2_SetIgnoreEnemies(false);
+                                        bIsActivelyFighting = true;
+                                        moveTarget = nullptr;
+                                        pdyPhaseNow = 3;
+                                        p7Wake = "PDY";
+                                    }
+                                    else {
+                                        if (!pdyCommit) {
+                                            g_pdyStartT[bot] = matchTimeB;
+                                        }
+                                        if (!pdyCommit || !pdyWasBlind) bot->K2_SetIgnoreEnemies(true);
+                                        bIsRotatingToObjective = true;
+                                        bIsIdle = true; BotIdleTicks[bot] = 10;
+                                        pdyPhaseNow = pdyCommit ? 2 : 1;
+                                        if (DPY_ACTION && dpyWalk) accRadius = DPY_WALK_ACCR;
+                                    }
+#if F4_LOG_LEVEL >= 1
+                                    if (pdyPhaseNow != 0) {
+                                        int  pdyPrevPhase = g_pdyPhase.count(bot) ? g_pdyPhase[bot] : 0;
+                                        bool pdyTrans = (pdyPhaseNow != pdyPrevPhase);
+                                        if (pdyTrans || !g_pdyLogT.count(bot) || (matchTimeB - g_pdyLogT[bot]) > 2.0f) {
+                                            g_pdyLogT[bot] = matchTimeB;
+                                            float pdyMovedM = -1.0f;
+                                            if (g_pdyPos.count(bot)) {
+                                                float mx = botLoc.X - g_pdyPos[bot].X, my = botLoc.Y - g_pdyPos[bot].Y;
+                                                pdyMovedM = sqrtf(mx * mx + my * my) / 100.0f;
+                                            }
+                                            g_pdyPos[bot] = botLoc;
+                                            const char* pdyPhaseStr = pdyPhaseNow == 1 ? "FIRE" : pdyPhaseNow == 2 ? "HOLD" : pdyPhaseNow == 3 ? "WAKE" : "ARRIVE";
+                                            const char* pdyReason   = pdyOutnum ? "Outnum" : pdyAlone ? "Alone" : pdyDeficit ? "Deficit" : (j1Depth || j1Ep) ? "Depth" : "-";
+                                            std::cout << "[P3-DEFEND-YIELD] " << botChar->GetFullName()
+                                                << " R=" << roleSlot << " Team=" << (bIsBlueTeam ? "B" : "R")
+                                                << " phase=" << pdyPhaseStr << " reason=" << pdyReason
+                                                << " | twrM=" << (int)(sqrtf(pdyTwrSq) / 100.0f)
+                                                << " heroM=" << (bestEnemyHero ? (int)(sqrtf(closestEnemyHeroDistSq) / 100.0f) : -1)
+                                                << " FrM18=" << pdyFrM << " EnM18=" << pdyEnM << " FrH18=" << pdyFrH << " EnH18=" << pdyEnH
+                                                << " | streak=" << g_pdyStreak[bot]
+                                                << " commitS=" << (g_pdyStartT.count(bot) ? (int)(matchTimeB - g_pdyStartT[bot]) : -1)
+                                                << " fromBlind=" << (pdyWasBlind ? 1 : 0)
+                                                << " s0g=" << (pdyS0 ? 1 : 0)
+                                                << " j1=" << (j1Ep ? 2 : (j1Depth ? 1 : 0)) << " heroTwrM=" << (int)j1HeroTwrM << " l3=" << (l3AfterDe ? 1 : 0)
+                                                << " combat=" << ((CombatTimer.count(bot) && CombatTimer[bot] > 0.0f) ? 1 : 0)
+                                                << " lead=" << (j1HeroHP >= 0 ? (int)((currentHealth / maxHealth) * 100.0f) - j1HeroHP : -999)
+                                                << " trLose3s=" << trLose3s << " trHeroLoss3s=" << trHeroLoss3s
+                                                << " movedM=" << pdyMovedM
+                                                << " HP=" << (int)((currentHealth / maxHealth) * 100.0f) << "%"
+                                                << " tier=" << bestThreatenedTowerTier
+                                                << " T=" << (int)matchTimeB << "s" << std::endl;
+                                        }
+                                    } else {
+                                        g_pdyPos.erase(bot);
+                                    }
+                                    g_pdyPhase[bot] = pdyPhaseNow;
+#endif
+                                }
+                            }
+
+
+                            else if (!bShouldDefend && LastMacroAction[bot] == "Defend") {
+                                LastMacroAction[bot] = "";
+                                LastMacroTargetName[bot] = "";
+                                g_dpyOnT.erase(bot); g_dpyArrT.erase(bot); g_dpyCoolT.erase(bot); g_i1EpT.erase(bot); g_l3DeSeenT.erase(bot);
+                                g_pdyStartT.erase(bot); g_pdyStreak.erase(bot);
+                                if (g_rtrAStartT.count(bot)) {
+                                    g_rRetEndT[bot] = matchTimeB;
+                                    g_rtrAEndT[bot] = matchTimeB;
+#if F4_LOG_LEVEL >= 1
+                                    std::cout << "[R-TR] END mode=A bot=" << botChar->GetFullName() << " Team=" << (bIsBlueTeam ? "B" : "R") << " R=" << roleSlot
+                                        << " why=defExit ageS=" << (int)(matchTimeB - g_rtrAStartT[bot]) << " T=" << (int)matchTimeB << "s" << std::endl;
+#endif
+                                }
+                                g_rtrAStartT.erase(bot); g_rtrAWakeT.erase(bot); g_rtrAStreak.erase(bot); g_rtrAStreakT.erase(bot); g_rtrAFrMN.erase(bot); g_rtrANoHeroN.erase(bot);
+                                g_rtrAIn16N.erase(bot); g_rtrAHandoffT.erase(bot);
+                                if (g_rtrASeeT.count(bot)) { g_rtrASeeT.erase(bot); g_rtrASeeLastT.erase(bot); g_rRetEndT[bot] = matchTimeB; }
+                                {
+                                    UBotObjective* defExitObj = *reinterpret_cast<UBotObjective**>(reinterpret_cast<uintptr_t>(bot) + 0x0748);
+                                    if (defExitObj) {
+                                        *reinterpret_cast<UObject**>(reinterpret_cast<uintptr_t>(defExitObj) + 0x50) = nullptr;
+                                        *reinterpret_cast<AActor**>(reinterpret_cast<uintptr_t>(defExitObj) + 0x00A0) = nullptr;
+                                        *reinterpret_cast<AActor**>(reinterpret_cast<uintptr_t>(defExitObj) + 0x0130) = nullptr;
+                                    }
+                                }
+                            }
+                            else if (!bShouldDefend && !bLateGame
+                                && roleSlot != 2
+                                && !bV44Threatened
+                                && (BotIdleTicks[bot] >= 1 || LastMacroAction[bot] == "Rotate" || LastMacroAction[bot] == "")
+                                && !bIsInBase
+                                && (CombatTimer[bot] <= 0.0f || LastMacroAction[bot] == "Rotate")
+                                && matchTimeB > 120.0f
+                                && ((currentHealth / maxHealth) > 0.5f || LastMacroAction[bot] == "Rotate")
+                                ) {
+                                AOrionChar* bestRotEnemy = nullptr;
+                                float bestRotDistSq = 49000000.0f;
+
+                                for (const auto& fight : ActiveFights) {
+                                    if (fight.allyTeam != botTeam) continue;
+                                    if (fight.allyHero == botChar) continue;
+
+                                    if (LastMacroAction[bot] != "Rotate") {
+                                        float allyHp = 1.0f, allyMax = 1000.0f;
+                                        if (getHealthFunc) fight.allyHero->ProcessEvent(getHealthFunc, &allyHp);
+                                        if (getMaxHealthFunc) fight.allyHero->ProcessEvent(getMaxHealthFunc, &allyMax);
+                                        if (allyMax > 0.0f && (allyHp / allyMax) >= 0.6f) {
+                                            continue;
+                                        }
+                                    }
+
+                                    float dSq = (fight.fightLocation.X - botLoc.X) * (fight.fightLocation.X - botLoc.X) +
+                                        (fight.fightLocation.Y - botLoc.Y) * (fight.fightLocation.Y - botLoc.Y) +
+                                        (fight.fightLocation.Z - botLoc.Z) * (fight.fightLocation.Z - botLoc.Z);
+
+                                    if (dSq < 2250000.0f) continue;
+
+                                    {
+                                        int rotFightLane = 1; float bestLaneDSq = 3.4e38f;
+                                        for (int L = 0; L < 3; ++L) {
+                                            if (!frontFriendlyTowers[L]) continue;
+                                            FVector lLoc = frontFriendlyTowers[L]->K2_GetActorLocation();
+                                            float dL = (lLoc.X - fight.fightLocation.X) * (lLoc.X - fight.fightLocation.X)
+                                                     + (lLoc.Y - fight.fightLocation.Y) * (lLoc.Y - fight.fightLocation.Y);
+                                            if (dL < bestLaneDSq) { bestLaneDSq = dL; rotFightLane = L; }
+                                        }
+                                        int rdRot = botPhysLane - rotFightLane; if (rdRot < 0) rdRot = -rdRot;
+                                        if (rdRot >= 2) continue;
+                                    }
+
+                                    if (dSq < bestRotDistSq) {
+                                        bestRotDistSq = dSq;
+                                        bestRotEnemy = fight.enemyHero;
+                                    }
+                                }
+
+                                if (LastMacroAction[bot] == "Rotate") {
+                                    AOrionChar* savedTarget = RotationTargetEnemy.count(bot) ? RotationTargetEnemy[bot] : nullptr;
+                                    bool bRotationStillValid = false;
+
+                                    if (savedTarget) {
+                                        bool bTargetStillExists = false;
+                                        for (AOrionChar* c : AllChars) {
+                                            if (c == savedTarget) { bTargetStillExists = true; break; }
+                                        }
+                                        if (!bTargetStillExists) {
+                                            RotationTargetEnemy.erase(bot);
+                                            RotationStartTime.erase(bot);
+                                            LastMacroAction[bot] = "";
+                                            LastMacroTargetName[bot] = "";
+                                            bestRotEnemy = nullptr;
+                                            savedTarget = nullptr;
+                                        }
+                                    }
+
+                                    if (savedTarget) {
+                                        float savedHp = 0.0f;
+                                        if (getHealthFunc) savedTarget->ProcessEvent(getHealthFunc, &savedHp);
+
+                                        if (savedHp > 0.0f) {
+                                            FVector eLoc = savedTarget->K2_GetActorLocation();
+                                            float eDistSq = (eLoc.X - botLoc.X) * (eLoc.X - botLoc.X) +
+                                                (eLoc.Y - botLoc.Y) * (eLoc.Y - botLoc.Y) +
+                                                (eLoc.Z - botLoc.Z) * (eLoc.Z - botLoc.Z);
+
+                                            if (eDistSq < 100000000.0f) {
+                                                bRotationStillValid = true;
+                                                bestRotEnemy = savedTarget;
+                                                bestRotDistSq = eDistSq;
+                                            }
+                                        }
+                                    }
+
+                                    if (RotationStartTime.count(bot) && (matchTimeB - RotationStartTime[bot]) > 20.0f) {
+                                        bRotationStillValid = false;
+                                    }
+                                    if ((currentHealth / maxHealth) <= 0.5f) {
+                                        bRotationStillValid = false;
+                                    }
+
+                                    if (!bRotationStillValid) {
+                                        LastMacroAction[bot] = "";
+                                        LastMacroTargetName[bot] = "";
+                                        RotationTargetEnemy.erase(bot);
+                                        RotationStartTime.erase(bot);
+                                        bestRotEnemy = nullptr;
+                                    }
+                                }
+
+                                if (bestRotEnemy) {
+                                    std::string targetName = bestRotEnemy->GetFullName();
+
+                                    if (LastMacroAction[bot] != "Rotate" || LastMacroTargetName[bot] != targetName) {
+                                        RotationTargetEnemy[bot] = bestRotEnemy;
+                                        RotationStartTime[bot] = matchTimeB;
+
+                                        UBotObjective* existingObj = *reinterpret_cast<UBotObjective**>(
+                                            reinterpret_cast<uintptr_t>(bot) + 0x0748);
+                                        if (!existingObj || !WLClass || !existingObj->IsA(WLClass)) {
+                                            if (WLClass && StaticConstructObject) {
+                                                uint32_t* fl = reinterpret_cast<uint32_t*>(
+                                                    reinterpret_cast<uintptr_t>(WLClass) + 0xB4);
+                                                uint32_t sv = *fl; *fl &= ~0x01u;
+                                                UObject* nObj = StaticConstructObject(
+                                                    WLClass, CommanderObj, FName(), 0, 0, nullptr, false, nullptr, false);
+                                                *fl = sv;
+                                                if (nObj) {
+                                                    existingObj = reinterpret_cast<UBotObjective*>(nObj);
+                                                    *reinterpret_cast<UBotObjective**>(
+                                                        reinterpret_cast<uintptr_t>(bot) + 0x0748) = existingObj;
+                                                    *reinterpret_cast<UObject**>(
+                                                        reinterpret_cast<uintptr_t>(existingObj) + 0x0128) = CommanderObj;
+                                                }
+                                            }
+                                        }
+                                        if (existingObj) {
+                                            if (BT_GoToObjective) *reinterpret_cast<UObject**>(
+                                                reinterpret_cast<uintptr_t>(existingObj) + 0x50) = BT_GoToObjective;
+                                            *reinterpret_cast<AActor**>(
+                                                reinterpret_cast<uintptr_t>(existingObj) + 0x00A0) = bestRotEnemy;
+                                        }
+
+                                        LastMacroAction[bot] = "Rotate";
+                                        LastMacroTargetName[bot] = targetName;
+                                    }
+
+                                    if (bestRotDistSq > 2250000.0f) {
+                                        bIsRotatingToObjective = true;
+                                        BotIdleTicks[bot] = 10;
+                                        moveTarget = bestRotEnemy;
+                                        accRadius = 600.0f;
+                                    }
+                                    else {
+                                        bIsActivelyFighting = true;
+                                        moveTarget = nullptr;
+                                    }
+                                }
+                                else if (bestEnemyTower && LastMacroAction[bot] != "Rotate") {
+                                    std::string targetName = bestEnemyTower->GetFullName();
+
+                                    if (LastMacroTargetName[bot] != targetName) {
+                                        UBotObjective* existingObj = *reinterpret_cast<UBotObjective**>(
+                                            reinterpret_cast<uintptr_t>(bot) + 0x0748);
+                                        if (!existingObj || !WLClass || !existingObj->IsA(WLClass)) {
+                                            if (WLClass && StaticConstructObject) {
+                                                uint32_t* fl = reinterpret_cast<uint32_t*>(reinterpret_cast<uintptr_t>(WLClass) + 0xB4);
+                                                uint32_t sv = *fl; *fl &= ~0x01u;
+                                                UObject* nObj = StaticConstructObject(WLClass, CommanderObj, FName(), 0, 0, nullptr, false, nullptr, false);
+                                                *fl = sv;
+                                                if (nObj) {
+                                                    existingObj = reinterpret_cast<UBotObjective*>(nObj);
+                                                    *reinterpret_cast<UBotObjective**>(reinterpret_cast<uintptr_t>(bot) + 0x0748) = existingObj;
+                                                    *reinterpret_cast<UObject**>(reinterpret_cast<uintptr_t>(existingObj) + 0x0128) = CommanderObj;
+                                                }
+                                            }
+                                        }
+                                        if (existingObj) {
+                                            if (BT_AttackTower) *reinterpret_cast<UObject**>(reinterpret_cast<uintptr_t>(existingObj) + 0x50) = BT_AttackTower;
+                                            *reinterpret_cast<AActor**>(reinterpret_cast<uintptr_t>(existingObj) + 0x00A0) = bestEnemyTower;
+                                            *reinterpret_cast<AOrionDamageableObjective_Base**>(reinterpret_cast<uintptr_t>(existingObj) + 0x0130) = bestEnemyTower;
+                                        }
+                                        LastMacroAction[bot] = "TowerObjective";
+                                        LastMacroTargetName[bot] = targetName;
+                                    }
+
+                                    std::string tNameLower = targetName;
+                                    std::transform(tNameLower.begin(), tNameLower.end(), tNameLower.begin(), ::tolower);
+                                    bool bTargetIsBlue = (bestEnemyTower->TeamNum == EOrionTeam::TeamBlue);
+                                    int targetPhysLane = 1;
+                                    if (tNameLower.find("_left_") != std::string::npos || tNameLower.find("tower_0") != std::string::npos) {
+                                        targetPhysLane = bTargetIsBlue ? 0 : 2;
+                                    }
+                                    else if (tNameLower.find("_right_") != std::string::npos || tNameLower.find("tower_2") != std::string::npos) {
+                                        targetPhysLane = bTargetIsBlue ? 2 : 0;
+                                    }
+                                    AOrionDamageableObjective_Base* dynamicWaypointTower = frontFriendlyTowers[targetPhysLane];
+                                    if (!dynamicWaypointTower) dynamicWaypointTower = friendlyCore;
+
+                                    bool bSiegeSafe = evalSiegeSafe();
+                                    if (g_wegAActive[bot]
+                                        && (bLanePushVetoActive
+                                            || closestEnemyTowerDistSq >= 3240000.0f)) {
+                                        g_wegAActive[bot] = false;
+                                    }
+                                    if (bInsideEnemyTurretGlobal && !bIsSafeToPush && !bSiegeSafe) {
+                                        moveTarget = closestFriendlyTower ? closestFriendlyTower : friendlyCore;
+                                        accRadius = 1500.0f;
+                                        bIsActivelyFighting = false;
+                                        bIsFleeing = true;
+                                    }
+                                    else if (!bIsSafeToPush) {
+                                        float distToWaypointSq = 0.0f;
+                                        if (dynamicWaypointTower) {
+                                            FVector wpLoc = dynamicWaypointTower->K2_GetActorLocation();
+                                            distToWaypointSq =
+                                                (wpLoc.X - botLoc.X) * (wpLoc.X - botLoc.X) +
+                                                (wpLoc.Y - botLoc.Y) * (wpLoc.Y - botLoc.Y) +
+                                                (wpLoc.Z - botLoc.Z) * (wpLoc.Z - botLoc.Z);
+                                        }
+                                        bool bIsRotating = (closestEnemyTowerDistSq > 36000000.0f && distToWaypointSq > 36000000.0f);
+
+                                        if (bSiegeSafe) {
+                                            g_wegAActive[bot] = true;
+                                            moveTarget = bestEnemyTower;
+                                            accRadius = 1000.0f;
+                                        }
+                                        else if (g_wegAActive[bot]) {
+                                            moveTarget = closestFriendlyTower ? closestFriendlyTower : friendlyCore;
+                                            accRadius = 1500.0f;
+                                            bIsActivelyFighting = false;
+                                            bIsFleeing = true;
+                                            if (bV44Threatened) {
+                                                if (!g_siegeAbortLockBreak.count(bot)
+                                                    || matchTimeB - g_siegeAbortLockBreak[bot] >= 2.0f) {
+                                                    AActor* curNatSA = nullptr;
+                                                    if (GetEnemyCharacterFunc) {
+                                                        struct { class AActor* ReturnValue; } gpSA{};
+                                                        gpSA.ReturnValue = nullptr;
+                                                        bot->ProcessEvent(GetEnemyCharacterFunc, &gpSA);
+                                                        curNatSA = gpSA.ReturnValue;
+                                                    }
+                                                    if (curNatSA != nullptr) bot->K2_SetEnemy(nullptr);
+                                                }
+                                                g_siegeAbortLockBreak[bot] = matchTimeB;
+                                            }
+                                        }
+                                        else if (bAttrAbort) {
+                                            moveTarget = closestFriendlyTower ? closestFriendlyTower : friendlyCore;
+                                            accRadius = 1500.0f;
+                                            bIsActivelyFighting = false;
+                                            bIsFleeing = true;
+                                            bIsIdle = true; BotIdleTicks[bot] = 10;
+                                            if (bIsMeleeChar) bMeleeLockbreakActive = true;
+                                        }
+                                        else if (ENABLE_MELEE_WAVE_HOLD && bIsMeleeChar && !bIsJungler
+                                                 && rearWaveAnchor && rwFrM25 >= 1
+                                                 && (!ENABLE_MWH_ANCHOR_SUBSTANCE || rwAnchorSub >= MWH_ANCHOR_MIN_SUB)
+                                                 && rwAheadM25 == 0
+                                                 && g_mwhAheadZeroSince.count(bot)
+                                                 && (matchTimeB - g_mwhAheadZeroSince[bot]) >= MWH_PERSIST_SEC
+                                                 && ((sqrtf(rearWaveAnchorDistSq) / 100.0f) >= MWH_DFRONT_MIN_M
+                                                     || (g_mwhUntil.count(bot) && matchTimeB < g_mwhUntil[bot]))
+                                                 && ((bestEnemyHero   && closestEnemyHeroDistSq   < 3240000.0f)
+                                                  || (bestEnemyMinion && closestEnemyMinionDistSq < 1000000.0f))
+                                                 && !bIsRotating && !bV44Threatened && !bLanePushVetoActive
+                                                 && !(BotIsBlind.count(bot) && BotIsBlind[bot])
+                                                 && !(bestEnemyTowerTier == 0 || bestEnemyTowerTier == 3 || bestEnemyTowerTier == 4)
+                                                 && LastMacroAction[bot] != "Rotate" && LastMacroAction[bot] != "Boss"
+                                                 && LastMacroAction[bot] != "Gank"   && LastMacroAction[bot] != "Recall"
+                                                 && LastMacroAction[bot] != "Jungle") {
+                                            float mwhGapM  = sqrtf(rearWaveAnchorDistSq) / 100.0f;
+                                            bool  mwhFresh = (mwhGapM >= MWH_DFRONT_MIN_M);
+                                            if (mwhFresh) {
+                                                if (!g_mwhUntil.count(bot) || matchTimeB >= g_mwhUntil[bot]) {
+                                                    g_mwhStartT[bot] = matchTimeB; g_mwhStartGap[bot] = (int)mwhGapM; g_mwhTicks[bot] = 0;
+                                                }
+                                                g_mwhUntil[bot] = matchTimeB + MWH_WINDOW_SEC;
+                                            }
+                                            g_mwhTicks[bot] = (g_mwhTicks.count(bot) ? g_mwhTicks[bot] : 0) + 1;
+                                            moveTarget = rearWaveAnchor;
+                                            accRadius  = MWH_ACC_R;
+                                            bIsIdle = true; BotIdleTicks[bot] = 10;
+                                        }
+                                        else if (ENABLE_MELEE_FRONTPUSH && bIsMeleeChar && localFrontMinion && bestFriendlyEscortMinion && !bV44Threatened && closestEnemyTowerDistSq >= 16000000.0f && !bIsRotating) {
+                                            moveTarget = localFrontMinion;
+                                            accRadius = 600.0f;
+                                        }
+                                        else if (rF3Want != 0) {
+                                            rF3Apply(rF3Want);
+                                        }
+                                        else if (bestFriendlyEscortMinion && closestFriendlyMinionDistSq < 36000000.0f && !bIsRotating) {
+                                            moveTarget = bestFriendlyEscortMinion;
+                                            accRadius = 600.0f;
+                                        }
+                                        else if (closestEnemyTowerDistSq < 16000000.0f) {
+                                            moveTarget = bestEnemyTower;
+                                            accRadius = 1800.0f;
+                                        }
+                                        else if (bV44Threatened) {
+                                            moveTarget = closestFriendlyTower ? closestFriendlyTower : friendlyCore;
+                                            accRadius = 800.0f;
+                                        }
+                                        else if (frontMostLaneMinion) {
+                                            moveTarget = frontMostLaneMinion;
+                                            accRadius = 600.0f;
+                                        }
+                                        else if (ENABLE_R_ADVWAIT_GATE && !bIsMeleeChar && !bIsJungler) {
+                                            rAwRanged(1);
+                                        }
+                                        else {
+                                            bool bAwHeroNear = (bestEnemyHero && closestEnemyHeroDistSq < 3240000.0f);
+                                            bool bAwDeep     = (closestFriendlyTower && closestFriendlyTowerDistSq > 36000000.0f);
+                                            bool bAwCriticalPush = (bestEnemyTowerTier == 0 || bestEnemyTowerTier == 3
+                                                                                            || bestEnemyTowerTier == 4);
+                                            if (closestFriendlyTower
+                                                && LastMacroAction[bot] != "Rotate"
+                                                && !bAwCriticalPush
+                                                && (bAwHeroNear || bAwDeep)) {
+                                                moveTarget = closestFriendlyTower;
+                                                accRadius = 1500.0f;
+                                                bIsIdle = true;
+                                                BotIdleTicks[bot] = 10;
+                                            } else {
+                                                bool bAwWaveBehind = (frontMostLaneMinion == nullptr
+                                                                      && anyLaneMinionInVoronoiPool > 0
+                                                                      && botToEnemyCoreSq > 0.0f);
+                                                bool bAwStickyHold = lastAdvWaitOverextTime.count(bot)
+                                                                     && (matchTimeB - lastAdvWaitOverextTime[bot] < 2.0f);
+                                                if ((bAwWaveBehind || bAwStickyHold || bStickyRetreat)
+                                                    && !bAwCriticalPush
+                                                    && closestFriendlyTower
+                                                    && LastMacroAction[bot] != "Rotate") {
+                                                    if (bAwWaveBehind) lastAdvWaitOverextTime[bot] = matchTimeB;
+                                                    moveTarget = closestFriendlyTower;
+                                                    accRadius = 1500.0f;
+                                                    bIsIdle = true; BotIdleTicks[bot] = 10;
+                                                } else {
+                                                    moveTarget = bestEnemyTower;
+                                                    accRadius = 3500.0f;
+                                                }
+                                            }
+                                        }
+                                        bIsActivelyFighting = false;
+                                    }
+                                    else {
+                                        if ((LastMacroAction[bot] != "Attack" && LastMacroAction[bot] != "TowerObjective")
+                                            || LastMacroTargetName[bot] != targetName) {
+                                            UBotObjective* existingObj = *reinterpret_cast<UBotObjective**>(
+                                                reinterpret_cast<uintptr_t>(bot) + 0x0748);
+                                            if (!existingObj || !WLClass || !existingObj->IsA(WLClass)) {
+                                                if (WLClass && StaticConstructObject) {
+                                                    uint32_t* fl = reinterpret_cast<uint32_t*>(reinterpret_cast<uintptr_t>(WLClass) + 0xB4);
+                                                    uint32_t sv = *fl; *fl &= ~0x01u;
+                                                    UObject* nObj = StaticConstructObject(WLClass, CommanderObj, FName(), 0, 0, nullptr, false, nullptr, false);
+                                                    *fl = sv;
+                                                    if (nObj) {
+                                                        existingObj = reinterpret_cast<UBotObjective*>(nObj);
+                                                        *reinterpret_cast<UBotObjective**>(reinterpret_cast<uintptr_t>(bot) + 0x0748) = existingObj;
+                                                        *reinterpret_cast<UObject**>(reinterpret_cast<uintptr_t>(existingObj) + 0x0128) = CommanderObj;
+                                                    }
+                                                }
+                                            }
+                                            if (existingObj) {
+                                                if (BT_AttackTower) *reinterpret_cast<UObject**>(reinterpret_cast<uintptr_t>(existingObj) + 0x50) = BT_AttackTower;
+                                                *reinterpret_cast<AActor**>(reinterpret_cast<uintptr_t>(existingObj) + 0x00A0) = bestEnemyTower;
+                                                *reinterpret_cast<AOrionDamageableObjective_Base**>(reinterpret_cast<uintptr_t>(existingObj) + 0x0130) = bestEnemyTower;
+                                            }
+                                            LastMacroAction[bot] = "Attack";
+                                            LastMacroTargetName[bot] = targetName;
+                                        }
+                                        if (!bHasRealEnemy) {
+                                            if (bestFriendlyEscortMinion) {
+                                                moveTarget = bestFriendlyEscortMinion;
+                                                accRadius = 300.0f;
+                                            }
+                                            else {
+                                                moveTarget = bestEnemyTower;
+                                                accRadius = 800.0f;
+                                            }
+                                            bIsActivelyFighting = false;
+                                        }
+                                        else {
+                                            bIsActivelyFighting = true;
+                                            moveTarget = nullptr;
+                                        }
+                                    }
+                                }
+                                }
+
+
+                            else if (bestEnemyTower) {
+
+
+                                std::string targetName = bestEnemyTower->GetFullName();
+
+
+                                if (LastMacroTargetName[bot] != targetName) {
+
+                                    UBotObjective* existingObj = *reinterpret_cast<UBotObjective**>(
+                                        reinterpret_cast<uintptr_t>(bot) + 0x0748);
+                                    if (!existingObj || !WLClass || !existingObj->IsA(WLClass)) {
+                                        if (WLClass && StaticConstructObject) {
+                                            uint32_t* fl = reinterpret_cast<uint32_t*>(reinterpret_cast<uintptr_t>(WLClass) + 0xB4);
+                                            uint32_t sv = *fl; *fl &= ~0x01u;
+                                            UObject* nObj = StaticConstructObject(WLClass, CommanderObj, FName(), 0, 0, nullptr, false, nullptr, false);
+                                            *fl = sv;
+                                            if (nObj) {
+                                                existingObj = reinterpret_cast<UBotObjective*>(nObj);
+                                                *reinterpret_cast<UBotObjective**>(reinterpret_cast<uintptr_t>(bot) + 0x0748) = existingObj;
+                                                *reinterpret_cast<UObject**>(reinterpret_cast<uintptr_t>(existingObj) + 0x0128) = CommanderObj;
+                                            }
+                                        }
+                                    }
+                                    if (existingObj) {
+                                        if (BT_AttackTower) *reinterpret_cast<UObject**>(reinterpret_cast<uintptr_t>(existingObj) + 0x50) = BT_AttackTower;
+                                        *reinterpret_cast<AActor**>(reinterpret_cast<uintptr_t>(existingObj) + 0x00A0) = bestEnemyTower;
+                                        *reinterpret_cast<AOrionDamageableObjective_Base**>(reinterpret_cast<uintptr_t>(existingObj) + 0x0130) = bestEnemyTower;
+                                    }
+
+                                    LastMacroAction[bot] = "TowerObjective";
+                                    LastMacroTargetName[bot] = targetName;
+                                }
+
+
+                                std::string tNameLower = targetName;
+                                std::transform(tNameLower.begin(), tNameLower.end(), tNameLower.begin(), ::tolower);
+                                bool bTargetIsBlue = (bestEnemyTower->TeamNum == EOrionTeam::TeamBlue);
+
+                                int targetPhysLane = 1;
+                                if (tNameLower.find("_left_") != std::string::npos || tNameLower.find("tower_0") != std::string::npos) {
+                                    targetPhysLane = bTargetIsBlue ? 0 : 2;
+                                }
+                                else if (tNameLower.find("_right_") != std::string::npos || tNameLower.find("tower_2") != std::string::npos) {
+                                    targetPhysLane = bTargetIsBlue ? 2 : 0;
+                                }
+
+                                AOrionDamageableObjective_Base* dynamicWaypointTower = frontFriendlyTowers[targetPhysLane];
+                                if (!dynamicWaypointTower) dynamicWaypointTower = friendlyCore;
+
+                                if (bestEnemyHero
+                                    && closestEnemyHeroDistSq < 3240000.0f
+                                    && closestFriendlyTower
+                                    )
+                                {
+                                    int lpFrM18 = 0, lpEnM18 = 0, lpFrH18 = 0, lpEnH18 = 0;
+                                    for (const CachedChar& cc_lp : LiveChars) {
+                                        if (cc_lp.ptr == botChar) continue;
+                                        float dx_lp = cc_lp.loc.X - botLoc.X;
+                                        float dy_lp = cc_lp.loc.Y - botLoc.Y;
+                                        float dSq_lp = dx_lp * dx_lp + dy_lp * dy_lp;
+                                        if (dSq_lp >= 3240000.0f) continue;
+                                        if (cc_lp.bIsHero) {
+                                            if (cc_lp.team == enemyTeam)      lpEnH18++;
+                                            else if (cc_lp.team == botTeam)   lpFrH18++;
+                                        }
+                                        else if (!cc_lp.bIsNeutral) {
+                                            if (cc_lp.team == botTeam)        lpFrM18++;
+                                            else if (cc_lp.team == enemyTeam) lpEnM18++;
+                                        }
+                                    }
+                                    bool bLpWaveDeficit  = (lpEnM18 > lpFrM18 + 1);
+                                    bool bLpOutnumber    = (lpEnH18 > lpFrH18 + 1);
+                                    bool bLpAloneVsEnemy = (lpFrM18 == 0 && lpEnH18 >= 1);
+                                    float lpHpPct = (currentHealth / maxHealth);
+                                    bool bLpWaveDeficitFire = bLpWaveDeficit && (lpHpPct < 0.85f);
+                                    if (ENABLE_H2_LPV_KILLSECURE && bIsMeleeChar && bestEnemyHero && !bLpOutnumber && (bLpAloneVsEnemy || bLpWaveDeficitFire)
+                                        && !(lpEnM18 >= lpFrM18 + 3 && lpFrM18 <= 1)) {
+                                        int lpHeroHP = -1;
+                                        for (const CachedChar& mc : LiveChars) { if (mc.ptr != bestEnemyHero) continue; lpHeroHP = (mc.maxHealth > 0.0f) ? (int)((mc.health / mc.maxHealth) * 100.0f) : -1; break; }
+                                        if (lpHeroHP >= 0 && (float)lpHeroHP <= H_LPV_KILL_HP) {
+                                            bLpAloneVsEnemy = false; bLpWaveDeficitFire = false;
+                                        }
+                                    }
+                                    bool mrkCLimitOff = ENABLE_MRK_C_LIMIT && bIsMeleeChar && bLpAloneVsEnemy && lpFrH18 >= 1 && (lpHpPct * 100.0f) < MRK_C_MIN_HP;
+                                    bool mrkAloneAllySkip = ENABLE_MRK_C_ALONE_NO_ALLY && bIsMeleeChar && bLpAloneVsEnemy && lpFrH18 >= 1 && !mrkCLimitOff;
+                                    if (mrkAloneAllySkip) bLpAloneVsEnemy = false;
+                                    int  lpDeadEnInhibs = bIsBlueTeam ? deadInhibitorsRed : deadInhibitorsBlue;
+                                    int  lpDeadEnemies  = bIsBlueTeam ? deadRed : deadBlue;
+                                    bool lpV45WinCond   = (lpDeadEnInhibs >= 2) || (lpDeadEnInhibs >= 1 && lpDeadEnemies >= 2);
+                                    bool lpAtFinishPush = (bestEnemyTowerTier == 0) && lpV45WinCond && (closestEnemyTowerDistSq < 9000000.0f);
+                                    bool bRangedFinishExempt = (!bIsMeleeChar) && lpAtFinishPush;
+                                    bool bMeleeFinishExempt  = ENABLE_MRK_B_MELEE_FINISH && bIsMeleeChar && lpAtFinishPush;
+                                    bool mrkLpvOld = (bLpOutnumber && !bRangedFinishExempt) || (bIsMeleeChar && (bLpAloneVsEnemy || mrkAloneAllySkip || bLpWaveDeficitFire));
+                                    bool mrkLpvNew = ((bLpOutnumber && !bRangedFinishExempt) || (bIsMeleeChar && (bLpAloneVsEnemy || bLpWaveDeficitFire))) && !bMeleeFinishExempt;
+                                    mrkLpvSuppressed = mrkLpvOld && !mrkLpvNew;
+                                    if (mrkLpvNew) {
+                                        bool bAtTowerSafety = (closestFriendlyTowerDistSq < TOWER_SAFE_SQ);
+                                        bool bHasWaveSupport = (lpFrM18 > 0);
+                                        bool bUseHardEscape = !bAtTowerSafety && (!bHasWaveSupport || bLpOutnumber) && bIsMeleeChar;
+
+                                        moveTarget = closestFriendlyTower;
+                                        accRadius = bAtTowerSafety ? 500.0f : 1500.0f;
+                                        bIsActivelyFighting = false;
+                                        bIsIdle = true;
+
+                                        if (bUseHardEscape) {
+                                            static std::map<AOrionAIBot*, float> lastLanePushHardEscapeTime;
+                                            bool isNewEpisode = !lastLanePushHardEscapeTime.count(bot)
+                                                || (matchTimeB - lastLanePushHardEscapeTime[bot] >= 2.0f);
+                                            if (isNewEpisode) {
+                                                bot->K2_SetEnemy(nullptr);
+                                            }
+                                            lastLanePushHardEscapeTime[bot] = matchTimeB;
+                                            if (bIsMeleeChar) bMeleeLockbreakActive = true;
+                                            lastThreatRetreatTime[bot] = matchTimeB;
+                                        }
+                                        bLanePushVetoActive = true;
+#if F4_LOG_LEVEL >= 1
+                                        std::string lpReason;
+                                        if (bLpWaveDeficitFire && bLpOutnumber)  lpReason = "WaveDeficit+Outnumber";
+                                        else if (bLpOutnumber)                    lpReason = "Outnumber";
+                                        else if (bLpAloneVsEnemy)                 lpReason = "AloneVsEnemy";
+                                        else                                      lpReason = "WaveDeficit";
+                                        const char* lpMode = bAtTowerSafety
+                                            ? "Hold"
+                                            : (bUseHardEscape ? "ActiveHard" : "ActiveSoft");
+                                        std::cout << "[LANE-PUSH-VETO] bot=" << botChar->GetFullName()
+                                            << " Team=" << (bIsBlueTeam ? "B" : "R")
+                                            << " Role=" << roleSlot
+                                            << " HP=" << (int)((currentHealth / maxHealth) * 100)
+                                            << " HeroDistM=" << (int)(sqrt(closestEnemyHeroDistSq) / 100.0f)
+                                            << " | EnM18=" << lpEnM18 << " FrM18=" << lpFrM18
+                                            << " EnH18=" << lpEnH18 << " FrH18=" << lpFrH18
+                                            << " | Reason=" << lpReason
+                                            << " Mode=" << lpMode
+                                            << " FrTwrM=" << (int)(sqrt(closestFriendlyTowerDistSq) / 100.0f)
+                                            << " tier=" << bestEnemyTowerTier << " v45=" << (lpV45WinCond ? 1 : 0) << " deadEnInh=" << lpDeadEnInhibs << " deadEn=" << lpDeadEnemies
+                                            << " enTwrM=" << (int)(sqrt(closestEnemyTowerDistSq) / 100.0f)
+                                            << " T=" << (int)matchTimeB << "s" << std::endl;
+#endif
+                                    }
+                                }
+
+                                int wovDeadEnemyInhibs = bIsBlueTeam ? deadInhibitorsRed : deadInhibitorsBlue;
+                                int wovDeadEnemies     = bIsBlueTeam ? deadRed : deadBlue;
+                                bool bWovV45WinCondition = (wovDeadEnemyInhibs >= 2)
+                                                         || (wovDeadEnemyInhibs >= 1 && wovDeadEnemies >= 2);
+                                bool bWovAtFinishPush = (bestEnemyTowerTier == 0)
+                                                      && bWovV45WinCondition
+                                                      && (closestEnemyTowerDistSq < 9000000.0f);
+
+                                if (!bLanePushVetoActive
+                                    && bestEnemyMinion
+                                    && closestEnemyMinionDistSq < 1000000.0f
+                                    && closestFriendlyMinionDistSq > 6250000.0f
+                                    && closestFriendlyTower
+                                    && (!bestEnemyHero || closestEnemyHeroDistSq > 3240000.0f))
+                                {
+                                    int wovFrM18 = 0, wovEnM18 = 0;
+                                    for (const CachedChar& cc_wov : LiveChars) {
+                                        if (cc_wov.ptr == botChar) continue;
+                                        if (cc_wov.bIsHero || cc_wov.bIsNeutral) continue;
+                                        float dx_w = cc_wov.loc.X - botLoc.X;
+                                        float dy_w = cc_wov.loc.Y - botLoc.Y;
+                                        float dSq_w = dx_w * dx_w + dy_w * dy_w;
+                                        if (dSq_w >= 3240000.0f) continue;
+                                        if (cc_wov.team == botTeam)        wovFrM18++;
+                                        else if (cc_wov.team == enemyTeam) wovEnM18++;
+                                    }
+                                    if (wovFrM18 == 0 && wovEnM18 >= 2 && !bWovAtFinishPush) {
+                                        bool bWovAtTowerSafety = (closestFriendlyTowerDistSq < TOWER_SAFE_SQ);
+                                        moveTarget = closestFriendlyTower;
+                                        accRadius = bWovAtTowerSafety ? 500.0f : 1500.0f;
+                                        bIsActivelyFighting = false;
+                                        bIsIdle = true;
+                                        bLanePushVetoActive = true;
+
+                                        WaveOutpaceVetoLifetimeCnt[bot]++;
+#if F4_LOG_LEVEL >= 1
+                                        const char* wovMode = bWovAtTowerSafety ? "Hold" : "ActiveSoft";
+                                        std::cout << "[WAVE-OUTPACE-VETO] bot=" << botChar->GetFullName()
+                                            << " Team=" << (bIsBlueTeam ? "B" : "R")
+                                            << " Role=" << roleSlot
+                                            << " " << (bIsMeleeChar ? "Melee" : "Ranged")
+                                            << " HP=" << (int)((currentHealth / maxHealth) * 100)
+                                            << " | EnM18=" << wovEnM18 << " FrM18=" << wovFrM18
+                                            << " EnMinDistM=" << (int)(sqrt(closestEnemyMinionDistSq) / 100.0f)
+                                            << " FrMinDistM=" << ((closestFriendlyMinionDistSq < 9999999999.0f)
+                                                ? (int)(sqrt(closestFriendlyMinionDistSq) / 100.0f) : -1)
+                                            << " FrTwrM=" << (int)(sqrt(closestFriendlyTowerDistSq) / 100.0f)
+                                            << " | Mode=" << wovMode
+                                            << " accR=" << (int)accRadius
+                                            << " LifetimeVetoCnt=" << WaveOutpaceVetoLifetimeCnt[bot]
+                                            << " Action=" << LastMacroAction[bot]
+                                            << " T=" << (int)matchTimeB << "s" << std::endl;
+#endif
+                                    }
+                                }
+
+                                bool bSiegeSafe = evalSiegeSafe();
+                                if (g_wegAActive[bot]
+                                    && (bLanePushVetoActive
+                                        || closestEnemyTowerDistSq >= 3240000.0f)) {
+                                    g_wegAActive[bot] = false;
+                                }
+                                if (!bLanePushVetoActive && bInsideEnemyTurretGlobal && !bIsSafeToPush && !bSiegeSafe) {
+                                    moveTarget = closestFriendlyTower ? closestFriendlyTower : friendlyCore;
+                                    accRadius = 1500.0f; bIsActivelyFighting = false; bIsFleeing = true;
+                                }
+                                else if (!bLanePushVetoActive && !bIsSafeToPush) {
+                                    float distToWaypointSq = 0.0f;
+                                    if (dynamicWaypointTower) {
+                                        FVector wpLoc = dynamicWaypointTower->K2_GetActorLocation();
+                                        distToWaypointSq =
+                                            (wpLoc.X - botLoc.X) * (wpLoc.X - botLoc.X) +
+                                            (wpLoc.Y - botLoc.Y) * (wpLoc.Y - botLoc.Y) +
+                                            (wpLoc.Z - botLoc.Z) * (wpLoc.Z - botLoc.Z);
+                                    }
+                                    bool bIsRotating = (closestEnemyTowerDistSq > 36000000.0f && distToWaypointSq > 36000000.0f);
+
+                                    AOrionChar* rearWaveDeep = nullptr;
+                                    float       rearWaveDeepDistSq = 1e18f;
+                                    bool        mwhDangerHero = false;
+                                    int         mwhDeepSub = 0;
+                                    FVector     mwhDeepLoc = FVector();
+                                    if (ENABLE_MWH_DANGER_MODE && ENABLE_MELEE_WAVE_HOLD && bIsMeleeChar && !bIsJungler
+                                        && bestEnemyHero && closestEnemyHeroDistSq < MWH_DANGER_HERO_SQ && enemyCore
+                                        && closestEnemyHeroDistSq >= 90000.0f) {
+                                        int mwhHeroHP = -1;
+                                        for (const CachedChar& mc : LiveChars) {
+                                            if (mc.ptr != bestEnemyHero) continue;
+                                            mwhHeroHP = (mc.maxHealth > 0.0f) ? (int)((mc.health / mc.maxHealth) * 100.0f) : -1;
+                                            break;
+                                        }
+                                        mwhDangerHero = (mwhHeroHP < 0 || mwhHeroHP > MWH_DANGER_KILL_HP);
+                                        if (mwhDangerHero) {
+                                            AOrionDamageableObjective_Base* mwhAnchorTwr = (botPhysLane >= 0 && botPhysLane < 3) ? frontFriendlyTowers[botPhysLane] : nullptr;
+                                            FVector mwhAnchorLoc = mwhAnchorTwr ? mwhAnchorTwr->K2_GetActorLocation() : FVector();
+                                            float mwhBotToECoreSq = (enemyCoreLoc.X - botLoc.X) * (enemyCoreLoc.X - botLoc.X)
+                                                                  + (enemyCoreLoc.Y - botLoc.Y) * (enemyCoreLoc.Y - botLoc.Y);
+                                            for (const CachedChar& mc : LiveChars) {
+                                                if (mc.team != botTeam || mc.bIsHero || mc.bIsNeutral) continue;
+                                                if (mc.fullName.find("bp_minion_lane_") == std::string::npos) continue;
+                                                float mex = mc.loc.X - enemyCoreLoc.X, mey = mc.loc.Y - enemyCoreLoc.Y;
+                                                if (mex * mex + mey * mey <= mwhBotToECoreSq) continue;
+                                                float mbx = mc.loc.X - botLoc.X, mby = mc.loc.Y - botLoc.Y;
+                                                float mdSq = mbx * mbx + mby * mby;
+                                                if (mdSq < MWH_DEEP_MIN_SQ) { continue; }
+                                                if (mdSq > MWH_DEEP_MAX_SQ) continue;
+                                                if (mwhAnchorTwr) {
+                                                    float toMineSq = (mc.loc.X - mwhAnchorLoc.X) * (mc.loc.X - mwhAnchorLoc.X)
+                                                                   + (mc.loc.Y - mwhAnchorLoc.Y) * (mc.loc.Y - mwhAnchorLoc.Y);
+                                                    bool onMyLane = true;
+                                                    for (int oL = 0; oL < 3; oL++) {
+                                                        if (oL == botPhysLane || !frontFriendlyTowers[oL]) continue;
+                                                        FVector oLoc = frontFriendlyTowers[oL]->K2_GetActorLocation();
+                                                        float toOtherSq = (mc.loc.X - oLoc.X) * (mc.loc.X - oLoc.X) + (mc.loc.Y - oLoc.Y) * (mc.loc.Y - oLoc.Y);
+                                                        if (toOtherSq < toMineSq) { onMyLane = false; break; }
+                                                    }
+                                                    if (!onMyLane) { continue; }
+                                                }
+                                                if (mdSq < rearWaveDeepDistSq) { rearWaveDeepDistSq = mdSq; rearWaveDeep = mc.ptr; mwhDeepLoc = mc.loc; }
+                                            }
+                                            if (rearWaveDeep && ENABLE_MWH_ANCHOR_SUBSTANCE) {
+                                                for (const CachedChar& mc : LiveChars) {
+                                                    if (mc.team != botTeam || mc.bIsHero || mc.bIsNeutral) continue;
+                                                    if (mc.fullName.find("bp_minion_lane_") == std::string::npos) continue;
+                                                    float dsx = mc.loc.X - mwhDeepLoc.X, dsy = mc.loc.Y - mwhDeepLoc.Y;
+                                                    if (dsx * dsx + dsy * dsy < 640000.0f) mwhDeepSub++;
+                                                }
+                                                if (mwhDeepSub < MWH_ANCHOR_MIN_SUB) { rearWaveDeep = nullptr; }
+                                            }
+                                        }
+                                    }
+                                    bool mwhDangerOK = (rearWaveDeep != nullptr);
+                                    bool mrkWegAFinish = false;
+                                    if (ENABLE_MRK_B_MELEE_FINISH && bIsMeleeChar) {
+                                        int  mrkWaDI = bIsBlueTeam ? deadInhibitorsRed : deadInhibitorsBlue;
+                                        int  mrkWaDE = bIsBlueTeam ? deadRed : deadBlue;
+                                        bool mrkWaV  = (mrkWaDI >= 2) || (mrkWaDI >= 1 && mrkWaDE >= 2);
+                                        mrkWegAFinish = (bestEnemyTowerTier == 0) && mrkWaV && (closestEnemyTowerDistSq < 9000000.0f);
+                                    }
+
+                                    if (bSiegeSafe) {
+                                        g_wegAActive[bot] = true;
+                                        moveTarget = bestEnemyTower;
+                                        accRadius = 1000.0f;
+                                    }
+                                    else if (g_wegAActive[bot] && !mrkWegAFinish) {
+                                        moveTarget = closestFriendlyTower ? closestFriendlyTower : friendlyCore;
+                                        accRadius = 1500.0f;
+                                        bIsActivelyFighting = false;
+                                        bIsFleeing = true;
+                                        if (bV44Threatened) {
+                                            if (!g_siegeAbortLockBreak.count(bot)
+                                                || matchTimeB - g_siegeAbortLockBreak[bot] >= 2.0f) {
+                                                AActor* curNatSA = nullptr;
+                                                if (GetEnemyCharacterFunc) {
+                                                    struct { class AActor* ReturnValue; } gpSA{};
+                                                    gpSA.ReturnValue = nullptr;
+                                                    bot->ProcessEvent(GetEnemyCharacterFunc, &gpSA);
+                                                    curNatSA = gpSA.ReturnValue;
+                                                }
+                                                if (curNatSA != nullptr) bot->K2_SetEnemy(nullptr);
+                                            }
+                                            g_siegeAbortLockBreak[bot] = matchTimeB;
+                                        }
+                                    }
+                                    else if (bAttrAbort) {
+                                        moveTarget = closestFriendlyTower ? closestFriendlyTower : friendlyCore;
+                                        accRadius = 1500.0f;
+                                        bIsActivelyFighting = false;
+                                        bIsFleeing = true;
+                                        bIsIdle = true; BotIdleTicks[bot] = 10;
+                                        if (bIsMeleeChar) bMeleeLockbreakActive = true;
+                                    }
+                                    else if (ENABLE_MELEE_WAVE_HOLD && bIsMeleeChar && !bIsJungler
+                                             && rearWaveAnchor && rwFrM25 >= 1
+                                             && (!ENABLE_MWH_ANCHOR_SUBSTANCE || rwAnchorSub >= MWH_ANCHOR_MIN_SUB)
+                                             && rwAheadM25 == 0
+                                             && (mwhDangerOK || (g_mwhAheadZeroSince.count(bot)
+                                                 && (matchTimeB - g_mwhAheadZeroSince[bot]) >= MWH_PERSIST_SEC))
+                                             && (mwhDangerOK || (sqrtf(rearWaveAnchorDistSq) / 100.0f) >= MWH_DFRONT_MIN_M
+                                                 || (g_mwhUntil.count(bot) && matchTimeB < g_mwhUntil[bot]))
+                                             && ((bestEnemyHero   && closestEnemyHeroDistSq   < 3240000.0f)
+                                              || (bestEnemyMinion && closestEnemyMinionDistSq < 1000000.0f))
+                                             && !bIsRotating && !bV44Threatened && !bLanePushVetoActive
+                                             && !(BotIsBlind.count(bot) && BotIsBlind[bot])
+                                             && !(bestEnemyTowerTier == 0 || bestEnemyTowerTier == 3 || bestEnemyTowerTier == 4)
+                                             && LastMacroAction[bot] != "Rotate" && LastMacroAction[bot] != "Boss"
+                                             && LastMacroAction[bot] != "Gank"   && LastMacroAction[bot] != "Recall"
+                                             && LastMacroAction[bot] != "Jungle") {
+                                        float mwhGapM  = sqrtf(rearWaveAnchorDistSq) / 100.0f;
+                                        bool  mwhFresh = (mwhGapM >= MWH_DFRONT_MIN_M) || mwhDangerOK;
+                                        if (mwhFresh) {
+                                            if (!g_mwhUntil.count(bot) || matchTimeB >= g_mwhUntil[bot]) {
+                                                g_mwhStartT[bot] = matchTimeB; g_mwhStartGap[bot] = (int)mwhGapM; g_mwhTicks[bot] = 0;
+                                            }
+                                            g_mwhUntil[bot] = matchTimeB + MWH_WINDOW_SEC;
+                                        }
+                                        g_mwhTicks[bot] = (g_mwhTicks.count(bot) ? g_mwhTicks[bot] : 0) + 1;
+                                        moveTarget = mwhDangerOK ? static_cast<AActor*>(rearWaveDeep) : static_cast<AActor*>(rearWaveAnchor);
+                                        accRadius  = MWH_ACC_R;
+                                        bIsIdle = true; BotIdleTicks[bot] = 10;
+                                    }
+                                    else if (ENABLE_MELEE_FRONTPUSH && bIsMeleeChar && localFrontMinion && bestFriendlyEscortMinion
+                                             && !(CombatTimer.count(bot) && CombatTimer[bot] > 0.0f)
+                                             && !bV44Threatened && closestEnemyTowerDistSq >= 16000000.0f && !bIsRotating) {
+                                        moveTarget = localFrontMinion;
+                                        accRadius = 600.0f;
+                                    }
+                                    else if (rF3Want != 0) {
+                                        rF3Apply(rF3Want);
+                                    }
+                                    else if (bestFriendlyEscortMinion && closestFriendlyMinionDistSq < 36000000.0f && !bIsRotating) {
+                                        moveTarget = bestFriendlyEscortMinion;
+                                        accRadius = 600.0f;
+                                    }
+                                    else if (closestEnemyTowerDistSq < 16000000.0f) {
+                                        moveTarget = bestEnemyTower;
+                                        accRadius = 1800.0f;
+                                    }
+                                    else if (bV44Threatened) {
+                                        moveTarget = closestFriendlyTower ? closestFriendlyTower : friendlyCore;
+                                        accRadius = 800.0f;
+                                    }
+                                    else if (frontMostLaneMinion) {
+                                        moveTarget = frontMostLaneMinion;
+                                        accRadius = 600.0f;
+                                    }
+                                    else if (ENABLE_R_ADVWAIT_GATE && !bIsMeleeChar && !bIsJungler) {
+                                        rAwRanged(2);
+                                    }
+                                    else {
+                                        bool bAwHeroNear = (bestEnemyHero && closestEnemyHeroDistSq < 3240000.0f);
+                                        bool bAwDeep     = (closestFriendlyTower && closestFriendlyTowerDistSq > 36000000.0f);
+                                        bool bAwCriticalPush = (bestEnemyTowerTier == 0 || bestEnemyTowerTier == 3
+                                                                                        || bestEnemyTowerTier == 4);
+                                        if (closestFriendlyTower
+                                            && LastMacroAction[bot] != "Rotate"
+                                            && !bAwCriticalPush
+                                            && (bAwHeroNear || bAwDeep)) {
+                                            moveTarget = closestFriendlyTower;
+                                            accRadius = 1500.0f;
+                                            bIsIdle = true;
+                                            BotIdleTicks[bot] = 10;
+                                        } else {
+                                            bool bAwWaveBehind = (frontMostLaneMinion == nullptr
+                                                                  && anyLaneMinionInVoronoiPool > 0
+                                                                  && botToEnemyCoreSq > 0.0f);
+                                            bool bAwStickyHold = lastAdvWaitOverextTime.count(bot)
+                                                                 && (matchTimeB - lastAdvWaitOverextTime[bot] < 2.0f);
+                                            if ((bAwWaveBehind || bAwStickyHold || bStickyRetreat)
+                                                && !bAwCriticalPush
+                                                && closestFriendlyTower
+                                                && LastMacroAction[bot] != "Rotate") {
+                                                if (bAwWaveBehind) lastAdvWaitOverextTime[bot] = matchTimeB;
+                                                moveTarget = closestFriendlyTower;
+                                                accRadius = 1500.0f;
+                                                bIsIdle = true; BotIdleTicks[bot] = 10;
+                                            } else {
+                                                moveTarget = bestEnemyTower;
+                                                accRadius = 3500.0f;
+                                            }
+                                        }
+                                    }
+                                    bIsActivelyFighting = false;
+                                }
+                                else if (!bLanePushVetoActive) {
+
+                                    if ((LastMacroAction[bot] != "Attack" && LastMacroAction[bot] != "TowerObjective")
+                                        || LastMacroTargetName[bot] != targetName) {
+                                        UBotObjective* existingObj = *reinterpret_cast<UBotObjective**>(
+                                            reinterpret_cast<uintptr_t>(bot) + 0x0748);
+                                        if (!existingObj || !WLClass || !existingObj->IsA(WLClass)) {
+                                            if (WLClass && StaticConstructObject) {
+                                                uint32_t* fl = reinterpret_cast<uint32_t*>(reinterpret_cast<uintptr_t>(WLClass) + 0xB4);
+                                                uint32_t sv = *fl; *fl &= ~0x01u;
+                                                UObject* nObj = StaticConstructObject(WLClass, CommanderObj, FName(), 0, 0, nullptr, false, nullptr, false);
+                                                *fl = sv;
+                                                if (nObj) {
+                                                    existingObj = reinterpret_cast<UBotObjective*>(nObj);
+                                                    *reinterpret_cast<UBotObjective**>(reinterpret_cast<uintptr_t>(bot) + 0x0748) = existingObj;
+                                                    *reinterpret_cast<UObject**>(reinterpret_cast<uintptr_t>(existingObj) + 0x0128) = CommanderObj;
+                                                }
+                                            }
+                                        }
+                                        if (existingObj) {
+                                            if (BT_AttackTower) *reinterpret_cast<UObject**>(reinterpret_cast<uintptr_t>(existingObj) + 0x50) = BT_AttackTower;
+                                            *reinterpret_cast<AActor**>(reinterpret_cast<uintptr_t>(existingObj) + 0x00A0) = bestEnemyTower;
+                                            *reinterpret_cast<AOrionDamageableObjective_Base**>(reinterpret_cast<uintptr_t>(existingObj) + 0x0130) = bestEnemyTower;
+                                        }
+
+                                        LastMacroAction[bot] = "Attack";
+                                        LastMacroTargetName[bot] = targetName;
+                                    }
+
+
+
+                                    if (!bHasRealEnemy) {
+                                        if (bestFriendlyEscortMinion) {
+                                            moveTarget = bestFriendlyEscortMinion;
+                                            accRadius = 300.0f;
+                                        }
+                                        else {
+                                            moveTarget = bestEnemyTower;
+                                            accRadius = 800.0f;
+                                        }
+                                        bIsActivelyFighting = false;
+                                    }
+                                    else {
+                                        bIsActivelyFighting = true;
+                                        moveTarget = nullptr;
+                                    }
+                                }
+                            }
+
+
+                            if (LastMacroAction[bot] == "Jungle"
+                                && !bIsJungler
+                                && !bestJungleCreep
+                                && !bShouldDefend
+                                && !bestEnemyTower) {
+                                LastMacroAction[bot] = "";
+                                LastMacroTargetName[bot] = "";
+                            }
+
+
+
+                        }
+
+                    }
+
+
+
+
+
+
+
+
+
+                    {
+                        UBotObjective* currentObj = *reinterpret_cast<UBotObjective**>(
+                            reinterpret_cast<uintptr_t>(bot) + 0x0748);
+
+                        if (currentObj) {
+                            UObject* objBT = *reinterpret_cast<UObject**>(
+                                reinterpret_cast<uintptr_t>(currentObj) + 0x50);
+                            if (!objBT) {
+                                if (WLClass && currentObj->IsA(WLClass)) {
+                                    if (LastMacroAction[bot] == "Attack" || LastMacroAction[bot] == "TowerObjective") {
+                                        if (BT_AttackTower) *reinterpret_cast<UObject**>(reinterpret_cast<uintptr_t>(currentObj) + 0x50) = BT_AttackTower;
+                                    }
+                                    else if (LastMacroAction[bot] == "Defend") {
+                                        if (BT_DefendTower) *reinterpret_cast<UObject**>(reinterpret_cast<uintptr_t>(currentObj) + 0x50) = BT_DefendTower;
+                                    }
+                                    else if (LastMacroAction[bot] == "Rotate") {
+                                        if (BT_GoToObjective) *reinterpret_cast<UObject**>(reinterpret_cast<uintptr_t>(currentObj) + 0x50) = BT_GoToObjective;
+                                    }
+                                }
+                                else if (JCClass && currentObj->IsA(JCClass)) {
+                                    if (LastMacroAction[bot] != "Boss") {
+                                        if (BT_AttackObjective) *reinterpret_cast<UObject**>(reinterpret_cast<uintptr_t>(currentObj) + 0x50) = BT_AttackObjective;
+                                    }
+                                }
+                                else if (RCClass && currentObj->IsA(RCClass)) {
+                                    if (BT_Recall) *reinterpret_cast<UObject**>(reinterpret_cast<uintptr_t>(currentObj) + 0x50) = BT_Recall;
+                                }
+                                else if (GKClass && currentObj->IsA(GKClass)) {
+                                    bool bGankCombatPhase = (LastMacroAction[bot] == "Gank" && bIsActivelyFighting);
+                                    if (!bGankCombatPhase && BT_GoToObjective)
+                                        *reinterpret_cast<UObject**>(reinterpret_cast<uintptr_t>(currentObj) + 0x50) = BT_GoToObjective;
+                                }
+                            }
+
+                            if (WLClass && currentObj->IsA(WLClass)) {
+                                AActor* goalTarget = nullptr;
+                                if (LastMacroAction[bot] == "Attack" || LastMacroAction[bot] == "TowerObjective") {
+                                    goalTarget = bestEnemyTower;
+                                }
+                                else if (LastMacroAction[bot] == "Defend") {
+                                    goalTarget = threatenedFriendlyTower;
+                                }
+                                else if (LastMacroAction[bot] == "Rotate") {
+                                    *reinterpret_cast<AOrionDamageableObjective_Base**>(
+                                        reinterpret_cast<uintptr_t>(currentObj) + 0x0130) = nullptr;
+                                }
+                                if (goalTarget) {
+                                    AActor* currentRelated = *reinterpret_cast<AActor**>(
+                                        reinterpret_cast<uintptr_t>(currentObj) + 0x00A0);
+                                    if (!currentRelated || currentRelated != goalTarget) {
+                                        *reinterpret_cast<AOrionDamageableObjective_Base**>(
+                                            reinterpret_cast<uintptr_t>(currentObj) + 0x0130) =
+                                            reinterpret_cast<AOrionDamageableObjective_Base*>(goalTarget);
+                                        *reinterpret_cast<AActor**>(
+                                            reinterpret_cast<uintptr_t>(currentObj) + 0x00A0) = goalTarget;
+                                    }
+                                }
+                            }
+                            else if (JCClass && currentObj->IsA(JCClass)) {
+                                AActor* currentRelated = *reinterpret_cast<AActor**>(
+                                    reinterpret_cast<uintptr_t>(currentObj) + 0x00A0);
+                                if (LastMacroAction[bot] == "Jungle" && bestJungleCreep) {
+                                    if (!currentRelated || currentRelated != bestJungleCreep) {
+                                        *reinterpret_cast<AActor**>(
+                                            reinterpret_cast<uintptr_t>(currentObj) + 0x00A0) = bestJungleCreep;
+                                    }
+                                }
+                                else if (LastMacroAction[bot] == "Boss" && activeBossTarget) {
+                                    if (!currentRelated || currentRelated != activeBossTarget) {
+                                        *reinterpret_cast<AActor**>(
+                                            reinterpret_cast<uintptr_t>(currentObj) + 0x00A0) = activeBossTarget;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    bool brWindowActive = (ENABLE_BLINDRETREAT_PROBE && g_brActiveUntil.count(bot)
+                                           && matchTimeB < g_brActiveUntil[bot]);
+                    bool svWindowActive = (ENABLE_SOLO1V1_VETO && g_svActiveUntil.count(bot)
+                                           && matchTimeB < g_svActiveUntil[bot]);
+                    bool wfbWindowActive = (ENABLE_WAVE_FALLBACK && g_wfbUntil.count(bot)
+                                            && matchTimeB < g_wfbUntil[bot]);
+                    if (!bIsRotatingToObjective && !brWindowActive && !svWindowActive && !wfbWindowActive
+                        && BotIsBlind.count(bot) && BotIsBlind[bot]) {
+                        bot->K2_SetIgnoreEnemies(false);
+                    }
+                    BotIsBlind[bot] = bIsRotatingToObjective || brWindowActive || svWindowActive || wfbWindowActive;
+
+                    bool bMeleeTowerHold = false;
+                    if (ENABLE_MELEE_TOWER_HOLD && bIsMeleeChar && bestEnemyHero
+                        && closestEnemyHeroDistSq < 4000000.0f
+                        && closestFriendlyTower
+                        && closestFriendlyTowerDistSq < TOWER_SAFE_SQ
+                        && LastMacroAction[bot] != "Defend" && LastMacroAction[bot] != "Boss"
+                        && LastMacroAction[bot] != "Gank"   && LastMacroAction[bot] != "Recall"
+                        && LastMacroAction[bot] != "Rotate") {
+                        int mthFrM18 = 0, mthEnM18 = 0, mthFrH18 = 0;
+                        for (const CachedChar& cc : LiveChars) {
+                            if (cc.ptr == botChar) continue;
+                            float mdx = cc.loc.X - botLoc.X, mdy = cc.loc.Y - botLoc.Y;
+                            if (mdx * mdx + mdy * mdy >= 3240000.0f) continue;
+                            if (cc.bIsHero)          { if (cc.team == botTeam) mthFrH18++; }
+                            else if (!cc.bIsNeutral) { if (cc.team == botTeam) mthFrM18++; else if (cc.team == enemyTeam) mthEnM18++; }
+                        }
+                        bMeleeTowerHold = (mthFrH18 == 0)
+                                       && (mthEnM18 > mthFrM18 + 1);
+                    }
+
+                    int requiredIdleTicks = bHasRealEnemy ? 4 : 2;
+                    if (BotIdleTicks[bot] >= requiredIdleTicks) {
+                        bIsIdle = true;
+                    }
+
+
+                    if (ENABLE_DEFEND_TOWER_YIELD
+                        && LastMacroAction[bot] == "Defend"
+                        && bIsMeleeChar && !bIsJungler
+                        && bestEnemyHero && closestEnemyHeroDistSq < 3240000.0f
+                        && !(BotIsBlind.count(bot) && BotIsBlind[bot])
+                        && !bDoingBoss
+                        && moveTarget
+                        && maxHealth > 0.0f)
+                    {
+                        FVector dtyTL = moveTarget->K2_GetActorLocation();
+                        float dtyTwrSq = (dtyTL.X - botLoc.X) * (dtyTL.X - botLoc.X)
+                                       + (dtyTL.Y - botLoc.Y) * (dtyTL.Y - botLoc.Y);
+                        if (dtyTwrSq > DTY_TOWER_SQ) {
+                            int dtyFrM = 0, dtyEnM = 0, dtyFrH = 0, dtyEnH = 0;
+                            for (const CachedChar& cc : LiveChars) {
+                                if (cc.ptr == botChar) continue;
+                                float dx = cc.loc.X - botLoc.X, dy = cc.loc.Y - botLoc.Y;
+                                if (dx * dx + dy * dy >= 3240000.0f) continue;
+                                if (cc.bIsHero)          { if (cc.team == enemyTeam) dtyEnH++; else if (cc.team == botTeam) dtyFrH++; }
+                                else if (!cc.bIsNeutral) { if (cc.team == botTeam)   dtyFrM++; else if (cc.team == enemyTeam) dtyEnM++; }
+                            }
+                            bool dtyOutnumber = (dtyEnH > dtyFrH + 1);
+                            bool dtyAlone     = (dtyFrM == 0 && dtyEnH >= 1);
+                            bool dtyWaveDef   = (dtyEnM > dtyFrM + 1) && ((currentHealth / maxHealth) < 0.85f);
+                            bool dtyTier      = (bestThreatenedTowerTier == 1 || bestThreatenedTowerTier == 2);
+                            if (dtyTier && (dtyOutnumber || dtyAlone || dtyWaveDef)) {
+                                bMeleeLockbreakActive = true;
+                            }
+                        }
+                    }
+
+
+
+                    if (BotIsBlind[bot]) {
+                        bIsActivelyFighting = false;
+                    }
+                    else if (!bIsActivelyFighting && !bIsFleeing) {
+                        bool bIgnoreNativeBecauseGanking = false;
+                        bool bIsGanking = (LastMacroAction[bot] == "Gank");
+                        if (bIsGanking && bHasNativeTarget) {
+                            if (!bestEnemyHero || closestEnemyHeroDistSq > 6250000.0f) {
+                                bIgnoreNativeBecauseGanking = true;
+                            }
+                        }
+
+                        bool bMacroSaysWait = (!bIsSafeToPush && !bIsActivelyFighting && !bIsFleeing
+                            && !bIsJungler && !bDoingBoss
+                            && (LastMacroAction[bot] == "Attack" || LastMacroAction[bot] == "TowerObjective")
+                            && !bNativeTargetIsHero);
+                        if ((bHasNativeTarget && !bIgnoreNativeBecauseGanking && !bMacroSaysWait)
+                            || (CombatTimer[bot] > 0.0f && (bHasRealEnemy || bHasNativeTarget))) {
+                            bIsActivelyFighting = true;
+                            if (BotIdleTicks[bot] < 0) BotIdleTicks[bot] = 0;
+
+                            int  finDeadEnInhibs = bIsBlueTeam ? deadInhibitorsRed : deadInhibitorsBlue;
+                            int  finDeadEnemies  = bIsBlueTeam ? deadRed : deadBlue;
+                            bool finV45WinCond   = (finDeadEnInhibs >= 2) || (finDeadEnInhibs >= 1 && finDeadEnemies >= 2);
+                            bool finAtFinishPush = (bestEnemyTowerTier == 0) && finV45WinCond
+                                                 && (closestEnemyTowerDistSq < 9000000.0f);
+
+                            bStickyDangerRetreat = false;
+
+
+                            if ((bV44Threatened || bStickyDangerRetreat || bMeleeTowerHold
+                                 )
+                                && closestFriendlyTower
+                                && LastMacroAction[bot] != "Defend"
+                                && LastMacroAction[bot] != "Boss"
+                                && !(finAtFinishPush && !p2FinHeavyOut)) {
+                                moveTarget = closestFriendlyTower;
+                                bIsIdle = true;
+                                BotIdleTicks[bot] = 10;
+
+                                bool bAtAnchorV44 = (closestFriendlyTowerDistSq < 2890000.0f);
+                                if (bAtAnchorV44) {
+                                    accRadius = 500.0f;
+                                    bIsActivelyFighting = false;
+                                } else {
+                                    accRadius = 800.0f;
+                                    bool bRwChosen = (ENABLE_REARWAVE_RETREAT && rearWaveAnchor && !bLanePushVetoActive
+                                                   && rearWaveAnchorDistSq < closestFriendlyTowerDistSq
+                                                   && rearWaveAnchorDistSq > (accRadius * accRadius));
+                                    if (bRwChosen) moveTarget = rearWaveAnchor;
+                                    lastThreatRetreatTime[bot] = matchTimeB;
+                                    if (bIsMeleeChar) {
+                                        bMeleeLockbreakActive = true;
+                                    } else {
+                                        static std::map<AOrionAIBot*, float> lastV44RangedClear;
+                                        bool bNewRangedEpisode = !lastV44RangedClear.count(bot)
+                                            || (matchTimeB - lastV44RangedClear[bot] >= 2.0f);
+                                        if (bNewRangedEpisode) bot->K2_SetEnemy(nullptr);
+                                        lastV44RangedClear[bot] = matchTimeB;
+                                        bRangedV44Lockbreak = true;
+                                    }
+                                }
+                            }
+
+                        }
+                        else {
+                            bIsActivelyFighting = bHasRealEnemy;
+                        }
+                    }
+                    if (ENABLE_R_DEFEND_CARRY && !bIsMeleeChar && !bIsJungler) {
+                        bool rdcOpen  = g_rdcStartT.count(bot) > 0;
+                        bool rdcBlind = BotIsBlind.count(bot) && BotIsBlind[bot];
+                        bool rdcZone  = (LastMacroAction[bot] == "Defend") && threatenedFriendlyTower
+                                     && (bestThreatenedTowerTier == 1 || bestThreatenedTowerTier == 2)
+                                     && gThreatTowerIsMyLane && !bLateGame && !bDoingBoss
+                                     && closestThreatenedTowerDistSq > RDC_INNER_SQ && closestThreatenedTowerDistSq <= RDC_OUTER_SQ;
+                        bool rdcHero  = bestEnemyHero && closestEnemyHeroDistSq <= RDC_HERO_SQ;
+                        bool rdcTwrSame  = threatenedFriendlyTower && threatenedFriendlyTower == closestFriendlyTower;
+                        rdcZone = rdcZone && rdcTwrSame;
+                        bool rdwWakeNow = (std::string(p7Wake) == "LR");
+                        bool rdwWake2   = rdwWakeNow && g_rdcWakePrevT.count(bot) && (matchTimeB - g_rdcWakePrevT[bot]) <= 1.5f;
+                        bool rdwKind2   = ENABLE_R_DEFEND_WAKE && rdcOpen && g_rdcStartKind.count(bot) && g_rdcStartKind[bot] == 2;
+                        bool rdwPursuer = false;
+                        if (ENABLE_R_DEFEND_WAKE && rdwWake2 && bestEnemyHero) {
+                            std::string rdwHn = bestEnemyHero->GetFullName();
+                            bool rdwHeroMelee = (rdwHn.find("Steel") != std::string::npos || rdwHn.find("WarDrum") != std::string::npos
+                                || rdwHn.find("Chains") != std::string::npos || rdwHn.find("Kwang") != std::string::npos
+                                || rdwHn.find("Grux") != std::string::npos || rdwHn.find("Tomahawk") != std::string::npos
+                                || rdwHn.find("FallenAngel") != std::string::npos || rdwHn.find("Rampage") != std::string::npos
+                                || rdwHn.find("Vamp") != std::string::npos || rdwHn.find("Justice") != std::string::npos
+                                || rdwHn.find("Kurohane") != std::string::npos || rdwHn.find("Sword") != std::string::npos
+                                || rdwHn.find("Crunch") != std::string::npos || rdwHn.find("Mudang") != std::string::npos
+                                || rdwHn.find("Hammer") != std::string::npos || rdwHn.find("Wukong") != std::string::npos
+                                || rdwHn.find("Ice") != std::string::npos || rdwHn.find("Femme") != std::string::npos
+                                || rdwHn.find("ArcBlade") != std::string::npos);
+                            rdwPursuer = rdwHeroMelee || closestEnemyHeroDistSq <= RDW_HERO_CLOSE_SQ;
+                        }
+                        if (rdwKind2) {
+                            rdcZone = (LastMacroAction[bot] == "Defend") && threatenedFriendlyTower
+                                   && (bestThreatenedTowerTier == 1 || bestThreatenedTowerTier == 2)
+                                   && gThreatTowerIsMyLane && !bLateGame && !bDoingBoss && rdcTwrSame
+                                   && closestThreatenedTowerDistSq > TOWER_SAFE_SQ && closestThreatenedTowerDistSq <= RDC_OUTER_SQ;
+                        }
+                        const char* rdcEv = nullptr; const char* rdcReason = nullptr; int rdcK2 = 0;
+                        if (rdcOpen) {
+                            if (LastMacroAction[bot] != "Defend")                              rdcReason = "actChange";
+                            else if (closestThreatenedTowerDistSq <= (rdwKind2 ? TOWER_SAFE_SQ : RDC_INNER_SQ)) rdcReason = "atTower";
+                            else if (!rdcZone)                                                rdcReason = "zoneLeft";
+                            else if ((matchTimeB - g_rdcStartT[bot]) > (rdwKind2 ? RDW_MAX_S : RDC_MAX_S)) rdcReason = "timeout";
+                            else if (!rdcHero && !rdcBlind)                                   rdcReason = "heroGone";
+                            if (rdcReason) { rdcEv = "END"; g_rdcStartT.erase(bot); rdcOpen = false; }
+                        }
+                        if (!rdcOpen && !rdcEv && rdcZone && rdcHero && !rdcBlind
+                            && g_rdcRetreatT.count(bot) && (matchTimeB - g_rdcRetreatT[bot]) <= RDC_RECENT_S) {
+                            g_rdcStartT[bot] = matchTimeB; rdcOpen = true; rdcEv = "START";
+                            g_rdcStartKind[bot] = 1;
+                            if (!g_rdcLastClearT.count(bot) || (matchTimeB - g_rdcLastClearT[bot]) >= 2.0f) {
+                                bot->K2_SetEnemy(nullptr); g_rdcLastClearT[bot] = matchTimeB; rdcK2 = 1;
+                            }
+                        }
+                        if (ENABLE_R_DEFEND_WAKE && !rdcOpen && !rdcEv && rdcZone && rdcHero && !rdcBlind && rdwWake2 && rdwPursuer) {
+                            g_rdcStartT[bot] = matchTimeB; g_rdcStartKind[bot] = 2; rdcOpen = true; rdcEv = "START";
+                        }
+                        if (rdcOpen && !rdcBlind) {
+                            moveTarget = threatenedFriendlyTower;
+                            accRadius = RDC_ACCR;
+                            bIsIdle = true; BotIdleTicks[bot] = 10;
+                            bRdcLockbreak = true;
+                            if (!rdcEv) rdcEv = "TRACE";
+                        }
+                        else if (rdcOpen && rdcBlind && !rdcEv) rdcEv = "PAUSE";
+#if F4_LOG_LEVEL >= 1
+                        if (rdcEv) {
+                            float rdcMoved = -1.0f;
+                            if (g_rdcPrevPos.count(bot)) { FVector pp = g_rdcPrevPos[bot];
+                                rdcMoved = sqrtf((botLoc.X - pp.X) * (botLoc.X - pp.X) + (botLoc.Y - pp.Y) * (botLoc.Y - pp.Y)) / 100.0f; }
+                            AActor* rdcNat = nullptr;
+                            if (GetEnemyCharacterFunc) { struct { class AActor* ReturnValue; } rp{}; rp.ReturnValue = nullptr;
+                                bot->ProcessEvent(GetEnemyCharacterFunc, &rp); rdcNat = rp.ReturnValue; }
+                            const char* rdcNatS = rdcK2 ? "CLR" : "NULL";
+                            if (rdcNat) { rdcNatS = "Other"; for (const CachedChar& c : LiveChars) if ((AActor*)c.ptr == rdcNat) { rdcNatS = c.bIsHero ? "Hero" : "Minion"; break; } }
+                            std::cout << "[R-DEF-CARRY] " << rdcEv << " bot=" << botChar->GetFullName() << " Team=" << (bIsBlueTeam ? "B" : "R") << " R=" << roleSlot
+                                << " dDefM=" << (int)(sqrtf(closestThreatenedTowerDistSq) / 100.0f)
+                                << " heroM=" << (bestEnemyHero ? (int)(sqrtf(closestEnemyHeroDistSq) / 100.0f) : -1)
+                                << " hero=" << (bestEnemyHero ? bestEnemyHero->GetFullName() : std::string("NULL"))
+                                << " HP=" << (int)((currentHealth / maxHealth) * 100) << " natTgt=" << rdcNatS << " movedM=" << rdcMoved
+                                << " blind=" << (rdcBlind ? 1 : 0) << " lrWake=" << (std::string(p7Wake) == "LR" ? 1 : 0)
+                                << " tier=" << bestThreatenedTowerTier << " k2=" << rdcK2 << " reason=" << (rdcReason ? rdcReason : "-")
+                                << " src=" << (!g_rdcRetreatSrc.count(bot) ? "-" : (g_rdcRetreatSrc[bot] == 1 ? "V44" : (g_rdcRetreatSrc[bot] == 3 ? "LPVHOLD" : (g_rdcRetreatSrc[bot] == 4 ? "RBR" : "LPV"))))
+                                << " retreatAgeS=" << (g_rdcRetreatT.count(bot) ? (int)(matchTimeB - g_rdcRetreatT[bot]) : -1)
+                                << " apprM=" << ((g_rdcPrevDefM.count(bot) && threatenedFriendlyTower) ? (g_rdcPrevDefM[bot] - sqrtf(closestThreatenedTowerDistSq) / 100.0f) : -999.0f)
+                                << " dtS=" << (g_rdcPrevDefT.count(bot) ? (matchTimeB - g_rdcPrevDefT[bot]) : -1.0f)
+                                << " twrSame=" << (rdcTwrSame ? 1 : 0)
+                                << " kind=" << (g_rdcStartKind.count(bot) ? g_rdcStartKind[bot] : 0) << " wake2=" << (rdwWake2 ? 1 : 0)
+                                << " pursuer=" << (rdwPursuer ? 1 : 0)
+                                << " T=" << (int)matchTimeB << "s" << std::endl;
+                        }
+                        if (rdcOpen || rdcEv) {
+                            g_rdcPrevPos[bot] = botLoc;
+                            if (threatenedFriendlyTower) { g_rdcPrevDefM[bot] = sqrtf(closestThreatenedTowerDistSq) / 100.0f; g_rdcPrevDefT[bot] = matchTimeB; }
+                        }
+                        else { g_rdcPrevPos.erase(bot); g_rdcPrevDefM.erase(bot); g_rdcPrevDefT.erase(bot); }
+#endif
+                        if (ENABLE_R_DEFEND_WAKE) {
+                            if (rdwWakeNow) g_rdcWakePrevT[bot] = matchTimeB; else g_rdcWakePrevT.erase(bot);
+                        }
+                    }
+
+                    int akvFrM18 = 0, akvEnM18 = 0, akvFrH18 = 0, akvEnH18 = 0;
+                    for (const CachedChar& cc_ak : LiveChars) {
+                        if (cc_ak.ptr == botChar) continue;
+                        float dx_ak = cc_ak.loc.X - botLoc.X;
+                        float dy_ak = cc_ak.loc.Y - botLoc.Y;
+                        float dSq_ak = dx_ak * dx_ak + dy_ak * dy_ak;
+                        if (dSq_ak >= 3240000.0f) continue;
+                        if (cc_ak.bIsHero) {
+                            if (cc_ak.team == enemyTeam)      akvEnH18++;
+                            else if (cc_ak.team == botTeam)   akvFrH18++;
+                        }
+                        else if (!cc_ak.bIsNeutral) {
+                            if (cc_ak.team == botTeam)        akvFrM18++;
+                            else if (cc_ak.team == enemyTeam) akvEnM18++;
+                        }
+                    }
+                    bool bAkWaveDeficit         = (akvEnM18 > akvFrM18 + 1);
+                    bool bAkOutnumber           = (akvEnH18 > akvFrH18 + 1);
+                    bool bAkHeroCommittedMelee  = (closestEnemyHeroDistSq < 90000.0f);
+                    if (ENABLE_R_TOWER_HOLD && !bIsMeleeChar && !bIsJungler && botChar && maxHealth > 0.0f) {
+                        bool rtbDef  = (LastMacroAction[bot] == "Defend");
+                        bool rtbTO   = (LastMacroAction[bot] == "TowerObjective");
+                        bool rtbTwrOk = closestFriendlyTower && (!rtbDef || threatenedFriendlyTower == closestFriendlyTower);
+                        bool rtbOpen = g_rtrBStartT.count(bot) > 0;
+                        const char* rtbEv = nullptr; const char* rtbWhy = nullptr; int rtbAgeLog = -1;
+                        int rtbTickLog = g_rtrBTickN.count(bot) ? g_rtrBTickN[bot] : 0, rtbPullLog = g_rtrBPullN.count(bot) ? g_rtrBPullN[bot] : 0;
+                        if (rtbOpen && g_rtrBLastT.count(bot) && (matchTimeB - g_rtrBLastT[bot]) > 1.5f) {
+                            rtbAgeLog = (int)(matchTimeB - g_rtrBStartT[bot]);
+                            g_rtrBStartT.erase(bot); g_rtrBWaveN.erase(bot); g_rtrBNoHeroN.erase(bot);
+                            g_rtrBEndT[bot] = matchTimeB; rtbOpen = false; rtbEv = "END"; rtbWhy = "gap";
+                        }
+                        g_rtrBLastT[bot] = matchTimeB;
+                        bool rtbOwner = (BotIsBlind.count(bot) && BotIsBlind[bot])
+                                     || (ENABLE_WAVE_FALLBACK && g_wfbUntil.count(bot) && matchTimeB < g_wfbUntil[bot])
+                                     || (ENABLE_R_DEFEND_CARRY && g_rdcStartT.count(bot) > 0)
+                                     || (ENABLE_R_TOWER_RADIUS && g_rtrAStartT.count(bot) > 0
+                                         && g_rtrALastT.count(bot) && g_rtrALastT[bot] == matchTimeB)
+                                     || (rtbTO && (bLanePushVetoActive || bV44Threatened))
+                                     || bIsRotatingToObjective || bDoingBoss || bLateGame;
+                        int   rtbHeroHP = -1;
+                        if (bestEnemyHero) for (const CachedChar& mc : LiveChars) { if (mc.ptr != bestEnemyHero) continue; rtbHeroHP = (mc.maxHealth > 0.0f) ? (int)((mc.health / mc.maxHealth) * 100.0f) : -1; break; }
+                        float rtbBotHP  = (currentHealth / maxHealth) * 100.0f;
+                        bool  rtbKill   = RKillLage(AllTowers, bestEnemyHero, rtbHeroHP, rtbBotHP, akvEnH18 > akvFrH18 + 1, closestEnemyHeroDistSq);
+                        bool  rtbHero18 = bestEnemyHero && closestEnemyHeroDistSq <= RBR_HERO_MAX_SQ;
+                        bool  rtbWaveOk = (akvFrM18 == 0) || (akvEnM18 >= akvFrM18 + 2);
+                        bool  rtbIn16   = rtbTwrOk && closestFriendlyTowerDistSq <= TOWER_SAFE_SQ;
+                        bool  rtbInLeash = rtbTwrOk && closestFriendlyTowerDistSq <= (rtbDef ? TOWER_SAFE_SQ : RTR_B_TO_LEASH_SQ);
+                        bool  rtbLage   = (rtbDef || rtbTO) && rtbIn16 && akvFrH18 == 0 && rtbHero18 && rtbWaveOk;
+                        if (rtbOpen) {
+                            float rtbAge = matchTimeB - g_rtrBStartT[bot];
+                            g_rtrBWaveN[bot]   = rtbWaveOk ? 0 : (g_rtrBWaveN[bot] + 1);
+                            g_rtrBNoHeroN[bot] = rtbHero18 ? 0 : (g_rtrBNoHeroN[bot] + 1);
+                            if (rtbOwner)                          rtbWhy = "owner";
+                            else if (!(rtbDef || rtbTO))           rtbWhy = "act";
+                            else if (!rtbTwrOk)                    rtbWhy = "twr";
+                            else if (!rtbInLeash)                  { rtbWhy = rtbDef ? "out16" : "out20";
+                                                                     if (rtbDef) g_rtrAHandoffT[bot] = matchTimeB; }
+                            else if (rtbKill)                      rtbWhy = "kill";
+                            else if (akvFrH18 >= 1)                rtbWhy = "frH";
+                            else if (g_rtrBWaveN[bot] >= 2)        rtbWhy = "wave";
+                            else if (g_rtrBNoHeroN[bot] >= 2)      rtbWhy = "heroGone";
+                            else if (rtbAge >= RTR_B_CAP_S)        rtbWhy = "cap";
+                            if (rtbWhy) {
+                                rtbAgeLog = (int)rtbAge;
+                                g_rtrBStartT.erase(bot); g_rtrBWaveN.erase(bot); g_rtrBNoHeroN.erase(bot);
+                                g_rtrBEndT[bot] = matchTimeB; rtbOpen = false; rtbEv = "END";
+                            }
+                        }
+                        bool rtbHandoff = g_rtrBHandoffT.count(bot) && (matchTimeB - g_rtrBHandoffT[bot]) <= 1.5f;
+                        if (!rtbOpen && !rtbWhy && rtbLage && !rtbOwner && !rtbKill
+                            && (rtbHandoff || !g_rtrBEndT.count(bot) || (matchTimeB - g_rtrBEndT[bot]) >= RTR_COOLDOWN_S)) {
+                            g_rtrBStartT[bot] = matchTimeB; g_rtrBWaveN[bot] = 0; g_rtrBNoHeroN[bot] = 0;
+                            g_rtrBTickN[bot] = 0; g_rtrBPullN[bot] = 0;
+                            rtbOpen = true; rtbEv = "FIRE";
+                        }
+                        if (rtbHandoff) g_rtrBHandoffT.erase(bot);
+                        bool rtbPull = false;
+                        if (rtbOpen && closestFriendlyTowerDistSq > RTR_B_PULL_SQ) {
+                            moveTarget = static_cast<AActor*>(closestFriendlyTower); accRadius = RTR_B_ACCR;
+                            bIsIdle = true; BotIdleTicks[bot] = 10;
+                            g_rtrBWroteT[bot] = matchTimeB; rtbPull = true;
+                        }
+                        if (rtbOpen) { g_rtrBTickN[bot]++; if (rtbPull) g_rtrBPullN[bot]++; }
+#if F4_LOG_LEVEL >= 1
+                        int rtbPullPrev = g_rtrBPullPrev.count(bot) ? g_rtrBPullPrev[bot] : 0;
+                        if (rtbEv || (rtbOpen && ((rtbPull ? 1 : 0) != rtbPullPrev
+                                                 || !g_rtrBLogT.count(bot) || (matchTimeB - g_rtrBLogT[bot]) >= 2.0f))) {
+                            g_rtrBLogT[bot] = matchTimeB;
+                            float rtbMoved = -1.0f;
+                            if (g_rtrBPrevPos.count(bot) && (!rtbEv || std::string(rtbEv) != "FIRE")) { FVector pp = g_rtrBPrevPos[bot];
+                                rtbMoved = sqrtf((botLoc.X - pp.X) * (botLoc.X - pp.X) + (botLoc.Y - pp.Y) * (botLoc.Y - pp.Y)) / 100.0f; }
+                            g_rtrBPrevPos[bot] = botLoc;
+                            AActor* rtbNat = nullptr;
+                            int rtbMelee12 = 0;
+                            for (const CachedChar& mc : LiveChars) {
+                                if (!mc.bIsHero || mc.team != enemyTeam || !mc.ptr) continue;
+                                float mx = mc.loc.X - botLoc.X, my = mc.loc.Y - botLoc.Y;
+                                if (mx * mx + my * my > 1440000.0f) continue;
+                                if (RIsMeleeHeroName(mc.ptr->GetFullName())) { rtbMelee12 = 1; break; }
+                            }
+                            if (GetEnemyCharacterFunc) { struct { class AActor* ReturnValue; } np{}; np.ReturnValue = nullptr; bot->ProcessEvent(GetEnemyCharacterFunc, &np); rtbNat = np.ReturnValue; }
+                            std::cout << "[R-TR] " << (rtbEv ? rtbEv : (rtbPull ? "PULL" : "TRACE")) << " mode=B bot=" << botChar->GetFullName()
+                                << " Team=" << (bIsBlueTeam ? "B" : "R") << " R=" << roleSlot << " why=" << (rtbWhy ? rtbWhy : "-")
+                                << " act=" << (rtbDef ? "Defend" : rtbTO ? "TO" : "other")
+                                << " twrM=" << (closestFriendlyTower ? (int)(sqrtf(closestFriendlyTowerDistSq) / 100.0f) : -1) << " pull=" << (rtbPull ? 1 : 0)
+                                << " heroM=" << (bestEnemyHero ? (int)(sqrtf(closestEnemyHeroDistSq) / 100.0f) : -1)
+                                << " heroMelee=" << ((bestEnemyHero && RIsMeleeHeroName(bestEnemyHero->GetFullName())) ? 1 : 0)
+                                << " melee12=" << rtbMelee12
+                                << " FrM18/EnM18=" << akvFrM18 << "/" << akvEnM18 << " FrH18/EnH18=" << akvFrH18 << "/" << akvEnH18
+                                << " ageS=" << (rtbOpen ? (int)(matchTimeB - g_rtrBStartT[bot]) : rtbAgeLog) << " movedM=" << rtbMoved
+                                << " natTgt=" << (rtbNat == nullptr ? "NULL" : (static_cast<AActor*>(bestEnemyHero) == rtbNat ? "Hero" : "other"))
+                                << " HP=" << (int)rtbBotHP << " heroHP=" << rtbHeroHP << " handoff=" << (rtbHandoff ? 1 : 0)
+                                << " ticks=" << (rtbOpen ? g_rtrBTickN[bot] : rtbTickLog) << " pullTicks=" << (rtbOpen ? g_rtrBPullN[bot] : rtbPullLog)
+                                << " T=" << (int)matchTimeB << "s" << std::endl;
+                        }
+                        g_rtrBPullPrev[bot] = rtbPull ? 1 : 0;
+                        if (!rtbOpen) g_rtrBPrevPos.erase(bot);
+#endif
+                    }
+                    if (ENABLE_R_TOWER_LEASH && !bIsMeleeChar && !bIsJungler && botChar && maxHealth > 0.0f) {
+                        bool  rtlDef     = (LastMacroAction[bot] == "Defend");
+                        bool  rtlActNone = LastMacroAction[bot].empty();
+                        bool  rtlOpen    = g_rtlStartT.count(bot) > 0;
+                        const char* rtlEv = nullptr; const char* rtlWhy = nullptr; int rtlAgeLog = -1;
+                        int   rtlTickLog = g_rtlTickN.count(bot) ? g_rtlTickN[bot] : 0, rtlPullLog = g_rtlPullN.count(bot) ? g_rtlPullN[bot] : 0;
+                        if (rtlOpen && g_rtlLastT.count(bot) && (matchTimeB - g_rtlLastT[bot]) > 1.5f) {
+                            rtlAgeLog = (int)(matchTimeB - g_rtlStartT[bot]);
+                            g_rtlStartT.erase(bot); g_rtlActN.erase(bot); g_rtlNoHeroN.erase(bot); g_rtlWaveN.erase(bot);
+                            g_rtlEndT[bot] = matchTimeB; rtlOpen = false; rtlEv = "END"; rtlWhy = "gap";
+                        }
+                        g_rtlLastT[bot] = matchTimeB;
+                        bool  rtlTwrOk   = closestFriendlyTower && ((rtlDef && threatenedFriendlyTower == closestFriendlyTower) || (rtlOpen && rtlActNone));
+                        bool  rtlOwner   = (BotIsBlind.count(bot) && BotIsBlind[bot])
+                                        || (ENABLE_WAVE_FALLBACK && g_wfbUntil.count(bot) && matchTimeB < g_wfbUntil[bot])
+                                        || (ENABLE_R_DEFEND_CARRY && g_rdcStartT.count(bot) > 0)
+                                        || (ENABLE_R_TOWER_RADIUS && g_rtrAStartT.count(bot) > 0
+                                            && g_rtrALastT.count(bot) && g_rtrALastT[bot] == matchTimeB)
+                                        || (ENABLE_R_TR_A_SEE && g_rtrASeeLastT.count(bot) && g_rtrASeeLastT[bot] == matchTimeB)
+                                        || bIsRotatingToObjective || bDoingBoss || bLateGame;
+                        bool  rtlBOpen   = ENABLE_R_TOWER_HOLD && g_rtrBStartT.count(bot) > 0;
+                        float rtlOutCm   = -9999.0f;
+                        if (closestFriendlyTower && g_rtlPrevTwrSq.count(bot) && g_rtlPrevTwrSq[bot] >= 0.0f
+                            && g_rtlPrevTwrT.count(bot) && (matchTimeB - g_rtlPrevTwrT[bot]) <= 1.5f)
+                            rtlOutCm = sqrtf(closestFriendlyTowerDistSq) - sqrtf(g_rtlPrevTwrSq[bot]);
+                        g_rtlPrevTwrSq[bot] = closestFriendlyTower ? closestFriendlyTowerDistSq : -1.0f;
+                        g_rtlPrevTwrT[bot]  = matchTimeB;
+                        float rtlHeroTwrSq = 1e18f;
+                        if (closestFriendlyTower && bestEnemyHero) {
+                            FVector rtlTL = closestFriendlyTower->K2_GetActorLocation(), rtlHL = bestEnemyHero->K2_GetActorLocation();
+                            rtlHeroTwrSq = (rtlTL.X - rtlHL.X) * (rtlTL.X - rtlHL.X) + (rtlTL.Y - rtlHL.Y) * (rtlTL.Y - rtlHL.Y);
+                        }
+                        int   rtlHeroHP = -1;
+                        if (bestEnemyHero) for (const CachedChar& mc : LiveChars) { if (mc.ptr != bestEnemyHero) continue; rtlHeroHP = (mc.maxHealth > 0.0f) ? (int)((mc.health / mc.maxHealth) * 100.0f) : -1; break; }
+                        float rtlBotHP   = (currentHealth / maxHealth) * 100.0f;
+                        bool  rtlKill    = RKillLage(AllTowers, bestEnemyHero, rtlHeroHP, rtlBotHP, akvEnH18 > akvFrH18 + 1, closestEnemyHeroDistSq);
+                        bool  rtlHero    = bestEnemyHero && closestEnemyHeroDistSq <= RTL_HERO_SQ;
+                        bool  rtlHeroIn  = rtlHero && rtlHeroTwrSq <= TOWER_SAFE_SQ;
+                        bool  rtlOwnUe   = ENABLE_R_OWNUE_SELF ? ROwnHeroUe(akvFrH18, akvEnH18) : (akvFrH18 >= akvEnH18 + 1);
+                        bool  rtlMinUe   = (akvFrM18 >= akvEnM18 + 1);
+                        bool  rtlLrWake  = (p7Wake[0] == 'L');
+                        if (rtlOpen) {
+                            float rtlAge = matchTimeB - g_rtlStartT[bot];
+                            g_rtlActN[bot]    = rtlDef ? 0 : (g_rtlActN[bot] + 1);
+                            g_rtlNoHeroN[bot] = rtlHero ? 0 : (g_rtlNoHeroN[bot] + 1);
+                            g_rtlWaveN[bot]   = rtlMinUe ? (g_rtlWaveN[bot] + 1) : 0;
+                            if (rtlOwner)                                              rtlWhy = "owner";
+                            else if (rtlBOpen)                                         rtlWhy = "toB";
+                            else if (!rtlDef && !(rtlActNone && g_rtlActN[bot] <= 1))  rtlWhy = "act";
+                            else if (!rtlTwrOk)                                        rtlWhy = "twr";
+                            else if (closestFriendlyTowerDistSq > RTL_MAX_SQ)          rtlWhy = "out30";
+                            else if (rtlKill)                                          rtlWhy = "kill";
+                            else if (rtlOwnUe)                                         rtlWhy = "ownUe";
+                            else if (rtlLrWake)                                        rtlWhy = "lrWake";
+                            else if (rtlHeroIn)                                        rtlWhy = "heroIn";
+                            else if (g_rtlWaveN[bot] >= 2)                             rtlWhy = "wave";
+                            else if (g_rtlNoHeroN[bot] >= 2)                           rtlWhy = "heroGone";
+                            else if (rtlAge >= RTL_CAP_S)                              rtlWhy = "cap";
+                            if (rtlWhy) {
+                                rtlAgeLog = (int)rtlAge;
+                                g_rtlStartT.erase(bot); g_rtlActN.erase(bot); g_rtlNoHeroN.erase(bot); g_rtlWaveN.erase(bot);
+                                g_rtlEndT[bot] = matchTimeB; rtlOpen = false; rtlEv = "END";
+                            }
+                        }
+                        bool rtlCheap = rtlDef && rtlTwrOk && (bestThreatenedTowerTier == 1 || bestThreatenedTowerTier == 2)
+                                     && closestFriendlyTowerDistSq > RTL_START_SQ && closestFriendlyTowerDistSq <= RTL_MAX_SQ
+                                     && rtlOutCm >= RTL_OUTWARD_CM
+                                     && rtlHero && !rtlHeroIn && !rtlKill && !rtlOwnUe && !rtlMinUe && !rtlLrWake && !rtlBOpen && !rtlOwner
+                                     && (!g_rtlEndT.count(bot) || (matchTimeB - g_rtlEndT[bot]) >= RTL_COOLDOWN_S);
+                        bool rtlNatHero = false;
+                        if (!rtlOpen && !rtlWhy && rtlCheap && GetEnemyCharacterFunc) {
+                            struct { class AActor* ReturnValue; } rtlNp{}; rtlNp.ReturnValue = nullptr;
+                            bot->ProcessEvent(GetEnemyCharacterFunc, &rtlNp);
+                            rtlNatHero = (rtlNp.ReturnValue != nullptr && rtlNp.ReturnValue == static_cast<AActor*>(bestEnemyHero));
+                        }
+                        int rtlK2 = 0;
+                        if (!rtlOpen && !rtlWhy && rtlCheap && rtlNatHero) {
+                            g_rtlStartT[bot] = matchTimeB; g_rtlActN[bot] = 0; g_rtlNoHeroN[bot] = 0; g_rtlWaveN[bot] = 0;
+                            g_rtlTickN[bot] = 0; g_rtlPullN[bot] = 0;
+                            rtlOpen = true; rtlEv = "FIRE";
+                            if (!g_rtlK2T.count(bot) || (matchTimeB - g_rtlK2T[bot]) >= RTL_K2_MIN_GAP_S) {
+                                bot->K2_SetEnemy(nullptr); g_rtlK2T[bot] = matchTimeB; rtlK2 = 1;
+                            }
+                            bR51Lockbreak = true;
+                        }
+                        bool rtlPull = false;
+                        if (rtlOpen && rtlTwrOk && closestFriendlyTowerDistSq > TOWER_SAFE_SQ) {
+                            moveTarget = static_cast<AActor*>(closestFriendlyTower); accRadius = RTR_B_ACCR;
+                            bIsIdle = true; BotIdleTicks[bot] = 10;
+                            g_rtlWroteT[bot] = matchTimeB; rtlPull = true;
+                        }
+                        if (rtlOpen) { g_rtlTickN[bot]++; if (rtlPull) g_rtlPullN[bot]++; }
+#if F4_LOG_LEVEL >= 1
+                        int rtlPullPrev = g_rtlPullPrev.count(bot) ? g_rtlPullPrev[bot] : 0;
+                        if (rtlEv || (rtlOpen && ((rtlPull ? 1 : 0) != rtlPullPrev
+                                                 || !g_rtlLogT.count(bot) || (matchTimeB - g_rtlLogT[bot]) >= 2.0f))) {
+                            g_rtlLogT[bot] = matchTimeB;
+                            float rtlMoved = -1.0f;
+                            if (g_rtlPrevPos.count(bot) && (!rtlEv || std::string(rtlEv) != "FIRE")) { FVector pp = g_rtlPrevPos[bot];
+                                rtlMoved = sqrtf((botLoc.X - pp.X) * (botLoc.X - pp.X) + (botLoc.Y - pp.Y) * (botLoc.Y - pp.Y)) / 100.0f; }
+                            g_rtlPrevPos[bot] = botLoc;
+                            AActor* rtlNat = nullptr;
+                            if (GetEnemyCharacterFunc) { struct { class AActor* ReturnValue; } np{}; np.ReturnValue = nullptr; bot->ProcessEvent(GetEnemyCharacterFunc, &np); rtlNat = np.ReturnValue; }
+                            std::cout << "[R-TR] " << (rtlEv ? rtlEv : (rtlPull ? "PULL" : "TRACE")) << " mode=L bot=" << botChar->GetFullName()
+                                << " Team=" << (bIsBlueTeam ? "B" : "R") << " R=" << roleSlot << " why=" << (rtlWhy ? rtlWhy : "-")
+                                << " act=" << (rtlDef ? "Defend" : rtlActNone ? "none" : "other")
+                                << " twrM=" << (closestFriendlyTower ? (int)(sqrtf(closestFriendlyTowerDistSq) / 100.0f) : -1)
+                                << " outM=" << (rtlOutCm > -9000.0f ? (int)(rtlOutCm / 100.0f) : -99) << " pull=" << (rtlPull ? 1 : 0)
+                                << " k2=" << rtlK2 << " lb=" << ((rtlEv && std::string(rtlEv) == "FIRE") ? 1 : 0)
+                                << " heroM=" << (bestEnemyHero ? (int)(sqrtf(closestEnemyHeroDistSq) / 100.0f) : -1)
+                                << " heroTwrM=" << (rtlHeroTwrSq < 1e17f ? (int)(sqrtf(rtlHeroTwrSq) / 100.0f) : -1)
+                                << " heroMelee=" << ((bestEnemyHero && RIsMeleeHeroName(bestEnemyHero->GetFullName())) ? 1 : 0)
+                                << " FrM18/EnM18=" << akvFrM18 << "/" << akvEnM18 << " FrH18/EnH18=" << akvFrH18 << "/" << akvEnH18
+                                << " tier=" << bestThreatenedTowerTier << " lrWake=" << (rtlLrWake ? 1 : 0) << " bOpen=" << (rtlBOpen ? 1 : 0)
+                                << " ageS=" << (rtlOpen ? (int)(matchTimeB - g_rtlStartT[bot]) : rtlAgeLog) << " movedM=" << rtlMoved
+                                << " natTgt=" << (rtlNat == nullptr ? "NULL" : (static_cast<AActor*>(bestEnemyHero) == rtlNat ? "Hero" : "other"))
+                                << " HP=" << (int)rtlBotHP << " heroHP=" << rtlHeroHP
+                                << " ticks=" << (rtlOpen ? g_rtlTickN[bot] : rtlTickLog) << " pullTicks=" << (rtlOpen ? g_rtlPullN[bot] : rtlPullLog)
+                                << " T=" << (int)matchTimeB << "s" << std::endl;
+                        }
+                        g_rtlPullPrev[bot] = rtlPull ? 1 : 0;
+                        if (!rtlOpen) g_rtlPrevPos.erase(bot);
+#endif
+                    }
+                    bool bAkHeavyDeficitNoBacking = (akvEnM18 >= akvFrM18 + 3) && (akvFrM18 <= 1);
+                    bool bAkDeathZoneVeto         = (bAkWaveDeficit || bAkOutnumber) && bAkHeavyDeficitNoBacking;
+                    bool bAkCommittedPunishOK   = bAkHeroCommittedMelee && !bAkHeavyDeficitNoBacking;
+                    int  akwFrM25 = 0, akwAhead = 0;
+                    int  akwHeroHP = -1;
+                    bool bAkWaveAhead = false;
+                    bool bAkHeroBeyondFront = false;
+                    bool ahbfBaseT = false, ahbfWasOnT = false;
+                    if (ENABLE_AK_WAVE_AHEAD_VETO && bIsMeleeChar && !bIsJungler && bestEnemyTower) {
+                        FVector awEtL     = bestEnemyTower->K2_GetActorLocation();
+                        float   awBotTwrM = sqrtf(closestEnemyTowerDistSq) / 100.0f;
+                        float   awFrontTwrM = 999999.0f;
+                        for (const CachedChar& cc_w : LiveChars) {
+                            if (cc_w.ptr == botChar || cc_w.bIsNeutral || cc_w.bIsHero) continue;
+                            if (cc_w.team != botTeam) continue;
+                            float wx = cc_w.loc.X - botLoc.X, wy = cc_w.loc.Y - botLoc.Y;
+                            float wSq = wx * wx + wy * wy;
+                            if (wSq >= AK_WAVE_AHEAD_R_SQ) continue;
+                            akwFrM25++;
+                            float ccTwrM = sqrtf((awEtL.X - cc_w.loc.X) * (awEtL.X - cc_w.loc.X)
+                                               + (awEtL.Y - cc_w.loc.Y) * (awEtL.Y - cc_w.loc.Y)) / 100.0f;
+                            if (ccTwrM < awBotTwrM) akwAhead++;
+                            if (ccTwrM < awFrontTwrM) { awFrontTwrM = ccTwrM; }
+                        }
+                        bAkWaveAhead = (akwFrM25 >= 1) && (akwAhead == 0);
+                        if (bAkWaveAhead && bestEnemyHero && getHealthFunc && getMaxHealthFunc) {
+                            float ah = 0.0f, am = 1.0f;
+                            bestEnemyHero->ProcessEvent(getHealthFunc, &ah);
+                            bestEnemyHero->ProcessEvent(getMaxHealthFunc, &am);
+                            akwHeroHP = (am > 0.0f) ? (int)((ah / am) * 100.0f) : -1;
+                            if (akwHeroHP >= 0 && akwHeroHP <= AK_WAVE_AHEAD_KILL_HP) bAkWaveAhead = false;
+                        }
+                        if (ENABLE_MRK_B_MELEE_FINISH && bAkWaveAhead) {
+                            int  mrkWaDeadEnInhibs = bIsBlueTeam ? deadInhibitorsRed : deadInhibitorsBlue;
+                            int  mrkWaDeadEnemies  = bIsBlueTeam ? deadRed : deadBlue;
+                            bool mrkWaV45          = (mrkWaDeadEnInhibs >= 2) || (mrkWaDeadEnInhibs >= 1 && mrkWaDeadEnemies >= 2);
+                            if (bestEnemyTowerTier == 0 && mrkWaV45 && closestEnemyTowerDistSq < 9000000.0f) {
+                                bAkWaveAhead = false;
+                            }
+                        }
+                        if (ENABLE_AK_HERO_BEYOND_FRONT) {
+                            ahbfWasOnT = g_ahbfOnT.count(bot) > 0;
+                            ahbfBaseT  = bestEnemyHero && closestEnemyHeroDistSq < 3240000.0f
+                                      && !bAkHeroCommittedMelee
+                                      && akvFrH18 == 0
+                                      && akvFrM18 < akvEnM18 + 2
+                                      && akwFrM25 >= 1
+                                      && (bestEnemyTowerTier == 1 || bestEnemyTowerTier == 2);
+                            if (ahbfBaseT) {
+                                FVector ahbfHL = bestEnemyHero->K2_GetActorLocation();
+                                float heroTwrM = sqrtf((awEtL.X - ahbfHL.X) * (awEtL.X - ahbfHL.X)
+                                                     + (awEtL.Y - ahbfHL.Y) * (awEtL.Y - ahbfHL.Y)) / 100.0f;
+                                bool posCand = ahbfWasOnT ? (heroTwrM < awFrontTwrM + AHBF_EXIT_M)
+                                                          : (heroTwrM < awFrontTwrM - AHBF_ENTER_M);
+                                bool heldT   = ahbfWasOnT && (matchTimeB - g_ahbfOnT[bot]) < AHBF_MIN_HOLD_S;
+                                if (posCand || heldT) {
+                                    int hHP = akwHeroHP;
+                                    if (hHP < 0 && getHealthFunc && getMaxHealthFunc) {
+                                        float ah2 = 0.0f, am2 = 1.0f;
+                                        bestEnemyHero->ProcessEvent(getHealthFunc, &ah2);
+                                        bestEnemyHero->ProcessEvent(getMaxHealthFunc, &am2);
+                                        hHP = (am2 > 0.0f) ? (int)((ah2 / am2) * 100.0f) : -1;
+                                    }
+                                    bool hpEnter = (hHP < 0 || hHP > AHBF_KILL_HP + 5);
+                                    bool hpStay  = (hHP < 0 || hHP > AHBF_KILL_HP);
+                                    if (ahbfWasOnT) {
+                                        bAkHeroBeyondFront = hpStay && (posCand || heldT);
+                                    } else {
+                                        bAkHeroBeyondFront = posCand && hpEnter;
+                                    }
+                                }
+                            }
+                            else if (ahbfWasOnT && bestEnemyHero && closestEnemyHeroDistSq < 3240000.0f && !bAkHeroCommittedMelee
+                                     && akvFrH18 == 0 && (matchTimeB - g_ahbfOnT[bot]) < AHBF_MIN_HOLD_S) {
+                                bAkHeroBeyondFront = true;
+                            }
+                            if (bAkHeroBeyondFront && !ahbfWasOnT) g_ahbfOnT[bot] = matchTimeB;
+                            if (!bAkHeroBeyondFront) g_ahbfOnT.erase(bot);
+                        }
+                    }
+                    bool bAkSoftVeto            = (bAkWaveDeficit || bAkOutnumber || bAkWaveAhead) && !bAkCommittedPunishOK;
+                    bool m1DefFar = false;
+                    if (ENABLE_M1_DEF_NEAR_ONLY && ENABLE_P8_FAR_DEFEND && bIsMeleeChar && !bIsJungler && !bDoingBoss
+                        && LastMacroAction[bot] == "Defend" && threatenedFriendlyTower && IsValidUE4Object(threatenedFriendlyTower)
+                        && (bestThreatenedTowerTier == 1 || bestThreatenedTowerTier == 2)
+                        && !bIsRotatingToObjective && p7Wake[0] == '-') {
+                        auto m1LrIt = g_laneReturnStartTime.find(bot);
+                        bool m1LrRunning = (m1LrIt != g_laneReturnStartTime.end()) && (matchTimeB - m1LrIt->second) < LANE_RETURN_COMMIT_SEC;
+                        if (!m1LrRunning) {
+                            FVector m1DT = threatenedFriendlyTower->K2_GetActorLocation();
+                            m1DefFar = ((m1DT.X - botLoc.X) * (m1DT.X - botLoc.X) + (m1DT.Y - botLoc.Y) * (m1DT.Y - botLoc.Y)) > P8_FAR_IN_SQ;
+                        }
+                    }
+
+                    bool bAkGateWouldFire =
+                        !bIsFleeing && !BotIsBlind[bot]
+                        && bestEnemyHero && closestEnemyHeroDistSq < 3240000.0f
+                        && CombatTimer[bot] > 0.0f
+                        && !bInsideEnemyTurretGlobal
+                        && !bV44Threatened
+                        && (closestEnemyHeroDistSq < 640000.0f
+                            || bIsSafeToPush
+                            || (currentHealth / maxHealth) > 0.8f
+                            || !bestEnemyMinion
+                            || closestEnemyMinionDistSq > 4000000.0f)
+                        && LastMacroAction[bot] != "Boss"
+                        && LastMacroAction[bot] != "Gank"
+                        && LastMacroAction[bot] != "Recall"
+                        && (LastMacroAction[bot] != "Defend" || m1DefFar)
+                        && bIsMeleeChar;
+#if F4_LOG_LEVEL >= 1
+                    if (bAkGateWouldFire && bAkSoftVeto) {
+                        std::string vetoReason;
+                        if (bAkWaveDeficit) vetoReason = "WaveDeficit";
+                        if (bAkOutnumber)   vetoReason += (vetoReason.empty() ? "" : "+") + std::string("Outnumber");
+                        if (bAkWaveAhead)   vetoReason += (vetoReason.empty() ? "" : "+") + std::string("WaveAhead");
+                        if (vetoReason.empty()) vetoReason = "(none)";
+                        std::cout << "[AK-VETO] bot=" << botChar->GetFullName().substr(0, 30)
+                            << " Role=" << roleSlot
+                            << " HP=" << (int)((currentHealth / maxHealth) * 100)
+                            << " HeroDistM=" << (int)(sqrt(closestEnemyHeroDistSq) / 100.0f)
+                            << " | EnM18=" << akvEnM18 << " FrM18=" << akvFrM18
+                            << " EnH18=" << akvEnH18 << " FrH18=" << akvFrH18
+                            << " | Reason=" << vetoReason
+                            << " Action=" << LastMacroAction[bot]
+                            << " T=" << (int)matchTimeB << "s" << std::endl;
+                    }
+#endif
+
+                    int heroHpPctInt        = 100;
+                    if (bAkGateWouldFire && bestEnemyHero) {
+                        if (getHealthFunc && getMaxHealthFunc) {
+                            float hp_hs = 0.0f, max_hs = 1.0f;
+                            bestEnemyHero->ProcessEvent(getHealthFunc, &hp_hs);
+                            bestEnemyHero->ProcessEvent(getMaxHealthFunc, &max_hs);
+                            heroHpPctInt = (max_hs > 0.0f) ? (int)((hp_hs / max_hs) * 100.0f) : 100;
+                        }
+                    }
+
+                    bool bAkHeroDataValid = false;
+                    int  akTraitCount     = 0;
+                    EOrionHeroTrait akDominantTrait = EOrionHeroTrait::Invalid;
+                    int  akDominantWeight = 0;
+                    bool bAkHeroIsRanged  = false;
+
+                    if (bestEnemyHero && bestEnemyHero->PlayerState) {
+                        AOrionPlayerState_Game* heroPs = reinterpret_cast<AOrionPlayerState_Game*>(bestEnemyHero->PlayerState);
+                        UOrionHeroData* heroData = heroPs->HeroDataSpec.HeroData;
+                        if (heroData) {
+                            bAkHeroDataValid = true;
+                            akTraitCount = heroData->Traits.Count();
+                            for (int ti = 0; ti < akTraitCount; ti++) {
+                                if (heroData->Traits[ti].Weight > akDominantWeight) {
+                                    akDominantWeight = heroData->Traits[ti].Weight;
+                                    akDominantTrait  = heroData->Traits[ti].Trait;
+                                }
+                            }
+                        }
+                    }
+
+                    if (bestEnemyHero) {
+                        std::string ehName = bestEnemyHero->GetFullName();
+                        bool bEnemyHeroIsMelee = (ehName.find("Steel") != std::string::npos
+                            || ehName.find("WarDrum") != std::string::npos
+                            || ehName.find("Chains") != std::string::npos
+                            || ehName.find("Kwang") != std::string::npos
+                            || ehName.find("Grux") != std::string::npos
+                            || ehName.find("Tomahawk") != std::string::npos
+                            || ehName.find("FallenAngel") != std::string::npos
+                            || ehName.find("Rampage") != std::string::npos
+                            || ehName.find("Vamp") != std::string::npos
+                            || ehName.find("Justice") != std::string::npos
+                            || ehName.find("Kurohane") != std::string::npos
+                            || ehName.find("Sword") != std::string::npos
+                            || ehName.find("Crunch") != std::string::npos
+                            || ehName.find("Mudang") != std::string::npos
+                            || ehName.find("Hammer") != std::string::npos
+                            || ehName.find("Wukong") != std::string::npos
+                            || ehName.find("Ice") != std::string::npos
+                            || ehName.find("Femme") != std::string::npos
+                            || ehName.find("ArcBlade") != std::string::npos);
+                        bAkHeroIsRanged = !bEnemyHeroIsMelee;
+                    }
+
+                    bool bAkTraitSkip = false;
+                    float botHpPctF  = (maxHealth > 0.0f) ? (currentHealth / maxHealth) : 1.0f;
+                    float heroHpPctF = heroHpPctInt / 100.0f;
+                    bool  bCommittedMelee = (closestEnemyHeroDistSq < 90000.0f);
+                    bool  bAkWaveBacking  = (akvFrM18 >= 1);
+
+                    if (bAkHeroDataValid && akDominantTrait != EOrionHeroTrait::Invalid) {
+                        if (akDominantTrait == EOrionHeroTrait::Burst
+                         || akDominantTrait == EOrionHeroTrait::Assassin
+                         || akDominantTrait == EOrionHeroTrait::Ganker) {
+                            if (botHpPctF < 0.85f && heroHpPctF > 0.30f && !bCommittedMelee
+                                && !bAkWaveBacking) {
+                                bAkTraitSkip = true;
+                            }
+                        }
+                        else if (akDominantTrait == EOrionHeroTrait::Elusive) {
+                            if (heroHpPctF > 0.30f && !bCommittedMelee) {
+                                bAkTraitSkip = true;
+                            }
+                        }
+                        else if (akDominantTrait == EOrionHeroTrait::Durable
+                              || akDominantTrait == EOrionHeroTrait::Guardian) {
+                            if (botHpPctF < 0.70f && heroHpPctF > 0.30f) {
+                                bAkTraitSkip = true;
+                            }
+                        }
+                    }
+                    bool p2TraitSkipF2 = bAkTraitSkip;
+                    if (ENABLE_P2_TRAIT_HP_FIX && bIsMeleeChar && bAkTraitSkip && !bAkGateWouldFire && bestEnemyHero) {
+                        for (const CachedChar& p2c : LiveChars) {
+                            if (p2c.ptr != bestEnemyHero) continue;
+                            if (p2c.maxHealth > 0.0f && (p2c.health / p2c.maxHealth) <= 0.30f) p2TraitSkipF2 = false;
+                            break;
+                        }
+                    }
+
+                    int kbEnMinsAroundHero = 0;
+                    if (bestEnemyHero && bIsMeleeChar && bAkHeroIsRanged) {
+                        FVector kbHeroLoc = bestEnemyHero->K2_GetActorLocation();
+                        for (const CachedChar& cc_kb : LiveChars) {
+                            if (cc_kb.ptr == botChar) continue;
+                            if (cc_kb.bIsHero || cc_kb.bIsNeutral) continue;
+                            if (cc_kb.team != enemyTeam) continue;
+                            float dx_kb = cc_kb.loc.X - kbHeroLoc.X;
+                            float dy_kb = cc_kb.loc.Y - kbHeroLoc.Y;
+                            float dSq_kb = dx_kb * dx_kb + dy_kb * dy_kb;
+                            if (dSq_kb < 1960000.0f) kbEnMinsAroundHero++;
+                        }
+                    }
+
+                    bool bAkKiteback =
+                        !bIsFleeing && !BotIsBlind[bot]
+                        && bestEnemyHero && closestEnemyHeroDistSq < 3240000.0f
+                        && CombatTimer[bot] > 0.0f
+                        && !bInsideEnemyTurretGlobal
+                        && !bV44Threatened
+                        && LastMacroAction[bot] != "Boss"
+                        && LastMacroAction[bot] != "Gank"
+                        && LastMacroAction[bot] != "Recall"
+                        && (LastMacroAction[bot] != "Defend" || m1DefFar)
+                        && bIsMeleeChar
+                        && !bLanePushVetoActive
+                        && !(m1DefFar && bMeleeLockbreakActive)
+                        && !bAkTraitSkip
+                        && akvFrM18 == 0
+                        && closestEnemyHeroDistSq >= 90000.0f
+                        && bAkHeroIsRanged
+                        && kbEnMinsAroundHero >= 2
+                        && (bestFriendlyEscortMinion || closestFriendlyTower);
+                    if (bAkKiteback && mrkLpvSuppressed) {
+                        bAkKiteback = false;
+                    }
+
+                    if (ENABLE_P8_FAR_DEFEND && bIsMeleeChar && !bIsJungler && !bDoingBoss && LastMacroAction[bot] == "Defend"
+                        && threatenedFriendlyTower && IsValidUE4Object(threatenedFriendlyTower)
+                        && (bestThreatenedTowerTier == 1 || bestThreatenedTowerTier == 2)
+                        && !bIsRotatingToObjective && p7Wake[0] == '-') {
+                        auto p8LrIt = g_laneReturnStartTime.find(bot);
+                        bool p8LrRunning = (p8LrIt != g_laneReturnStartTime.end()) && (matchTimeB - p8LrIt->second) < LANE_RETURN_COMMIT_SEC;
+                        if (!p8LrRunning) {
+                            FVector p8DT = threatenedFriendlyTower->K2_GetActorLocation();
+                            float p8DefSq = (p8DT.X - botLoc.X) * (p8DT.X - botLoc.X) + (p8DT.Y - botLoc.Y) * (p8DT.Y - botLoc.Y);
+                            auto p8SvIt = g_svActiveUntil.find(bot); auto p8WfIt = g_wfbUntil.find(bot);
+                            bool p8Win = (p8SvIt != g_svActiveUntil.end() && matchTimeB < p8SvIt->second) || (p8WfIt != g_wfbUntil.end() && matchTimeB < p8WfIt->second);
+                            bP8FarDefend = (p8DefSq > P8_FAR_IN_SQ) || (p8Win && p8DefSq > P8_FAR_OUT_SQ);
+                        }
+                    }
+                    auto svWaveSubstanceOk = [&](const FVector& svSubP) -> bool {
+                        int svSub = 0;
+                        for (const CachedChar& svS : LiveChars) {
+                            if (svS.bIsHero || svS.bIsNeutral || svS.team != botTeam) continue;
+                            if (svS.fullName.find("bp_minion_lane_") == std::string::npos) continue;
+                            float svSx = svS.loc.X - svSubP.X, svSy = svS.loc.Y - svSubP.Y;
+                            if (svSx * svSx + svSy * svSy < 640000.0f) svSub++;
+                        }
+                        return svSub >= akvEnM18 - 1;
+                    };
+                    auto svTgtAlive = [&](AActor* svT, bool svIsWave) -> bool {
+                        if (!svT) return false;
+                        if (svIsWave) {
+                            for (const CachedChar& svC : LiveChars)
+                                if (static_cast<AActor*>(svC.ptr) == svT) return svC.team == botTeam && !svC.bIsHero && !svC.bIsNeutral;
+                            return false;
+                        }
+                        return IsValidUE4Object(svT) && static_cast<AOrionDamageableObjective_Base*>(svT)->GetHealth() > 0.0f;
+                    };
+                    auto svPickTarget = [&](bool svShielded, bool& svIsWaveOut) -> AActor* {
+                        svIsWaveOut = false;
+                        bool svTwrOk = closestFriendlyTower && closestFriendlyTowerDistSq <= WFB_TOWER_MAX_SQ;
+                        if (ENABLE_SOLO1V1_DEATHBALL && rearWaveAnchor && rearWaveAnchorDistSq > 2250000.0f
+                            && (!closestFriendlyTower || rearWaveAnchorDistSq < closestFriendlyTowerDistSq)
+                            && (!svShielded || !closestFriendlyTower || closestFriendlyTowerDistSq > SOLO1V1_TOWER_PRIO_SQ)) {
+                            for (const CachedChar& svC : LiveChars) {
+                                if (static_cast<AActor*>(svC.ptr) != static_cast<AActor*>(rearWaveAnchor)) continue;
+                                if (svWaveSubstanceOk(svC.loc)) { svIsWaveOut = true; return static_cast<AActor*>(rearWaveAnchor); }
+                                break;
+                            }
+                        }
+                        if (svTwrOk) return static_cast<AActor*>(closestFriendlyTower);
+                        return nullptr;
+                    };
+                    if (ENABLE_SOLO1V1_VETO && bIsMeleeChar && bestEnemyHero && !(ENABLE_Q3_SV_NO_JUNGLER && bIsJungler)
+                        && closestEnemyHeroDistSq < 3240000.0f
+                        && akvFrH18 == 0
+                        && closestFriendlyTower
+                        && (!bV44Threatened
+                            || (ENABLE_SOLO1V1_V44DIVE
+                                && akvEnM18 > akvFrM18
+                                && bAkHeroIsRanged
+                                && closestFriendlyTowerDistSq > TOWER_SAFE_SQ))
+                        && !bMeleeTowerHold
+                        && (!bAkDeathZoneVeto || ENABLE_SOLO1V1_DEATHBALL)
+                        && !bAkKiteback
+                        && LastMacroAction[bot] != "Boss" && LastMacroAction[bot] != "Gank"
+                        && LastMacroAction[bot] != "Recall" && LastMacroAction[bot] != "Rotate"
+                        && (LastMacroAction[bot] != "Defend" || bP8FarDefend)) {
+                        int  svDeadEnInh = bIsBlueTeam ? deadInhibitorsRed : deadInhibitorsBlue;
+                        int  svDeadEn    = bIsBlueTeam ? deadRed : deadBlue;
+                        bool svFinish = (bestEnemyTowerTier == 0)
+                                     && ((svDeadEnInh >= 2) || (svDeadEnInh >= 1 && svDeadEn >= 2))
+                                     && (closestEnemyTowerDistSq < 9000000.0f);
+                        int svBotHP  = (maxHealth > 0.0f) ? (int)((currentHealth / maxHealth) * 100.0f) : -1;
+                        int svHeroHP = -1;
+                        if (getHealthFunc && getMaxHealthFunc) {
+                            float svh = 0.0f, svm = 1.0f;
+                            bestEnemyHero->ProcessEvent(getHealthFunc, &svh);
+                            bestEnemyHero->ProcessEvent(getMaxHealthFunc, &svm);
+                            svHeroHP = (svm > 0.0f) ? (int)((svh / svm) * 100.0f) : -1;
+                        }
+                        bool svNewEp = !g_svLastT.count(bot) || (matchTimeB - g_svLastT[bot]) > 8.0f;
+                        if (svNewEp) { g_svEpBotHP[bot] = svBotHP; g_svEpHeroHP[bot] = svHeroHP; }
+                        g_svLastT[bot] = matchTimeB;
+                        int  svBotDrop  = g_svEpBotHP[bot]  - svBotHP;
+                        int  svHeroDrop = g_svEpHeroHP[bot] - svHeroHP;
+                        bool svLosing   = (svBotDrop - svHeroDrop) >= SOLO1V1_LOSE_THRESH;
+
+                        bool svShieldedDive = false;
+                        int  svShield = 0;
+                        if (ENABLE_SHIELDED_DIVE
+                            && !bIsJungler
+                            && !bLanePushVetoActive
+                            && closestEnemyHeroDistSq >= 90000.0f
+                            && (akvEnM18 - akvFrM18) >= SHIELDED_DIVE_DEFICIT)
+                        {
+                            FVector svHL = bestEnemyHero->K2_GetActorLocation();
+                            for (const CachedChar& svcc : LiveChars) {
+                                if (svcc.bIsNeutral || svcc.bIsHero) continue;
+                                if (svcc.team == enemyTeam) {
+                                    float svdx = svcc.loc.X - svHL.X, svdy = svcc.loc.Y - svHL.Y;
+                                    if (svdx * svdx + svdy * svdy < 1960000.0f) svShield++;
+                                    continue;
+                                }
+                            }
+                            svShieldedDive = (svShield >= SHIELDED_DIVE_MIN);
+                            if (ENABLE_H1B_SV_ADV && svShieldedDive && !svLosing && H1AdvEnter((float)svBotHP, svHeroHP, akvEnH18 > akvFrH18 + 1, bAkHeavyDeficitNoBacking)) {
+                                svShieldedDive = false;
+                            }
+                        }
+                        bool svMaxHoldLock = ENABLE_RETREAT_COVER_RELEASE && g_svMaxHoldT.count(bot) && (matchTimeB - g_svMaxHoldT[bot]) < 2.0f;
+                        bool svWasArmedPre = g_svActiveUntil.count(bot) && matchTimeB < g_svActiveUntil[bot];
+                        AActor* svTgt = nullptr; bool svTgtWave = false;
+                        if (ENABLE_SV_TARGET_LATCH && (svLosing || svShieldedDive) && !svFinish && !svMaxHoldLock) {
+                            bool svLatchWave = g_svTgtIsWave.count(bot) && g_svTgtIsWave[bot];
+                            if (svWasArmedPre && g_svTarget.count(bot) && svTgtAlive(g_svTarget[bot], svLatchWave)) {
+                                svTgt = g_svTarget[bot]; svTgtWave = svLatchWave;
+                            } else {
+                                svTgt = svPickTarget(svShieldedDive, svTgtWave);
+                            }
+                        }
+                        if ((svLosing || svShieldedDive) && !svFinish && !svMaxHoldLock
+                            && (!ENABLE_SV_TARGET_LATCH || svTgt)) {
+                            bool svWasArmed = svWasArmedPre;
+                            bot->K2_SetIgnoreEnemies(true);
+                            BotIsBlind[bot] = true;
+                            moveTarget = closestFriendlyTower;
+                            if (ENABLE_SOLO1V1_DEATHBALL && rearWaveAnchor
+                                && rearWaveAnchorDistSq > 2250000.0f
+                                && rearWaveAnchorDistSq < closestFriendlyTowerDistSq
+                                && (!svShieldedDive || closestFriendlyTowerDistSq > SOLO1V1_TOWER_PRIO_SQ))
+                                moveTarget = rearWaveAnchor;
+                            if (ENABLE_SV_TARGET_LATCH) {
+                                moveTarget = svTgt;
+                                g_svTarget[bot] = svTgt; g_svTgtIsWave[bot] = svTgtWave;
+                            }
+                            accRadius = ENABLE_SOLO1V1_WAVEHOLD ? 500.0f : 1500.0f;
+                            bIsActivelyFighting = false;
+                            bIsIdle = true; BotIdleTicks[bot] = 10;
+                            g_svActiveUntil[bot] = matchTimeB + SOLO1V1_WINDOW_SEC;
+                            if (!svWasArmed) g_svFireT[bot] = matchTimeB;
+                            if (!svWasArmed) g_svFireHP[bot] = svBotHP;
+                            if (ENABLE_SOLO1V1_STICKY) lastThreatRetreatTime[bot] = matchTimeB;
+#if F4_LOG_LEVEL >= 1
+                            if (!svWasArmed) {
+                                std::cout << "[SOLO1V1-VETO] FIRE " << botChar->GetFullName().substr(0, 24)
+                                    << " p8far=" << (bP8FarDefend ? 1 : 0) << " Act=" << (LastMacroAction[bot].empty() ? std::string("(none)") : LastMacroAction[bot])
+                                    << " R=" << roleSlot << " HP=" << svBotHP << "% heroHP=" << svHeroHP << "%"
+                                    << " botDrop=" << svBotDrop << " heroDrop=" << svHeroDrop
+                                    << " heroM=" << (int)(sqrtf(closestEnemyHeroDistSq) / 100.0f)
+                                    << " twrM=" << (int)(sqrtf(closestFriendlyTowerDistSq) / 100.0f)
+                                    << " tgt=" << (!ENABLE_SV_TARGET_LATCH ? "legacy" : svTgtWave ? "wave" : "tower")
+                                    << " tgtM=" << ((ENABLE_SV_TARGET_LATCH && svTgt)
+                                                    ? (int)(sqrtf(svTgtWave ? rearWaveAnchorDistSq : closestFriendlyTowerDistSq) / 100.0f) : -1)
+                                    << " Team=" << (bIsBlueTeam ? "B" : "R");
+                                std::cout << " T=" << (int)matchTimeB << "s" << std::endl;
+                            }
+#endif
+                        }
+                    }
+
+                    bool  wfbTierOk  = (bestEnemyTowerTier == 1 || bestEnemyTowerTier == 2);
+                    bool  wfbDzInhib = ENABLE_WFB_DZ_INHIB && bAkHeavyDeficitNoBacking && !bDoingBoss
+                                    && bestEnemyTower && bestEnemyTower != enemyCore
+                                    && (bestEnemyTowerTier == 3 || bestEnemyTowerTier == 0)
+                                    && closestEnemyTowerDistSq < 9000000.0f
+                                    && rwFrM25 <= 1;
+                    bool  wfbDefCand = ENABLE_WFB_DEFICIT_EXT && bIsMeleeChar && !bIsJungler
+                                    && akvFrM18 >= 1 && (akvEnM18 - akvFrM18) >= 2
+                                    && (wfbTierOk || wfbDzInhib);
+                    bool  wfbPbHeavy = ENABLE_WFB_DEFICIT_EXT && bAkHeavyDeficitNoBacking
+                                    && bestEnemyHero && closestEnemyHeroDistSq < WFB_WAKE_HERO_SQ
+                                    && (wfbTierOk || wfbDzInhib);
+                    bool  wfbLpStalled = false;
+                    float wfbLpVel = -1.0f;
+                    if (wfbDefCand && bLanePushVetoActive && botChar) {
+                        UObject* wfbLpMc = *reinterpret_cast<UObject**>(reinterpret_cast<uintptr_t>(botChar) + 0x0380);
+                        if (wfbLpMc) {
+                            FVector* wfbVp = reinterpret_cast<FVector*>(reinterpret_cast<uintptr_t>(wfbLpMc) + 0x0104);
+                            wfbLpVel = sqrtf(wfbVp->X * wfbVp->X + wfbVp->Y * wfbVp->Y) / 100.0f;
+                        }
+                        g_wfbLpStall[bot] = (wfbLpVel >= 0.0f && wfbLpVel < 2.0f)
+                                          ? ((g_wfbLpStall.count(bot) ? g_wfbLpStall[bot] : 0) + 1) : 0;
+                        wfbLpStalled = (g_wfbLpStall[bot] >= 2);
+                    } else if (g_wfbLpStall.count(bot)) {
+                        g_wfbLpStall[bot] = 0;
+                    }
+                    bool h1WfbAdv = false;
+                    if (ENABLE_H1C_WFB_ADV && bIsMeleeChar && !bIsJungler && bestEnemyHero && !(g_wfbUntil.count(bot) && matchTimeB < g_wfbUntil[bot])) {
+                        int wfbHeroHP = -1;
+                        for (const CachedChar& mc : LiveChars) { if (mc.ptr != bestEnemyHero) continue; wfbHeroHP = (mc.maxHealth > 0.0f) ? (int)((mc.health / mc.maxHealth) * 100.0f) : -1; break; }
+                        float wfbBotHP = (maxHealth > 0.0f) ? (currentHealth / maxHealth) * 100.0f : -1.0f;
+                        h1WfbAdv = H1AdvEnter(wfbBotHP, wfbHeroHP, akvEnH18 > akvFrH18 + 1, bAkHeavyDeficitNoBacking);
+                        if (ENABLE_H1C_NOWAVE_KILLONLY && h1WfbAdv && akvFrM18 == 0 && (float)wfbHeroHP > H1C_NOWAVE_KILL_HP) h1WfbAdv = false;
+                    }
+                    bool rbrFire = false;
+                    bool rbrCoreNow = false;
+                    const char* rbrCoreWhy = "off";
+                    int rbrStartMask = 0;
+                    bool rwhxPath = false;
+                    if (ENABLE_R_BLIND_RETREAT && ENABLE_WAVE_FALLBACK && !bIsMeleeChar && !bIsJungler && botChar) {
+                        float rbrDuoBotHP = (maxHealth > 0.0f) ? (currentHealth / maxHealth) * 100.0f : 100.0f;
+                        bool  rbrDuo1     = ENABLE_R_WFB_DUO && ENABLE_R_WFB_DUO2 && akvFrH18 == 1;
+                        rbrStartMask      = !rbrDuo1 ? 0 : ((bV44Threatened ? RBR_WHY_V44 : 0) | ((akvEnH18 >= akvFrH18 + 2) ? RBR_WHY_OUT : 0)
+                                                          | ((rbrDuoBotHP <= RWFB_DUO_LOWHP) ? RBR_WHY_LOW : 0));
+                        bool rbrSoloOk = rbrDuo1 ? (rbrStartMask != 0)
+                                       : ENABLE_R_WFB_DUO ? (akvFrH18 <= 1 && akvEnH18 >= akvFrH18 + 1) : (akvFrH18 == 0);
+                        bool rbrPress  = ENABLE_R_WFB_DUO ? (akvEnM18 >= RBR_ENM_MIN || akvEnH18 >= akvFrH18 + 2)
+                                                          : (akvEnM18 >= RBR_ENM_MIN || akvEnH18 >= 2);
+                        bool rbrWaveOk = (rwFrM25 == 0)
+                                      || (ENABLE_R_WFB_CT && rwAheadM25 == 0 && bestEnemyTower && closestEnemyTowerDistSq <= RWFB_CT_ENTWR_SQ);
+                        bool rbrPartnerCommit = false;
+                        if (ENABLE_R_WFB_DUO && akvFrH18 >= 1 && bestEnemyHero) {
+                            FVector rbrEhL = bestEnemyHero->K2_GetActorLocation();
+                            for (const CachedChar& pc : LiveChars) {
+                                if (!pc.bIsHero || pc.team != botTeam || pc.ptr == botChar) continue;
+                                float px = pc.loc.X - botLoc.X, py = pc.loc.Y - botLoc.Y;
+                                if (px * px + py * py >= 3240000.0f) continue;
+                                float qx = pc.loc.X - rbrEhL.X, qy = pc.loc.Y - rbrEhL.Y;
+                                if (qx * qx + qy * qy > RWFB_PARTNER_COMMIT_SQ) continue;
+                                if (RIsMeleeHeroName(pc.ptr->GetFullName())) { rbrPartnerCommit = true; break; }
+                            }
+                        }
+                        bool rbrMelee8 = false;
+                        for (const CachedChar& ec : LiveChars) {
+                            if (!ec.bIsHero || ec.team != enemyTeam) continue;
+                            float ex = ec.loc.X - botLoc.X, ey = ec.loc.Y - botLoc.Y;
+                            float eSq = ex * ex + ey * ey;
+                            if (eSq >= 3240000.0f || eSq >= RBR_MELEE_PURSUER_SQ) continue;
+                            if (RIsMeleeHeroName(ec.ptr->GetFullName())) { rbrMelee8 = true; break; }
+                        }
+                        rbrCoreNow = bestEnemyHero
+                            && LastMacroAction[bot] == "TowerObjective" && !bDoingBoss
+                            && closestEnemyHeroDistSq < RBR_HERO_MAX_SQ && closestEnemyHeroDistSq >= WFB_WAKE_HERO_SQ
+                            && rbrSoloOk && akvFrM18 == 0 && rbrWaveOk
+                            && rbrPress
+                            && closestFriendlyTower && closestFriendlyTowerDistSq >= TOWER_SAFE_SQ
+                            && !rbrMelee8
+                            && !rbrPartnerCommit;
+                        rbrCoreWhy = !bestEnemyHero ? "noHero" : LastMacroAction[bot] != "TowerObjective" ? "act" : bDoingBoss ? "boss"
+                            : closestEnemyHeroDistSq >= RBR_HERO_MAX_SQ ? "hero18" : closestEnemyHeroDistSq < WFB_WAKE_HERO_SQ ? "hero4"
+                            : !rbrSoloOk ? (akvFrH18 >= 2 ? "frH2" : akvFrH18 == 1 ? (rbrDuo1 ? "duoNo" : ENABLE_R_WFB_DUO ? "duoAdv" : "frH") : "enH0")
+                            : akvFrM18 != 0 ? "frM" : !rbrWaveOk ? "rw25"
+                            : !rbrPress ? "press"
+                            : !(closestFriendlyTower && closestFriendlyTowerDistSq >= TOWER_SAFE_SQ) ? "twr16"
+                            : rbrMelee8 ? "m1"
+                            : rbrPartnerCommit ? "partner" : "ok";
+                        bool rwhxLage = false;
+                        if (ENABLE_R_WH_ESCALATE && ENABLE_R_WAVE_HOLD) {
+                            bool rwhxWrote = g_rwhWroteT.count(bot) && g_rwhWroteT[bot] == matchTimeB;
+                            bool rwhxBase  = rwhxWrote && rwAheadM25 == 0
+                                          && akvEnM18 >= RWHX_ENM_MIN && akvEnM18 >= akvFrM18 + RWHX_DEFICIT
+                                          && bestEnemyMinion && closestEnemyMinionDistSq <= RWHX_ENMIN_SQ;
+                            bool rwhxTwrOk = closestFriendlyTower && closestFriendlyTowerDistSq >= RETREAT_COVER_TWR_SQ;
+                            bool rwhxTrade = RWHX_TRADE_GUARD && rF3TradeX;
+                            rwhxLage = rwhxBase && LastMacroAction[bot] == "TowerObjective" && !bDoingBoss && akvFrH18 <= 1
+                                    && rwhxTwrOk && !rbrMelee8 && !rbrPartnerCommit && !rwhxTrade;
+                        }
+                        rwhxPath = rwhxLage && !rbrCoreNow;
+                        bool rbrGate = (rbrCoreNow || rwhxLage) && !bIsRotatingToObjective
+                            && !(BotIsBlind.count(bot) && BotIsBlind[bot])
+                            && !(g_wfbUntil.count(bot) && matchTimeB < g_wfbUntil[bot])
+                            && !(g_rbrEndT.count(bot) && (matchTimeB - g_rbrEndT[bot]) < RBR_COOLDOWN_S);
+                        bool rbrKillChk = ENABLE_R_WFB_DUO ? (akvEnH18 <= akvFrH18 + 1) : (akvEnH18 < 2);
+                        if (rbrGate && rbrKillChk) {
+                            int rbrHeroHP = -1; AOrionChar* rbrKillHero = nullptr;
+                            if (ENABLE_R_WFB_DUO) {
+                                for (const CachedChar& mc : LiveChars) {
+                                    if (!mc.bIsHero || mc.team != enemyTeam || mc.maxHealth <= 0.0f) continue;
+                                    float kx = mc.loc.X - botLoc.X, ky = mc.loc.Y - botLoc.Y;
+                                    if (kx * kx + ky * ky >= 3240000.0f) continue;
+                                    int hp = (int)((mc.health / mc.maxHealth) * 100.0f);
+                                    if (rbrHeroHP < 0 || hp < rbrHeroHP) { rbrHeroHP = hp; rbrKillHero = mc.ptr; }
+                                }
+                            } else {
+                                for (const CachedChar& mc : LiveChars) { if (mc.ptr != bestEnemyHero) continue; rbrHeroHP = (mc.maxHealth > 0.0f) ? (int)((mc.health / mc.maxHealth) * 100.0f) : -1; rbrKillHero = mc.ptr; break; }
+                            }
+                            float rbrBotHP = (maxHealth > 0.0f) ? (currentHealth / maxHealth) * 100.0f : -1.0f;
+                            bool  rbrKillRbr = rbrHeroHP >= 0 && (float)rbrHeroHP <= RBR_KILL_HERO_HP
+                                && rbrBotHP >= RBR_KILL_BOT_MIN_HP && rbrBotHP >= (float)rbrHeroHP + RBR_KILL_LEAD;
+                            bool  rbrKillRk  = false;
+                            if (ENABLE_R_WFB_KILL_FIX) {
+                                if (rbrKillRbr && (rbrStartMask == RBR_WHY_LOW || RHeroOwnTowerSq(AllTowers, rbrKillHero) <= RKILL_HERO_TWR_SQ)) rbrKillRbr = false;
+                                int rbrBestHP = -1;
+                                if (bestEnemyHero) for (const CachedChar& mc : LiveChars) { if (mc.ptr != bestEnemyHero) continue; rbrBestHP = (mc.maxHealth > 0.0f) ? (int)((mc.health / mc.maxHealth) * 100.0f) : -1; break; }
+                                rbrKillRk = RKillLage(AllTowers, bestEnemyHero, rbrBestHP, rbrBotHP, akvEnH18 > akvFrH18 + 1, closestEnemyHeroDistSq);
+                            }
+                            if (rbrKillRbr || rbrKillRk) { rbrGate = false; }
+                        }
+                        if (rbrGate) {
+                            bool rbrConsec = g_rbrArmT.count(bot) && (matchTimeB - g_rbrArmT[bot]) <= 1.5f;
+                            g_rbrArmN[bot] = rbrConsec ? (g_rbrArmN[bot] + 1) : 1;
+                            g_rbrArmT[bot] = matchTimeB;
+                            rbrFire = (g_rbrArmN[bot] >= RBR_ARM_TICKS);
+                        } else {
+                            g_rbrArmN.erase(bot); g_rbrArmT.erase(bot);
+                        }
+                    }
+                    if (ENABLE_WAVE_FALLBACK
+                        && bIsMeleeChar && !bIsJungler
+                        && bestEnemyHero
+                        && !h1WfbAdv
+                        && closestEnemyHeroDistSq < 3240000.0f
+                        && (closestEnemyHeroDistSq >= WFB_WAKE_HERO_SQ
+                            || wfbPbHeavy)
+                        && akvFrH18 == 0
+                        && (akvFrM18 == 0
+                            || wfbDefCand)
+                        && (akvEnM18 - akvFrM18) >= 2
+                        && (akvFrM18 == 0 || !bLanePushVetoActive || wfbLpStalled)
+                        && !(bMeleeTowerHold && closestFriendlyTowerDistSq < WFB_MTH_ANCHOR_SQ)
+                        && !(g_svActiveUntil.count(bot) && matchTimeB < g_svActiveUntil[bot])
+                        && !bAkKiteback
+                        && LastMacroAction[bot] != "Boss"   && LastMacroAction[bot] != "Gank"
+                        && LastMacroAction[bot] != "Recall" && LastMacroAction[bot] != "Rotate"
+                        && (LastMacroAction[bot] != "Defend" || (bP8FarDefend && akvFrM18 == 0))
+                        && !(g_wfbUntil.count(bot) && matchTimeB < g_wfbUntil[bot]))
+                    {
+                        int  wfbDeadInh = bIsBlueTeam ? deadInhibitorsRed : deadInhibitorsBlue;
+                        int  wfbDeadEn  = bIsBlueTeam ? deadRed : deadBlue;
+                        bool wfbFinish  = (bestEnemyTowerTier == 0)
+                                       && ((wfbDeadInh >= 2) || (wfbDeadInh >= 1 && wfbDeadEn >= 2))
+                                       && (closestEnemyTowerDistSq < 9000000.0f);
+                        if (!wfbFinish && enemyCore) {
+                            AOrionDamageableObjective_Base* wfbAnchor =
+                                (botPhysLane >= 0 && botPhysLane < 3) ? frontFriendlyTowers[botPhysLane] : nullptr;
+                            FVector wfbAnchorLoc = wfbAnchor ? wfbAnchor->K2_GetActorLocation() : FVector();
+                            float wfbBotToECoreSq = (enemyCoreLoc.X - botLoc.X) * (enemyCoreLoc.X - botLoc.X)
+                                                  + (enemyCoreLoc.Y - botLoc.Y) * (enemyCoreLoc.Y - botLoc.Y);
+                            AOrionChar* wfbWave = nullptr;
+                            float wfbWaveSq = 0.0f;
+                            bool  wfbDefPathNow = wfbDefCand;
+                            if (wfbAnchor) {
+                                for (const CachedChar& wf : LiveChars) {
+                                    if (wf.bIsHero || wf.bIsNeutral || wf.team != botTeam) continue;
+                                    if (wf.fullName.find("bp_minion_lane_") == std::string::npos) continue;
+                                    float ex = wf.loc.X - enemyCoreLoc.X, ey = wf.loc.Y - enemyCoreLoc.Y;
+                                    if (ex * ex + ey * ey <= wfbBotToECoreSq) continue;
+                                    float bx = wf.loc.X - botLoc.X, by = wf.loc.Y - botLoc.Y;
+                                    float dSq = bx * bx + by * by;
+                                    if (dSq < WFB_WAVE_MIN_SQ || dSq > WFB_WAVE_MAX_SQ) continue;
+                                    float toMineSq = (wf.loc.X - wfbAnchorLoc.X) * (wf.loc.X - wfbAnchorLoc.X)
+                                                   + (wf.loc.Y - wfbAnchorLoc.Y) * (wf.loc.Y - wfbAnchorLoc.Y);
+                                    bool onMyLane = true;
+                                    for (int oL = 0; oL < 3; oL++) {
+                                        if (oL == botPhysLane || !frontFriendlyTowers[oL]) continue;
+                                        FVector oLoc = frontFriendlyTowers[oL]->K2_GetActorLocation();
+                                        float toOtherSq = (wf.loc.X - oLoc.X) * (wf.loc.X - oLoc.X)
+                                                        + (wf.loc.Y - oLoc.Y) * (wf.loc.Y - oLoc.Y);
+                                        if (toOtherSq < toMineSq) { onMyLane = false; break; }
+                                    }
+                                    if (!onMyLane) continue;
+                                    if (wfbDefPathNow) {
+                                        if (wfbWave && dSq >= wfbWaveSq) continue;
+                                        int wfbSub = 0;
+                                        for (const CachedChar& ws : LiveChars) {
+                                            if (ws.bIsHero || ws.bIsNeutral || ws.team != botTeam) continue;
+                                            if (ws.fullName.find("bp_minion_lane_") == std::string::npos) continue;
+                                            float sx = ws.loc.X - wf.loc.X, sy = ws.loc.Y - wf.loc.Y;
+                                            if (sx * sx + sy * sy < WFB_DEF_SUBST_R_SQ) wfbSub++;
+                                        }
+                                        if (wfbSub < akvEnM18 - 1) continue;
+                                    }
+                                    if (!wfbWave || dSq < wfbWaveSq) { wfbWaveSq = dSq; wfbWave = wf.ptr; }
+                                }
+                            }
+                            AActor* wfbTgt = nullptr;
+                            const char* wfbKind = "none";
+                            bool wfbPickedWave = false;
+                            AOrionDamageableObjective_Base* wfbTwr = wfbDefPathNow ? wfbAnchor : closestFriendlyTower;
+                            float wfbTwrSq = closestFriendlyTowerDistSq;
+                            bool  wfbTwrBehindFail = false;
+                            if (wfbDefPathNow && wfbAnchor) {
+                                wfbTwrSq = (wfbAnchorLoc.X - botLoc.X) * (wfbAnchorLoc.X - botLoc.X)
+                                         + (wfbAnchorLoc.Y - botLoc.Y) * (wfbAnchorLoc.Y - botLoc.Y);
+                                wfbTwrBehindFail = ((wfbAnchorLoc.X - enemyCoreLoc.X) * (wfbAnchorLoc.X - enemyCoreLoc.X)
+                                                  + (wfbAnchorLoc.Y - enemyCoreLoc.Y) * (wfbAnchorLoc.Y - enemyCoreLoc.Y)) <= wfbBotToECoreSq;
+                                if (wfbTwrBehindFail) wfbTwr = nullptr;
+                            }
+                            bool wfbTwrOk = (wfbTwr != nullptr);
+                            if (wfbTwrOk && wfbTwrSq <= SOLO1V1_TOWER_PRIO_SQ) {
+                                wfbTgt = static_cast<AActor*>(wfbTwr); wfbKind = "towerPrio";
+                            }
+                            else if (wfbWave && (!wfbTwrOk || wfbWaveSq < wfbTwrSq)) {
+                                wfbTgt = static_cast<AActor*>(wfbWave); wfbKind = "wave"; wfbPickedWave = true;
+                            }
+                            else if (wfbTwrOk && wfbTwrSq <= WFB_TOWER_MAX_SQ) {
+                                wfbTgt = static_cast<AActor*>(wfbTwr); wfbKind = "tower";
+                            }
+                            if (wfbTgt) {
+                                bot->K2_SetIgnoreEnemies(true);
+                                BotIsBlind[bot] = true;
+                                moveTarget = wfbTgt;
+                                accRadius  = 500.0f;
+                                bIsActivelyFighting = false;
+                                bIsIdle = true; BotIdleTicks[bot] = 10;
+                                FVector wfbTL = wfbTgt->K2_GetActorLocation();
+                                float wfbD0 = (wfbTL.X - botLoc.X) * (wfbTL.X - botLoc.X)
+                                            + (wfbTL.Y - botLoc.Y) * (wfbTL.Y - botLoc.Y);
+                                g_wfbUntil[bot]      = matchTimeB + WFB_COMMIT_SEC;
+                                g_wfbTarget[bot]     = wfbTgt;
+                                g_wfbBestDistSq[bot] = wfbD0;
+                                g_wfbStall[bot]      = 0;
+                                g_wfbFireT[bot]      = matchTimeB;
+                                g_wfbEngineBlind[bot] = true;
+                                g_wfbDefPath[bot]     = (wfbDefPathNow || wfbPbHeavy);
+                                g_wfbDefParity[bot]   = 0;
+                                g_wfbTgtIsWave[bot]   = wfbPickedWave;
+                                lastThreatRetreatTime[bot] = matchTimeB;
+#if F4_LOG_LEVEL >= 1
+                                std::cout << "[WAVE-FALLBACK] FIRE " << botChar->GetFullName().substr(0, 24)
+                                    << " p8far=" << (bP8FarDefend ? 1 : 0)
+                                    << " R=" << roleSlot
+                                    << " HP=" << (maxHealth > 0.0f ? (int)((currentHealth / maxHealth) * 100.0f) : -1) << "%"
+                                    << " tgt=" << wfbKind
+                                    << " tgtM=" << (int)(sqrtf(wfbD0) / 100.0f)
+                                    << " twrM=" << (closestFriendlyTower ? (int)(sqrtf(closestFriendlyTowerDistSq) / 100.0f) : -1)
+                                    << " heroM=" << (int)(sqrtf(closestEnemyHeroDistSq) / 100.0f)
+                                    << " EnM18=" << akvEnM18
+                                    << " Act=" << (LastMacroAction.count(bot) && !LastMacroAction[bot].empty()
+                                                   ? LastMacroAction[bot] : std::string("(none)"))
+                                    << " V44=" << (bV44Threatened ? 1 : 0) << " lpv=" << (bLanePushVetoActive ? 1 : 0)
+                                    << " path=" << (wfbDefPathNow ? "P3def" : wfbPbHeavy ? "P2bPB" : "P2b")
+                                    << " pb=" << (wfbPbHeavy ? 1 : 0) << " heavy=" << (bAkHeavyDeficitNoBacking ? 1 : 0)
+                                    << " FrM18=" << akvFrM18 << " lpStall=" << (g_wfbLpStall.count(bot) ? g_wfbLpStall[bot] : 0)
+                                    << " velMs=" << wfbLpVel << " subNeed=" << (akvEnM18 - 1)
+                                    << " twrLane=" << ((wfbDefPathNow && wfbTwr) ? (int)(sqrtf(wfbTwrSq) / 100.0f) : -1)
+                                    << " twrBehind=" << (wfbTwrBehindFail ? 0 : 1)
+                                    << " tier=" << bestEnemyTowerTier << " dzInhib=" << (wfbDzInhib ? 1 : 0)
+                                    << " rwFrM25=" << rwFrM25 << " akwFrM25=" << akwFrM25
+                                    << " rwM=" << (rearWaveAnchor ? (int)(sqrtf(rearWaveAnchorDistSq) / 100.0f) : -1)
+                                    << " Team=" << (bIsBlueTeam ? "B" : "R")
+                                    << " T=" << (int)matchTimeB << "s" << std::endl;
+#endif
+                            }
+                        }
+                    }
+                    if (rbrFire
+                        && !(g_svActiveUntil.count(bot) && matchTimeB < g_svActiveUntil[bot])
+                        && !bAkKiteback
+                        && !(g_wfbUntil.count(bot) && matchTimeB < g_wfbUntil[bot]))
+                    {
+                        int  rwfDeadInh = bIsBlueTeam ? deadInhibitorsRed : deadInhibitorsBlue;
+                        int  rwfDeadEn  = bIsBlueTeam ? deadRed : deadBlue;
+                        bool rwfFinish  = (bestEnemyTowerTier == 0)
+                                       && ((rwfDeadInh >= 2) || (rwfDeadInh >= 1 && rwfDeadEn >= 2))
+                                       && (closestEnemyTowerDistSq < 9000000.0f);
+                        if (!rwfFinish && enemyCore) {
+                            AOrionDamageableObjective_Base* rwfAnchor =
+                                (botPhysLane >= 0 && botPhysLane < 3) ? frontFriendlyTowers[botPhysLane] : nullptr;
+                            FVector rwfAnchorLoc = rwfAnchor ? rwfAnchor->K2_GetActorLocation() : FVector();
+                            float rwfBotToECoreSq = (enemyCoreLoc.X - botLoc.X) * (enemyCoreLoc.X - botLoc.X)
+                                                  + (enemyCoreLoc.Y - botLoc.Y) * (enemyCoreLoc.Y - botLoc.Y);
+                            AOrionChar* rwfWave = nullptr;
+                            float rwfWaveSq = 0.0f;
+                            AOrionChar* rwhxNoSub = nullptr; float rwhxNoSubSq = 0.0f;
+                            AOrionChar* rwhxDeep4 = nullptr; float rwhxDeep4Sq = 0.0f, rwhxDeep4Cm = 0.0f;
+                            float rwhxTipCore = (rwhxPath && rearWaveAnchor)
+                                ? sqrtf((rearWaveAnchorLoc.X - enemyCoreLoc.X) * (rearWaveAnchorLoc.X - enemyCoreLoc.X)
+                                      + (rearWaveAnchorLoc.Y - enemyCoreLoc.Y) * (rearWaveAnchorLoc.Y - enemyCoreLoc.Y)) : 0.0f;
+                            if (rwfAnchor) {
+                                for (const CachedChar& wf : LiveChars) {
+                                    if (wf.bIsHero || wf.bIsNeutral || wf.team != botTeam) continue;
+                                    if (wf.fullName.find("bp_minion_lane_") == std::string::npos) continue;
+                                    float ex = wf.loc.X - enemyCoreLoc.X, ey = wf.loc.Y - enemyCoreLoc.Y;
+                                    if (ex * ex + ey * ey <= rwfBotToECoreSq) continue;
+                                    float bx = wf.loc.X - botLoc.X, by = wf.loc.Y - botLoc.Y;
+                                    float dSq = bx * bx + by * by;
+                                    if (dSq < WFB_WAVE_MIN_SQ || dSq > WFB_WAVE_MAX_SQ) continue;
+                                    float toMineSq = (wf.loc.X - rwfAnchorLoc.X) * (wf.loc.X - rwfAnchorLoc.X)
+                                                   + (wf.loc.Y - rwfAnchorLoc.Y) * (wf.loc.Y - rwfAnchorLoc.Y);
+                                    bool onMyLane = true;
+                                    for (int oL = 0; oL < 3; oL++) {
+                                        if (oL == botPhysLane || !frontFriendlyTowers[oL]) continue;
+                                        FVector oLoc = frontFriendlyTowers[oL]->K2_GetActorLocation();
+                                        float toOtherSq = (wf.loc.X - oLoc.X) * (wf.loc.X - oLoc.X)
+                                                        + (wf.loc.Y - oLoc.Y) * (wf.loc.Y - oLoc.Y);
+                                        if (toOtherSq < toMineSq) { onMyLane = false; break; }
+                                    }
+                                    if (!onMyLane) continue;
+                                    if (rwhxPath) {
+                                        if (!rearWaveAnchor) continue;
+                                        float xDepthCm = sqrtf(ex * ex + ey * ey) - rwhxTipCore;
+                                        if (xDepthCm < RWH_DEEP_MIN_CM) continue;
+                                        if (!rwhxDeep4 || xDepthCm > rwhxDeep4Cm) { rwhxDeep4 = wf.ptr; rwhxDeep4Sq = dSq; rwhxDeep4Cm = xDepthCm; }
+                                        if (xDepthCm < RWHX_BEHIND_TIP_M * 100.0f) continue;
+                                        if (!rwhxNoSub || dSq < rwhxNoSubSq) { rwhxNoSub = wf.ptr; rwhxNoSubSq = dSq; }
+                                        if (rwfWave && dSq >= rwfWaveSq) continue;
+                                        int xNeed = (akvEnM18 - RWHX_SUB_OFFSET > RWH_MIN_SUB) ? RWH_MIN_SUB : (akvEnM18 - RWHX_SUB_OFFSET);
+                                        int xSub = 0;
+                                        for (const CachedChar& ws : LiveChars) {
+                                            if (ws.bIsHero || ws.bIsNeutral || ws.team != botTeam) continue;
+                                            if (ws.fullName.find("bp_minion_lane_") == std::string::npos) continue;
+                                            float sx = ws.loc.X - wf.loc.X, sy = ws.loc.Y - wf.loc.Y;
+                                            if (sx * sx + sy * sy < WFB_DEF_SUBST_R_SQ) xSub++;
+                                        }
+                                        if (xSub < xNeed) continue;
+                                    }
+                                    if (!rwfWave || dSq < rwfWaveSq) { rwfWaveSq = dSq; rwfWave = wf.ptr; }
+                                }
+                            }
+                            AActor* rwfTgt = nullptr;
+                            const char* rwfKind = "none";
+                            bool rwfPickedWave = false;
+                            AOrionDamageableObjective_Base* rwfTwr = closestFriendlyTower;
+                            float rwfTwrSq = closestFriendlyTowerDistSq;
+                            bool  rwfTwrOk = (rwfTwr != nullptr);
+                            if (rwfTwrOk && rwfTwrSq <= SOLO1V1_TOWER_PRIO_SQ) {
+                                rwfTgt = static_cast<AActor*>(rwfTwr); rwfKind = "towerPrio";
+                            }
+                            else if (rwfWave && (!rwfTwrOk || rwfWaveSq < rwfTwrSq)) {
+                                rwfTgt = static_cast<AActor*>(rwfWave); rwfKind = "wave"; rwfPickedWave = true;
+                            }
+                            else if (rwhxPath && RWHX_DEEP_FALLBACK && (rwhxNoSub || rwhxDeep4)
+                                     && (!rwfTwrOk || (rwhxNoSub ? rwhxNoSubSq : rwhxDeep4Sq) < rwfTwrSq)) {
+                                rwfTgt = static_cast<AActor*>(rwhxNoSub ? rwhxNoSub : rwhxDeep4); rwfKind = rwhxNoSub ? "deepX" : "deepX4"; rwfPickedWave = true;
+                            }
+                            else if (rwfTwrOk && rwfTwrSq <= WFB_TOWER_MAX_SQ) {
+                                rwfTgt = static_cast<AActor*>(rwfTwr); rwfKind = "tower";
+                            }
+                            if (rwfTgt) {
+                                bot->K2_SetIgnoreEnemies(true);
+                                BotIsBlind[bot] = true;
+                                moveTarget = rwfTgt;
+                                accRadius  = 500.0f;
+                                bIsActivelyFighting = false;
+                                bIsIdle = true; BotIdleTicks[bot] = 10;
+                                FVector rwfTL = rwfTgt->K2_GetActorLocation();
+                                float rwfD0 = (rwfTL.X - botLoc.X) * (rwfTL.X - botLoc.X)
+                                            + (rwfTL.Y - botLoc.Y) * (rwfTL.Y - botLoc.Y);
+                                g_wfbUntil[bot]       = matchTimeB + RBR_TIMEOUT_S;
+                                g_wfbTarget[bot]      = rwfTgt;
+                                g_wfbBestDistSq[bot]  = rwfD0;
+                                g_wfbStall[bot]       = 0;
+                                g_wfbFireT[bot]       = matchTimeB;
+                                g_wfbEngineBlind[bot] = true;
+                                g_wfbDefPath[bot]     = false;
+                                g_wfbDefParity[bot]   = 0;
+                                g_wfbTgtIsWave[bot]   = rwfPickedWave;
+                                lastThreatRetreatTime[bot] = matchTimeB;
+                                g_rbrFireT[bot] = matchTimeB; g_rbrWaveN[bot] = 0; g_rbrNoHeroN[bot] = 0; g_rbrPrevPos[bot] = botLoc;
+                                g_rbrArmN.erase(bot); g_rbrArmT.erase(bot);
+                                g_rbrStartWhy[bot] = rbrStartMask; g_rbrV44OffN[bot] = 0;
+                                if (rwhxPath) g_rwhxFireT[bot] = matchTimeB; else g_rwhxFireT.erase(bot);
+#if F4_LOG_LEVEL >= 1
+                                int rbrSub = -1;
+                                if (rwfPickedWave) {
+                                    rbrSub = 0; FVector rbrWl = rwfTgt->K2_GetActorLocation();
+                                    for (const CachedChar& ws : LiveChars) {
+                                        if (ws.bIsHero || ws.bIsNeutral || ws.team != botTeam) continue;
+                                        if (ws.fullName.find("bp_minion_lane_") == std::string::npos) continue;
+                                        float sx = ws.loc.X - rbrWl.X, sy = ws.loc.Y - rbrWl.Y;
+                                        if (sx * sx + sy * sy < WFB_DEF_SUBST_R_SQ) rbrSub++;
+                                    }
+                                }
+                                std::cout << "[R-BR] FIRE " << botChar->GetFullName() << " Team=" << (bIsBlueTeam ? "B" : "R") << " R=" << roleSlot
+                                    << " HP=" << (maxHealth > 0.0f ? (int)((currentHealth / maxHealth) * 100.0f) : -1)
+                                    << " tgt=" << rwfKind << " tgtM=" << (int)(sqrtf(rwfD0) / 100.0f) << " sub=" << rbrSub
+                                    << " twrM=" << (int)(sqrtf(closestFriendlyTowerDistSq) / 100.0f)
+                                    << " heroM=" << (bestEnemyHero ? (int)(sqrtf(closestEnemyHeroDistSq) / 100.0f) : -1) << " heroRanged=" << (bAkHeroIsRanged ? 1 : 0)
+                                    << " FrH18/EnH18=" << akvFrH18 << "/" << akvEnH18 << " FrM18/EnM18=" << akvFrM18 << "/" << akvEnM18
+                                    << " rwM=" << (rearWaveAnchor ? (int)(sqrtf(rearWaveAnchorDistSq) / 100.0f) : -1)
+                                    << " duo=" << (akvFrH18 >= 1 ? 1 : 0) << " ct=" << (rwFrM25 >= 1 ? 1 : 0)
+                                    << " sw=" << rbrStartMask
+                                    << " x=" << (rwhxPath ? 1 : 0) << " enMinM=" << (bestEnemyMinion ? (int)(sqrtf(closestEnemyMinionDistSq) / 100.0f) : -1)
+                                    << " tipBehindM=" << ((rwhxPath && rearWaveAnchor) ? (int)((sqrtf((rwfTL.X - enemyCoreLoc.X) * (rwfTL.X - enemyCoreLoc.X)
+                                                                + (rwfTL.Y - enemyCoreLoc.Y) * (rwfTL.Y - enemyCoreLoc.Y)) - rwhxTipCore) / 100.0f) : -999)
+                                    << " enTwrM=" << (bestEnemyTower ? (int)(sqrtf(closestEnemyTowerDistSq) / 100.0f) : -1) << " core=" << rbrCoreWhy
+                                    << " V44=" << (bV44Threatened ? 1 : 0) << " lpv=" << (bLanePushVetoActive ? 1 : 0)
+                                    << " inTurret=" << (bInsideEnemyTurretGlobal ? 1 : 0)
+                                    << " T=" << (int)matchTimeB << "s" << std::endl;
+#endif
+                            }
+                        }
+                    }
+
+                    int  mrkDzDeadEnInhibs = bIsBlueTeam ? deadInhibitorsRed : deadInhibitorsBlue;
+                    int  mrkDzDeadEnemies  = bIsBlueTeam ? deadRed : deadBlue;
+                    bool mrkDzV45          = (mrkDzDeadEnInhibs >= 2) || (mrkDzDeadEnInhibs >= 1 && mrkDzDeadEnemies >= 2);
+                    bool mrkAkdzFinishSkip = ENABLE_MRK_B_MELEE_FINISH && bIsMeleeChar && bAkDeathZoneVeto
+                                          && (bestEnemyTowerTier == 0) && mrkDzV45 && (closestEnemyTowerDistSq < 9000000.0f);
+                    bool h3AkdzTwrSkip = ENABLE_H3_AKDZ_TOWER && bIsMeleeChar && !(ENABLE_I3_H3_NOJGL && bIsJungler) && bAkDeathZoneVeto && closestFriendlyTower && closestFriendlyTowerDistSq <= (ENABLE_I3_TWR16 ? I3_TWR16_SQ : H_AKDZ_TWR_SQ);
+                    bool ahbfAkCand = (!bIsFleeing && !BotIsBlind[bot]
+                        && bestEnemyHero && closestEnemyHeroDistSq < 3240000.0f
+                            && CombatTimer[bot] > 0.0f
+                            && !bInsideEnemyTurretGlobal
+                            && !bV44Threatened
+                            && !bStickyDangerRetreat
+                            && (closestEnemyHeroDistSq < 640000.0f
+                                || bIsSafeToPush
+                                || (currentHealth / maxHealth) > 0.8f
+                                || !bestEnemyMinion
+                                || closestEnemyMinionDistSq > 4000000.0f)
+                            && LastMacroAction[bot] != "Boss"
+                            && LastMacroAction[bot] != "Gank"
+                            && LastMacroAction[bot] != "Recall"
+                            && (LastMacroAction[bot] != "Defend" || m1DefFar)
+                            && bIsMeleeChar
+                            && !bAkSoftVeto
+                            && !bLanePushVetoActive
+                            && !bAkTraitSkip
+                            && !bAkKiteback
+                            && !(m1DefFar && bMeleeLockbreakActive)
+                            );
+                    if (ahbfAkCand
+                            && !bAkHeroBeyondFront
+                            )
+                    {
+                        bAntiKiteActive = true;
+                        AActor* currentNativeTargetAK = nullptr;
+                        if (GetEnemyCharacterFunc) {
+                            struct { class AActor* ReturnValue; } getEnemyParamsAK{};
+                            getEnemyParamsAK.ReturnValue = nullptr;
+                            bot->ProcessEvent(GetEnemyCharacterFunc, &getEnemyParamsAK);
+                            currentNativeTargetAK = getEnemyParamsAK.ReturnValue;
+                        }
+
+                        if (currentNativeTargetAK != bestEnemyHero) {
+                            bot->K2_SetEnemy(bestEnemyHero);
+                        }
+
+                        moveTarget = bestEnemyHero;
+                        accRadius = 300.0f;
+                        BotIdleTicks[bot] = 10;
+                        AntiKiteEngageTime[bot] = matchTimeB;
+                    }
+                    else if (bAkKiteback) {
+                        AActor* curNatKB = nullptr;
+                        if (GetEnemyCharacterFunc) {
+                            struct { class AActor* ReturnValue; } gpKB{};
+                            gpKB.ReturnValue = nullptr;
+                            bot->ProcessEvent(GetEnemyCharacterFunc, &gpKB);
+                            curNatKB = gpKB.ReturnValue;
+                        }
+                        if (curNatKB != bestEnemyHero) {
+                            bot->K2_SetEnemy(bestEnemyHero);
+                        }
+
+                        if (bestFriendlyEscortMinion) {
+                            moveTarget = bestFriendlyEscortMinion;
+                            accRadius = 600.0f;
+                        } else {
+                            moveTarget = closestFriendlyTower;
+                            accRadius = 800.0f;
+                        }
+                        bIsActivelyFighting = false;
+                        bIsIdle = true;
+                        BotIdleTicks[bot] = 10;
+                        AntiKiteEngageTime[bot] = matchTimeB;
+                    }
+                    else if (bIsMeleeChar
+                        && bAkDeathZoneVeto
+                        && !h3AkdzTwrSkip
+                        && !(ENABLE_SOLO1V1_DEATHBALL && ENABLE_SOLO1V1_VETO && g_svActiveUntil.count(bot) && matchTimeB < g_svActiveUntil[bot])
+                        && !(ENABLE_WAVE_FALLBACK && g_wfbUntil.count(bot) && matchTimeB < g_wfbUntil[bot])
+                        && !bLanePushVetoActive
+                        && !bV44Threatened
+                        && !bStickyDangerRetreat
+                        && LastMacroAction[bot] != "Defend"
+                        && LastMacroAction[bot] != "Boss"
+                        && LastMacroAction[bot] != "Gank"
+                        && LastMacroAction[bot] != "Recall"
+                        && LastMacroAction[bot] != "Rotate"
+                        && !mrkAkdzFinishSkip
+                        && closestFriendlyTower)
+                    {
+                        moveTarget = closestFriendlyTower;
+                        accRadius = 1500.0f;
+                        if (ENABLE_REARWAVE_RETREAT && rearWaveAnchor && !bLanePushVetoActive
+                            && rearWaveAnchorDistSq < closestFriendlyTowerDistSq
+                            && (!ENABLE_AKDZ_ANCHOR_SUBSTANCE || rwAnchorSub >= (akvEnM18 - 1 > 1 ? akvEnM18 - 1 : 1))) {
+                            moveTarget = rearWaveAnchor;
+                            if (ENABLE_AKDZ_WAVE_ACCR) accRadius = AKDZ_WAVE_ACC_R;
+                        }
+                        bIsActivelyFighting = false;
+                        bIsIdle = true;
+                        BotIdleTicks[bot] = 10;
+                        static std::map<AOrionAIBot*, float> lastDeathZoneEscapeTime;
+                        bool isNewDzEpisode = !lastDeathZoneEscapeTime.count(bot)
+                            || (matchTimeB - lastDeathZoneEscapeTime[bot] >= 2.0f);
+                        if (isNewDzEpisode) {
+                            bot->K2_SetEnemy(nullptr);
+                        }
+                        lastDeathZoneEscapeTime[bot] = matchTimeB;
+                        lastThreatRetreatTime[bot] = matchTimeB;
+                        bMeleeLockbreakActive = true;
+#if F4_LOG_LEVEL >= 1
+                        std::cout << "[AK-DZ-ESCAPE] bot=" << botChar->GetFullName().substr(0, 30) << " Role=" << roleSlot << " HP=" << (int)((currentHealth / maxHealth) * 100) << " HeroDistM=" << (int)(sqrt(closestEnemyHeroDistSq) / 100.0f) << " | akvFrM18=" << akvFrM18 << " akvEnM18=" << akvEnM18 << " anchorSub=" << rwAnchorSub << " subOk=" << ((rwAnchorSub >= (akvEnM18 - 1 > 1 ? akvEnM18 - 1 : 1)) ? 1 : 0) << " EnH18=" << akvEnH18 << " FrH18=" << akvFrH18 << " | LockBreak=" << (isNewDzEpisode ? 1 : 0) << " blind=" << ((BotIsBlind.count(bot) && BotIsBlind[bot]) ? 1 : 0) << " accR=" << (int)accRadius << " Action=" << LastMacroAction[bot] << " T=" << (int)matchTimeB << "s" << std::endl;
+#endif
+                    }
+
+                    int  lpFinDeadEnInhibs = bIsBlueTeam ? deadInhibitorsRed : deadInhibitorsBlue;
+                    int  lpFinDeadEnemies  = bIsBlueTeam ? deadRed : deadBlue;
+                    bool lpFinV45WinCond   = (lpFinDeadEnInhibs >= 2) || (lpFinDeadEnInhibs >= 1 && lpFinDeadEnemies >= 2);
+                    bool lpFinAtFinishPush = (bestEnemyTowerTier == 0) && lpFinV45WinCond
+                                           && (closestEnemyTowerDistSq < 9000000.0f);
+                    if (ENABLE_BLINDRETREAT_PROBE && bIsMeleeChar && !bLaunchProbeActive
+                        && CombatTimer.count(bot) && CombatTimer[bot] > 0.0f
+                        && bestEnemyHero && closestEnemyHeroDistSq < 640000.0f
+                        && closestFriendlyTower
+                        && (bV44Threatened || bLanePushVetoActive || bAkDeathZoneVeto || bMeleeLockbreakActive)
+                        && !bDoingBoss
+                        && LastMacroAction[bot] != "Boss"  && LastMacroAction[bot] != "Recall"
+                        && LastMacroAction[bot] != "Gank"  && LastMacroAction[bot] != "Rotate"
+                        && LastMacroAction[bot] != "Defend"
+                        && !bIsRotatingToObjective
+                        && !(lpFinAtFinishPush && !p2FinHeavyOut)
+                        )
+                    {
+                        float brPreVelMs = -1.0f;
+                        { UObject* mcPre = *reinterpret_cast<UObject**>(reinterpret_cast<uintptr_t>(botChar) + 0x0380);
+                          if (mcPre) { FVector* vp = reinterpret_cast<FVector*>(reinterpret_cast<uintptr_t>(mcPre) + 0x0104);
+                                       brPreVelMs = sqrtf(vp->X * vp->X + vp->Y * vp->Y) / 100.0f; } }
+                        if (brPreVelMs >= 0.0f && brPreVelMs < 2.0f) g_brFrozenTicks[bot]++;
+                        else g_brFrozenTicks[bot] = 0;
+                        if (g_brFrozenTicks[bot] >= 2) {
+                            int brEnH18 = 0, brFrH18 = 0;
+                            for (const CachedChar& brcc : LiveChars) {
+                                if (!brcc.bIsHero || brcc.bIsNeutral || brcc.ptr == botChar) continue;
+                                float bodx = brcc.loc.X - botLoc.X, body = brcc.loc.Y - botLoc.Y;
+                                if (bodx * bodx + body * body < 3240000.0f) { if (brcc.team == botTeam) brFrH18++; else brEnH18++; }
+                            }
+                            bool bBrOutnum = (brEnH18 > brFrH18 + 1);
+                            bool  brWakeHeroClose = bestEnemyHero
+                                                 && closestEnemyHeroDistSq < (BR_WAKE_HERO_M * 100.0f) * (BR_WAKE_HERO_M * 100.0f);
+                            bool  svYieldWin = ENABLE_BRWAKE_SV_YIELD && ENABLE_SOLO1V1_VETO
+                                             && g_svActiveUntil.count(bot) && matchTimeB < g_svActiveUntil[bot];
+                            bool  brInWfbDef = ENABLE_WFB_DEFICIT_EXT && g_wfbDefPath.count(bot) && g_wfbDefPath[bot]
+                                             && g_wfbUntil.count(bot) && matchTimeB < g_wfbUntil[bot];
+                            bool  brS0 = brInWfbDef;
+                            bool  brWakePre = ENABLE_BR_WAKE && brWakeHeroClose && !bBrOutnum && !svYieldWin && !brS0;
+                            int   brTrHeroHP  = -1;
+                            bool  brTradeSkip = false;
+                            if (ENABLE_BRWAKE_TRADE_SKIP && brWakePre && trLose3s != -999 && trLose3s >= BRWAKE_TRADE_LOSE && bestEnemyHero) {
+                                for (const CachedChar& btx : LiveChars) { if (btx.ptr != bestEnemyHero) continue; brTrHeroHP = (btx.maxHealth > 0.0f) ? (int)(btx.health / btx.maxHealth * 100.0f) : -1; break; }
+                                brTradeSkip = !(brTrHeroHP >= 0 && (float)brTrHeroHP <= BRWAKE_TRADE_KILL_HP);
+                            }
+                            bool  brWake = brWakePre && !brTradeSkip;
+                            if (brWake) {
+                                if (BotIsBlind.count(bot) && BotIsBlind[bot]) bot->K2_SetIgnoreEnemies(false);
+                                BotIsBlind[bot] = false;
+                                bIsActivelyFighting = true;
+                                moveTarget = nullptr;
+                                if (ENABLE_BRWAKE_REDIRECT && !bIsJungler && bestEnemyHero) {
+                                    float bwTwrSq = -1.0f;
+                                    for (AOrionDamageableObjective_Base* bwt : AllTowers) {
+                                        if (!bwt || bwt->TeamNum != enemyTeam || bwt->GetHealth() <= 0.0f) continue;
+                                        if (bwt->GetFullName().find("Default__") != std::string::npos) continue;
+                                        FVector bwtl = bwt->K2_GetActorLocation();
+                                        float bq = (bwtl.X - botLoc.X) * (bwtl.X - botLoc.X) + (bwtl.Y - botLoc.Y) * (bwtl.Y - botLoc.Y);
+                                        if (bwTwrSq < 0.0f || bq < bwTwrSq) bwTwrSq = bq;
+                                    }
+                                    int bwHeroHP = -1;
+                                    for (const CachedChar& bwx : LiveChars) { if (bwx.ptr != bestEnemyHero) continue; bwHeroHP = (bwx.maxHealth > 0.0f) ? (int)((bwx.health / bwx.maxHealth) * 100.0f) : -1; break; }
+                                    bool bwTwrSkip = (bwTwrSq >= 0.0f && bwTwrSq < BRWAKE_REDIR_TWR_SQ);
+                                    bool bwKill    = (bwHeroHP >= 0 && (float)bwHeroHP <= BRWAKE_REDIR_KILL_HP);
+                                    bool bwMinOk   = (akvEnM18 <= akvFrM18) || bwKill;
+                                    AActor* bwNat = nullptr;
+                                    bool bwK2 = false;
+                                    if (!bwTwrSkip && bwMinOk) {
+                                        bBrWakeRedirect = true;
+                                        if (GetEnemyCharacterFunc) { struct { class AActor* ReturnValue; } bwp{}; bwp.ReturnValue = nullptr; bot->ProcessEvent(GetEnemyCharacterFunc, &bwp); bwNat = bwp.ReturnValue; }
+                                        bwK2 = (bwNat != static_cast<AActor*>(bestEnemyHero));
+                                        if (bwK2) bot->K2_SetEnemy(bestEnemyHero);
+                                    }
+                                }
+                            }
+                            if (!brWake && !(BotIsBlind.count(bot) && BotIsBlind[bot])) {
+                                bot->K2_SetIgnoreEnemies(true);
+                                BotIsBlind[bot] = true;
+                            }
+                            bool brLaunchNow = !brWake && (!g_brIssueTime.count(bot) || (matchTimeB - g_brIssueTime[bot]) >= 2.0f);
+                            if (brLaunchNow) {
+                                UObject* moveComp = *reinterpret_cast<UObject**>(reinterpret_cast<uintptr_t>(botChar) + 0x0380);
+                                static UFunction* fnLaunchBr = nullptr;
+                                if (!fnLaunchBr)
+                                    fnLaunchBr = UObject::FindObject<UFunction>("Function OrionGame.OrionCharMovementComponent.LaunchToPoint");
+                                if (moveComp && fnLaunchBr) {
+                                    AActor* brLaunchTgt = static_cast<AActor*>(closestFriendlyTower);
+                                    FVector twLoc = brLaunchTgt->K2_GetActorLocation();
+                                    float dirX = twLoc.X - botLoc.X, dirY = twLoc.Y - botLoc.Y;
+                                    float len = sqrtf(dirX * dirX + dirY * dirY);
+                                    if (len > 1.0f) {
+                                        struct LaunchPointParams { FVector EndPoint; float LaunchVelocityXY; bool bLockAirControl; uint8_t _pad11[3]; } lp{};
+                                        lp.EndPoint.X = botLoc.X + (dirX / len) * 800.0f;
+                                        lp.EndPoint.Y = botLoc.Y + (dirY / len) * 800.0f;
+                                        lp.EndPoint.Z = botLoc.Z;
+                                        lp.LaunchVelocityXY = 700.0f;
+                                        lp.bLockAirControl = false;
+                                        bool brWallSkip = false;
+                                        {
+                                            static UFunction* fnBrRay = nullptr;
+                                            if (!fnBrRay)
+                                                fnBrRay = UObject::FindObject<UFunction>("Function Engine.NavigationSystem.NavigationRaycast");
+                                            UObject* brNavCDO = fnBrRay ? reinterpret_cast<UObject*>(SDK::UNavigationSystem::GetDefaultObj()) : nullptr;
+                                            if (fnBrRay && brNavCDO && IsValidUE4Object(brNavCDO)) {
+                                                SDK::Params::NavigationSystem_NavigationRaycast brray{};
+                                                brray.WorldContextObject = botChar;
+                                                brray.RayStart = botLoc;
+                                                brray.RayEnd = lp.EndPoint;
+                                                brray.HitLocation = botLoc;
+                                                brray.Querier = reinterpret_cast<decltype(brray.Querier)>(bot);
+                                                brNavCDO->ProcessEvent(fnBrRay, &brray);
+                                                float brdhx = brray.HitLocation.X - botLoc.X, brdhy = brray.HitLocation.Y - botLoc.Y;
+                                                float brdex = brray.RayEnd.X - botLoc.X, brdey = brray.RayEnd.Y - botLoc.Y;
+                                                float brDistHit = sqrtf(brdhx * brdhx + brdhy * brdhy);
+                                                float brDistEnd = sqrtf(brdex * brdex + brdey * brdey);
+                                                brWallSkip = brray.ReturnValue && (brDistHit > 100.0f) && (brDistHit < brDistEnd - 150.0f);
+                                            }
+                                        }
+                                        if (!brWallSkip) {
+                                            moveComp->ProcessEvent(fnLaunchBr, &lp);
+                                            g_brIssueTime[bot] = matchTimeB;
+                                        }
+                                    }
+                                }
+                            }
+                            if (ENABLE_J0_BRWAKE_SYNC && brWake) {
+                                if (g_brActiveUntil.count(bot)) {
+#if F4_LOG_LEVEL >= 1
+                                    float j0Held = g_brFireT.count(bot) ? (matchTimeB - g_brFireT[bot]) : -1.0f;
+                                    std::cout << "[BLINDRETREAT] CLEAR " << botChar->GetFullName() << " Team=" << (bIsBlueTeam ? "B" : "R")
+                                        << " R=" << roleSlot << " reason=wakeSync heldS=" << (int)j0Held
+                                        << " twrD=" << (int)(sqrtf(closestFriendlyTowerDistSq) / 100.0f)
+                                        << " heroD=" << (int)(sqrtf(closestEnemyHeroDistSq) / 100.0f)
+                                        << " HP=" << (int)((currentHealth / maxHealth) * 100.0f) << " T=" << (int)matchTimeB << "s" << std::endl;
+#endif
+                                    g_brActiveUntil.erase(bot); g_brMoveTarget.erase(bot); g_brAccRadius.erase(bot); g_brFireT.erase(bot);
+                                }
+                            } else {
+                            if (!g_brActiveUntil.count(bot)) {
+                                g_brTracePos[bot] = botLoc;
+                                g_brMoveTarget[bot] = moveTarget ? moveTarget : static_cast<AActor*>(closestFriendlyTower);
+                                g_brAccRadius[bot]  = (accRadius > 0.0f) ? accRadius : 300.0f;
+                            }
+                            if (!g_brFireT.count(bot)) g_brFireT[bot] = matchTimeB;
+                            g_brActiveUntil[bot] = matchTimeB + 6.0f;
+                            }
+#if F4_LOG_LEVEL >= 1
+                            std::cout << "[BLINDRETREAT] FIRE " << botChar->GetFullName() << " Team=" << (bIsBlueTeam ? "B" : "R")
+                                << " R=" << roleSlot << " HP=" << (int)((currentHealth / maxHealth) * 100) << "%"
+                                << " heroD=" << (int)(sqrt(closestEnemyHeroDistSq) / 100.0f) << "m"
+                                << " twrD=" << (int)(sqrt(closestFriendlyTowerDistSq) / 100.0f) << "m"
+                                << " savable=" << (closestFriendlyTowerDistSq < 12250000.0f ? 1 : 0)
+                                << " preVelMs=" << brPreVelMs << " wake=" << (brWake ? 1 : 0) << " trSkip=" << (brTradeSkip ? 1 : 0) << " trade=" << trLose3s << " win=" << (g_brActiveUntil.count(bot) ? 1 : 0) << " launch=" << ((g_brIssueTime.count(bot) && g_brIssueTime[bot] == matchTimeB) ? 1 : 0) << " T=" << (int)matchTimeB << "s" << std::endl;
+#endif
+                        }
+                    }
+
+                    if (bAntiKiteActive) {
+                        bIsIdle = true;
+                    }
+
+                    {
+                        static const bool ENABLE_AK_JUMP = true;
+                        constexpr float AKJ_MIN_SQ  = 90000.0f;
+                        constexpr float AKJ_MAX_SQ  = 810000.0f;
+                        constexpr float AKJ_CD      = 3.0f;
+                        constexpr float AKJ_MAXDIST = 800.0f;
+                        if (ENABLE_AK_JUMP && bAntiKiteActive && !bIsJungler
+                            && LastMacroAction[bot] != "Rotate"
+                            && !bAkOutnumber
+                            && !((BotNeedsHeal.count(bot) && BotNeedsHeal[bot]) || bNeedsTacticalRecall)
+                            && !(BotIsBlind.count(bot) && BotIsBlind[bot])
+                            && bestEnemyHero
+                            && closestEnemyHeroDistSq >= AKJ_MIN_SQ
+                            && closestEnemyHeroDistSq <= AKJ_MAX_SQ) {
+                            if (g_akJumpTime.count(bot) == 0) g_akJumpTime[bot] = matchTimeB - AKJ_CD - 1.0f;
+                            if ((matchTimeB - g_akJumpTime[bot]) >= AKJ_CD) {
+                                UObject* akjMc = *reinterpret_cast<UObject**>(reinterpret_cast<uintptr_t>(botChar) + 0x0380);
+                                if (akjMc) {
+                                    static UFunction* fnAkjLaunch = nullptr;
+                                    if (!fnAkjLaunch)
+                                        fnAkjLaunch = UObject::FindObject<UFunction>("Function OrionGame.OrionCharMovementComponent.LaunchToPoint");
+                                    if (fnAkjLaunch) {
+                                        FVector akjHero = bestEnemyHero->K2_GetActorLocation();
+                                        float dX = akjHero.X - botLoc.X, dY = akjHero.Y - botLoc.Y, L = sqrtf(dX * dX + dY * dY);
+                                        if (L > 1.0f) {
+                                            float akjDist = L - 100.0f;
+                                            if (akjDist > AKJ_MAXDIST) akjDist = AKJ_MAXDIST;
+                                            if (akjDist < 100.0f)      akjDist = 100.0f;
+                                            struct LaunchPointParams { FVector EndPoint; float LaunchVelocityXY; bool bLockAirControl; uint8_t _pad11[3]; } akjlp{};
+                                            akjlp.EndPoint.X = botLoc.X + (dX / L) * akjDist;
+                                            akjlp.EndPoint.Y = botLoc.Y + (dY / L) * akjDist;
+                                            akjlp.EndPoint.Z = botLoc.Z;
+                                            akjlp.LaunchVelocityXY = 700.0f;
+                                            akjlp.bLockAirControl = false;
+                                            bool akjWallSkip = false;
+                                            {
+                                                static UFunction* fnAkjRay = nullptr;
+                                                if (!fnAkjRay)
+                                                    fnAkjRay = UObject::FindObject<UFunction>("Function Engine.NavigationSystem.NavigationRaycast");
+                                                UObject* akjNavCDO = fnAkjRay ? reinterpret_cast<UObject*>(SDK::UNavigationSystem::GetDefaultObj()) : nullptr;
+                                                if (fnAkjRay && akjNavCDO && IsValidUE4Object(akjNavCDO)) {
+                                                    SDK::Params::NavigationSystem_NavigationRaycast akjray{};
+                                                    akjray.WorldContextObject = botChar;
+                                                    akjray.RayStart = botLoc;
+                                                    akjray.RayEnd = akjlp.EndPoint;
+                                                    akjray.HitLocation = botLoc;
+                                                    akjray.Querier = reinterpret_cast<decltype(akjray.Querier)>(bot);
+                                                    akjNavCDO->ProcessEvent(fnAkjRay, &akjray);
+                                                    float adhx = akjray.HitLocation.X - botLoc.X, adhy = akjray.HitLocation.Y - botLoc.Y;
+                                                    float adex = akjray.RayEnd.X - botLoc.X, adey = akjray.RayEnd.Y - botLoc.Y;
+                                                    float aDistHit = sqrtf(adhx * adhx + adhy * adhy);
+                                                    float aDistEnd = sqrtf(adex * adex + adey * adey);
+                                                    akjWallSkip = akjray.ReturnValue && (aDistHit > 100.0f) && (aDistHit < aDistEnd - 150.0f);
+                                                }
+                                            }
+                                            bool akjTowerSkip = false;
+                                            for (AOrionDamageableObjective_Base* akjTwr : AllTowers) {
+                                                if (!akjTwr || akjTwr->TeamNum != enemyTeam || akjTwr->GetHealth() <= 0.0f) continue;
+                                                if (akjTwr->GetFullName().find("Default__") != std::string::npos) continue;
+                                                FVector akjTwrLoc = akjTwr->K2_GetActorLocation();
+                                                float atdx = akjTwrLoc.X - akjlp.EndPoint.X, atdy = akjTwrLoc.Y - akjlp.EndPoint.Y;
+                                                if (atdx * atdx + atdy * atdy < 3240000.0f) { akjTowerSkip = true; break; }
+                                            }
+                                            int akjLandEn = 0, akjLandFr = 0;
+                                            for (const CachedChar& cc_aj : LiveChars) {
+                                                if (cc_aj.bIsHero || cc_aj.bIsNeutral) continue;
+                                                float ljx = cc_aj.loc.X - akjlp.EndPoint.X, ljy = cc_aj.loc.Y - akjlp.EndPoint.Y;
+                                                if (ljx * ljx + ljy * ljy >= 640000.0f) continue;
+                                                if (cc_aj.team == enemyTeam)    akjLandEn++;
+                                                else if (cc_aj.team == botTeam) akjLandFr++;
+                                            }
+                                            bool akjLandUnsafe = (akjLandEn > akjLandFr);
+                                            if (!akjWallSkip && !akjTowerSkip && !akjLandUnsafe) {
+                                                akjMc->ProcessEvent(fnAkjLaunch, &akjlp);
+                                                g_akJumpTime[bot] = matchTimeB;
+#if F4_LOG_LEVEL >= 1
+                                                std::cout << "[AK-JUMP] bot=" << botChar->GetFullName().substr(0, 24)
+                                                    << " R=" << roleSlot
+                                                    << " heroD=" << (int)(sqrt(closestEnemyHeroDistSq) / 100.0f) << "m"
+                                                    << " jumpM=" << (akjDist / 100.0f)
+                                                    << " landM=" << ((L - akjDist) / 100.0f)
+                                                    << " FrM18=" << akvFrM18 << " EnM18=" << akvEnM18
+                                                    << " landFr=" << akjLandFr << " landEn=" << akjLandEn
+                                                    << " HP=" << (int)((currentHealth / maxHealth) * 100) << "%"
+                                                    << " T=" << (int)matchTimeB << "s" << std::endl;
+#endif
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    {
+                        if (ServerConfig::EnableBotSpeedBuff && botChar) {
+                            static UFunction* spApplyFn = nullptr;
+                            static void*      spGeClass = nullptr;
+                            if (!spApplyFn)
+                                spApplyFn = UObject::FindObject<UFunction>("Function GameplayAbilities.AbilitySystemComponent.BP_ApplyGameplayEffectToSelf");
+                            if (!spGeClass) {
+                                UGameplayEffect* spCdo = UObject::FindObject<UGameplayEffect>("GE_Buff_Dragon_MoveSpeed_C GE_Buff_Dragon_MoveSpeed.Default__GE_Buff_Dragon_MoveSpeed_C");
+                                if (spCdo) spGeClass = *reinterpret_cast<void**>(reinterpret_cast<uintptr_t>(spCdo) + 0x10);
+                            }
+                            if (g_speedGEHandle.count(bot) == 0 && spApplyFn && spGeClass && CombatTimer[bot] <= 0.0f) {
+                                g_speedGEHandle[bot] = SafeApplyBotGE(botChar, spGeClass, spApplyFn);
+                            }
+#if F4_LOG_LEVEL >= 1
+                            UObject* spMoveSet = *reinterpret_cast<UObject**>(reinterpret_cast<uintptr_t>(botChar) + 0x0798);
+                            float spMax = spMoveSet ? *reinterpret_cast<float*>(reinterpret_cast<uintptr_t>(spMoveSet) + 0x0030) : -1.0f;
+                            float spVel = -1.0f;
+                            UObject* spMc = *reinterpret_cast<UObject**>(reinterpret_cast<uintptr_t>(botChar) + 0x0380);
+                            if (spMc) { FVector* vp = reinterpret_cast<FVector*>(reinterpret_cast<uintptr_t>(spMc) + 0x0104);
+                                        spVel = sqrtf(vp->X * vp->X + vp->Y * vp->Y) / 100.0f; }
+                            std::cout << "[SPEED-GE] bot=" << botChar->GetFullName().substr(0, 24)
+                                << " R=" << roleSlot
+                                << " maxSpeed=" << (int)spMax
+                                << " velMs=" << spVel
+                                << " Combat=" << (int)CombatTimer[bot]
+                                << " geH=" << (g_speedGEHandle.count(bot) ? g_speedGEHandle[bot] : 0)
+                                << " T=" << (int)matchTimeB << "s" << std::endl;
+#endif
+                        }
+                    }
+
+                    static std::map<AOrionAIBot*, AOrionChar*> g_rkfTgt;
+                    static std::map<AOrionAIBot*, float>       g_rkfK2T;
+                    if (ENABLE_RKF && !bIsMeleeChar && !bIsJungler && LastMacroAction[bot] == "TowerObjective" && !bDoingBoss && !bIsRotatingToObjective
+                        && !(BotIsBlind.count(bot) && BotIsBlind[bot]) && !bV44Threatened && maxHealth > 0.0f && (currentHealth / maxHealth) * 100.0f >= RKF_BOT_MIN_HP
+                        && bestEnemyHero && closestEnemyHeroDistSq < RKF_HERO_SQ) {
+                        float rkfBotHP = (currentHealth / maxHealth) * 100.0f;
+                        const CachedChar* rkfX = nullptr; int rkfEnH18 = 0, rkfFrH18 = 0;
+                        for (const CachedChar& rx : LiveChars) {
+                            if (!rx.bIsHero || rx.bIsNeutral || rx.ptr == botChar) continue;
+                            if (rx.ptr == bestEnemyHero) rkfX = &rx;
+                            float rdx = rx.loc.X - botLoc.X, rdy = rx.loc.Y - botLoc.Y;
+                            if (rdx * rdx + rdy * rdy >= RKF_HERO_SQ) continue;
+                            if (rx.team == botTeam) rkfFrH18++; else if (rx.team == enemyTeam) rkfEnH18++;
+                        }
+                        int rkfHP = (rkfX && rkfX->maxHealth > 0.0f) ? (int)(rkfX->health / rkfX->maxHealth * 100.0f) : 101;
+                        bool rkfPre = rkfX && (float)rkfHP <= RKF_HERO_HP && rkfBotHP >= (float)rkfHP && rkfEnH18 <= rkfFrH18 + 1;
+                        bool rkfSup = false;
+                        if (rkfPre) {
+                            for (const CachedChar& rx : LiveChars) {
+                                if (!rx.bIsHero || rx.bIsNeutral || rx.ptr == botChar || rx.team != botTeam) continue;
+                                float sdx = rx.loc.X - rkfX->loc.X, sdy = rx.loc.Y - rkfX->loc.Y;
+                                if (sdx * sdx + sdy * sdy < RKF_SUPPORT_SQ) { rkfSup = true; break; }
+                            }
+                            float rkfOwnSq = -1.0f, rkfEnSq = -1.0f;
+                            for (AOrionDamageableObjective_Base* rt : AllTowers) {
+                                if (!rt || rt->TeamNum != enemyTeam || rt->GetHealth() <= 0.0f) continue;
+                                if (rt->GetFullName().find("Default__") != std::string::npos) continue;
+                                FVector rtl = rt->K2_GetActorLocation();
+                                float hq = (rtl.X - rkfX->loc.X) * (rtl.X - rkfX->loc.X) + (rtl.Y - rkfX->loc.Y) * (rtl.Y - rkfX->loc.Y);
+                                float bq = (rtl.X - botLoc.X) * (rtl.X - botLoc.X) + (rtl.Y - botLoc.Y) * (rtl.Y - botLoc.Y);
+                                if (rkfOwnSq < 0.0f || hq < rkfOwnSq) rkfOwnSq = hq;
+                                if (rkfEnSq < 0.0f || bq < rkfEnSq) rkfEnSq = bq;
+                            }
+                            bRkfActive = (rkfOwnSq < 0.0f || rkfOwnSq >= RKF_HERO_OWNTWR_SQ) && (rkfEnSq < 0.0f || rkfEnSq > RKF_BOT_ENTWR_SQ)
+                                      && (rkfSup || (float)rkfHP <= RKF_SOLO_HERO_HP);
+                        }
+                        if (bRkfActive) {
+                            AActor* rkfNat = nullptr;
+                            if (GetEnemyCharacterFunc) { struct { class AActor* ReturnValue; } rkp{}; rkp.ReturnValue = nullptr; bot->ProcessEvent(GetEnemyCharacterFunc, &rkp); rkfNat = rkp.ReturnValue; }
+                            bool rkfNewTgt = !g_rkfTgt.count(bot) || g_rkfTgt[bot] != rkfX->ptr;
+                            bool rkfGapOk  = rkfNewTgt || !g_rkfK2T.count(bot) || (matchTimeB - g_rkfK2T[bot]) >= RKF_K2_GAP_S;
+                            bool rkfK2 = (rkfNat != static_cast<AActor*>(rkfX->ptr)) && rkfGapOk;
+                            if (rkfK2) { bot->K2_SetEnemy(rkfX->ptr); g_rkfK2T[bot] = matchTimeB; }
+                            g_rkfTgt[bot] = rkfX->ptr;
+                        }
+                    }
+                    UObject** overrideQueryPtr = reinterpret_cast<UObject**>(
+                        reinterpret_cast<uintptr_t>(bot) + 0x0650);
+                    UObject* currentNativeQuery = *overrideQueryPtr;
+                    UObject* desiredQuery = nullptr;
+
+                    if (LastMacroAction[bot] == "Gank") {
+                        desiredQuery = HeroFocusQuery;
+                    }
+                    else if (bAntiKiteActive || bAkKiteback
+                             || (bAkDeathZoneVeto && !bV44Threatened
+                                 && !(ENABLE_DZ_HEROFOCUS_DEFEND_GATE && LastMacroAction[bot] == "Defend")
+                                 && !(ENABLE_MRK_A_DZHF_RETREAT_OFF && bIsMeleeChar && !bIsJungler && bMeleeLockbreakActive
+                                      && bestEnemyHero && closestEnemyHeroDistSq < 3240000.0f))) {
+                        desiredQuery = HeroFocusQuery;
+                    }
+                    else if (bBrWakeRedirect) {
+                        desiredQuery = HeroFocusQuery;
+                    }
+                    else if (bRkfActive) {
+                        desiredQuery = HeroFocusQuery;
+                    }
+                    else if (bV44Threatened && closestFriendlyTowerDistSq > 4000000.0f
+                        && !bIsActivelyFighting && !bIsJungler) {
+                        desiredQuery = JustMinionsQuery;
+                    }
+                    if (currentNativeQuery == HeroFocusQuery && LastMacroAction[bot] != "Gank"
+                        && !bAntiKiteActive
+                        && LastMacroAction[bot] != "Boss"
+                        && (CombatTimer[bot] <= 0.0f || bNativeTargetIsHero || bV44Threatened
+                            || (currentHealth / maxHealth) <= 0.4f)) {
+                        *overrideQueryPtr = nullptr;
+                    }
+                    if (desiredQuery) {
+                        *overrideQueryPtr = desiredQuery;
+                    }
+                    else if (currentNativeQuery && !desiredQuery) {
+                        if (currentNativeQuery == HeroFocusQuery || currentNativeQuery == JustMinionsQuery
+                            || (InsideTurretQuery && currentNativeQuery == InsideTurretQuery)) {
+                            *overrideQueryPtr = nullptr;
+                        }
+                    }
+                    UBotObjective* schubserObj = *reinterpret_cast<UBotObjective**>(
+                        reinterpret_cast<uintptr_t>(bot) + 0x0748);
+                    AActor* rSbPreMove  = moveTarget;
+                    float   rSbPreAccR  = accRadius;
+                    bool    rSbPreIdle  = bIsIdle;
+                    bool    rSbPreFight = bIsActivelyFighting;
+                    int     rSbPreIdleT = BotIdleTicks.count(bot) ? BotIdleTicks[bot] : 0;
+                    bool    rSbKeepMove = false;
+                    bool    rSbNoMinTgt = false;
+                    bool    rSbNoMinK2  = false;
+                    bool    rSbHoldWin  = false;
+                    bool    rSbNoMinTwr = false;
+                    if (!bIsMeleeChar && !bIsJungler) {
+                        if (ENABLE_R_TOWER_DIST && g_rtdWroteT.count(bot) && g_rtdWroteT[bot] == matchTimeB)          { rSbKeepMove = true; }
+                        else if (ENABLE_R_WAVE_HOLD && g_rwhWroteT.count(bot) && g_rwhWroteT[bot] == matchTimeB)      { rSbKeepMove = true; }
+                        else if (ENABLE_R_TOWER_HOLD && g_rtrBWroteT.count(bot) && g_rtrBWroteT[bot] == matchTimeB)   { rSbKeepMove = true; }
+                        else if (ENABLE_R_TOWER_LEASH && g_rtlWroteT.count(bot) && g_rtlWroteT[bot] == matchTimeB)    { rSbKeepMove = true; }
+                        else if (ENABLE_R_OFFENSE && g_roffWroteT.count(bot) && g_roffWroteT[bot] == matchTimeB)      { rSbKeepMove = true; }
+                        else if (ENABLE_R_OFFENSE && g_roffPostT.count(bot) && g_roffPostT[bot] == matchTimeB)        { rSbKeepMove = true; }
+                        else if (ENABLE_R_OFFENSE && ENABLE_R_OFF_HOLD && g_roffHoldT.count(bot) && g_roffHoldT[bot] == matchTimeB) { rSbKeepMove = true; }
+                        else if (ENABLE_R_ADVWAIT_GATE && g_rawPullAnyT.count(bot) && g_rawPullAnyT[bot] == matchTimeB) { rSbKeepMove = true; }
+                        rSbNoMinK2 = (ENABLE_R_WAVE_HOLD && g_rwhWroteT.count(bot) && g_rwhWroteT[bot] == matchTimeB)
+                                  || (ENABLE_R_OFFENSE && g_roffWroteT.count(bot) && g_roffWroteT[bot] == matchTimeB)
+                                  || (ENABLE_R_OFFENSE && ENABLE_R_OFF_HOLD && g_roffHoldT.count(bot) && g_roffHoldT[bot] == matchTimeB);
+                        if (ENABLE_R_TOWER_DIST && RTD_ACTION && g_rtdOnT.count(bot) > 0
+                            && bestEnemyMinion && bestEnemyTower && (bestEnemyTowerTier == 1 || bestEnemyTowerTier == 2)) {
+                            FVector rSbML = bestEnemyMinion->K2_GetActorLocation(), rSbTL = bestEnemyTower->K2_GetActorLocation();
+                            rSbNoMinTgt = ((rSbML.X - rSbTL.X) * (rSbML.X - rSbTL.X) + (rSbML.Y - rSbTL.Y) * (rSbML.Y - rSbTL.Y)) < RTD_MIN_TGT_TWR_SQ;
+                        }
+                        if (ENABLE_R_SB_TWR_GUARD && bestEnemyMinion && bestEnemyTower && (bestEnemyTowerTier == 1 || bestEnemyTowerTier == 2)
+                            && closestEnemyMinionDistSq < 4840000.0f) {
+                            FVector k8ML = bestEnemyMinion->K2_GetActorLocation(), k8TL = bestEnemyTower->K2_GetActorLocation();
+                            if (((k8ML.X - k8TL.X) * (k8ML.X - k8TL.X) + (k8ML.Y - k8TL.Y) * (k8ML.Y - k8TL.Y)) < RTD_MIN_TGT_TWR_SQ) {
+                                bool k8Tank = false;
+                                for (const CachedChar& cc : LiveChars) {
+                                    if (cc.team != botTeam || cc.bIsHero || cc.bIsNeutral) continue;
+                                    if (cc.fullName.find("bp_minion_lane_") == std::string::npos) continue;
+                                    float tx = cc.loc.X - k8TL.X, ty = cc.loc.Y - k8TL.Y;
+                                    if (tx * tx + ty * ty <= RTD_TANK_SQ) { k8Tank = true; break; }
+                                }
+                                rSbNoMinTwr = !k8Tank;
+                            }
+                        }
+                        if (ENABLE_R_ADVWAIT_GATE && RAW_STOP_ON_EXIT && MeleeLockbreakStopFn && g_rawMode.count(bot) && g_rawMode[bot] == 1
+                            && g_rawModeT.count(bot) && g_rawModeT[bot] != matchTimeB && (matchTimeB - g_rawModeT[bot]) <= 1.5f
+                            && !(g_rbrFireT.count(bot) && g_rbrFireT[bot] == matchTimeB)
+                            && !bDoingBoss && LastMacroAction[bot] != "Boss" && LastMacroAction[bot] != "Recall") {
+                            bot->ProcessEvent(MeleeLockbreakStopFn, nullptr);
+                            g_rawMode[bot] = 0; g_rawModeT[bot] = matchTimeB;
+                        }
+                        rSbHoldWin = (ENABLE_R_TOWER_HOLD && g_rtrBStartT.count(bot) > 0) || (ENABLE_R_TOWER_LEASH && g_rtlStartT.count(bot) > 0);
+                    }
+                    const char* rsbSite = nullptr;
+                    bool bRsbHold = false;
+                    if (bIsActivelyFighting && !bIsFleeing && !BotIsBlind[bot]
+                            && !bLaunchProbeActive
+                        && !bV44Threatened
+                            && !bStickyDangerRetreat
+                            && !bAntiKiteActive
+                            && !bAkTraitSkip
+                            && !bAkKiteback
+                            && !bAkDeathZoneVeto
+                            && !bAkSoftVeto
+                            && !bLanePushVetoActive
+                            && !bMeleeLockbreakActive
+                            && schubserObj
+                            && LastMacroAction[bot] != "Boss"
+                            && LastMacroAction[bot] != "Gank"
+                            && LastMacroAction[bot] != "Recall"
+                            && LastMacroAction[bot] != "Jungle"
+                            && LastMacroAction[bot] != "Rotate"
+                            && (LastMacroAction[bot] != "Defend" || m1DefFar))
+                    {
+                        if (!bHasNativeTarget) {
+                            if (bestEnemyHero && closestEnemyHeroDistSq < 6250000.0f) {
+                                if (bIsSafeToPush || closestEnemyHeroDistSq < 640000.0f) {
+                                    if (!bAkHeroBeyondFront) {
+                                        moveTarget = bestEnemyHero;
+                                        accRadius = 300.0f;
+                                        bIsActivelyFighting = false;
+                                        BotIdleTicks[bot] = 10;
+                                        bIsIdle = true;
+                                        if (ENABLE_R_SCHUBSER_RANGE && !bIsMeleeChar && !bIsJungler) {
+                                            moveTarget = nullptr;
+                                            BotIdleTicks[bot] = 0;
+                                            if (ENABLE_R_SCHUBSER_SITE1_K2) {
+                                                bot->K2_SetEnemy(bestEnemyHero);
+                                            }
+                                            bRsbHold = true; rsbSite = "1H";
+                                        }
+                                    }
+                                }
+                            }
+                            else if (bestEnemyMinion && closestEnemyMinionDistSq < 4840000.0f) {
+                                moveTarget = bestEnemyMinion;
+                                accRadius = 200.0f;
+                                bIsActivelyFighting = false;
+                                BotIdleTicks[bot] = 10;
+                                bIsIdle = true;
+                                if (ENABLE_R_SCHUBSER_RANGE && !bIsMeleeChar && !bIsJungler) {
+                                    if (closestEnemyMinionDistSq > RSB_RANGED_ACCR * RSB_RANGED_ACCR) {
+                                        accRadius = RSB_RANGED_ACCR;
+                                    }
+                                    else {
+                                        moveTarget = nullptr; bRsbHold = true;
+                                        BotIdleTicks[bot] = 0;
+                                        if (ENABLE_R_SCHUBSER_SITE1_K2 && !rSbNoMinTgt && !rSbNoMinTwr && !rSbNoMinK2) { bot->K2_SetEnemy(bestEnemyMinion); }
+                                    }
+                                    rsbSite = "1M";
+                                }
+                            }
+                        }
+                        else if (bestEnemyHero
+                            && ((closestEnemyHeroDistSq < 640000.0f)
+                                || (closestEnemyHeroDistSq < 3240000.0f
+                                    && CombatTimer[bot] > 0.0f
+                                    && bIsMeleeChar
+                                    && !(roleSlot == 4 && LastMacroAction[bot] == "Gank")))
+                            && !bInsideEnemyTurretGlobal
+                            && !(bIsSafeToPush && closestEnemyTowerDistSq < 4000000.0f)
+                            && closestEnemyTowerDistSq > 4000000.0f) {
+                            if (!bAkHeroBeyondFront) {
+                                AActor* currentNativeTargetSB = nullptr;
+                                if (GetEnemyCharacterFunc) {
+                                    struct { class AActor* ReturnValue; } getEnemyParamsSB{};
+                                    getEnemyParamsSB.ReturnValue = nullptr;
+                                    bot->ProcessEvent(GetEnemyCharacterFunc, &getEnemyParamsSB);
+                                    currentNativeTargetSB = getEnemyParamsSB.ReturnValue;
+                                }
+                                if (currentNativeTargetSB != bestEnemyHero) {
+                                    bot->K2_SetEnemy(bestEnemyHero);
+                                }
+                                moveTarget = bestEnemyHero;
+                                accRadius = 300.0f;
+                                bIsActivelyFighting = false;
+                                BotIdleTicks[bot] = 10;
+                                bIsIdle = true;
+                                if (ENABLE_R_SCHUBSER_RANGE && !bIsMeleeChar && !bIsJungler) {
+                                    moveTarget = nullptr;
+                                    BotIdleTicks[bot] = 0;
+                                    bRsbHold = true; rsbSite = "2H";
+                                }
+                            }
+                        }
+                    }
+                    if (rsbSite && !bIsMeleeChar && !bIsJungler) {
+                        std::string rSbS(rsbSite);
+                        bool  rSbRun1M    = (rSbS == "1M") && moveTarget == static_cast<AActor*>(bestEnemyMinion);
+                        float rSbMinTwrSq = 0.0f;
+                        if (rSbHoldWin && rSbRun1M && closestFriendlyTower) {
+                            FVector a = bestEnemyMinion->K2_GetActorLocation(), b = closestFriendlyTower->K2_GetActorLocation();
+                            rSbMinTwrSq = (a.X - b.X) * (a.X - b.X) + (a.Y - b.Y) * (a.Y - b.Y);
+                        }
+                        const char* rSbWhy = rSbKeepMove ? "keepMove"
+                                           : (rSbNoMinTgt && rSbS == "1M") ? "td20"
+                                           : (rSbNoMinTwr && rSbS == "1M") ? "tw20"
+                                           : (rSbHoldWin && rSbRun1M && rSbMinTwrSq > TOWER_SAFE_SQ) ? "hold16" : nullptr;
+                        if (rSbWhy) {
+                            moveTarget = rSbPreMove; accRadius = rSbPreAccR; bIsIdle = rSbPreIdle; bIsActivelyFighting = rSbPreFight; BotIdleTicks[bot] = rSbPreIdleT;
+                            rsbSite = nullptr;
+                        }
+                    }
+                    if (!moveTarget
+                        && !bLaunchProbeActive
+                        && !bRsbHold
+                        && LastMacroAction[bot] == ""
+                        && EmptyActionTicks[bot] > 15
+                        && roleSlot != 4
+                        && !bIsInBase
+                        && (currentHealth / maxHealth) > 0.3f) {
+
+                        AActor* limboTarget = nullptr;
+                        float limboAcc = 1500.0f;
+                        const char* limboChoice = "NONE";
+
+                        AOrionChar* frontMostLaneMinion = nullptr;
+                        float bestFrontMinToEnemyCoreSq = 1e10f;
+                        AOrionDamageableObjective_Base* myLaneAnchor = (botPhysLane >= 0 && botPhysLane < 3)
+                            ? frontFriendlyTowers[botPhysLane] : nullptr;
+
+                        if (myLaneAnchor && enemyCore) {
+                            FVector anchorLoc = myLaneAnchor->K2_GetActorLocation();
+                            FVector eCoreLoc = enemyCore->K2_GetActorLocation();
+
+                            for (const CachedChar& cc : LiveChars) {
+                                if (cc.team != botTeam) continue;
+                                if (cc.bIsHero || cc.bIsNeutral) continue;
+                                if (cc.fullName.find("bp_minion_lane_") == std::string::npos) continue;
+
+                                float distToMyAnchorSq = (cc.loc.X - anchorLoc.X) * (cc.loc.X - anchorLoc.X)
+                                    + (cc.loc.Y - anchorLoc.Y) * (cc.loc.Y - anchorLoc.Y);
+                                bool bIsOnMyLane = true;
+                                for (int otherLane = 0; otherLane < 3; otherLane++) {
+                                    if (otherLane == botPhysLane) continue;
+                                    if (!frontFriendlyTowers[otherLane]) continue;
+                                    FVector otherLoc = frontFriendlyTowers[otherLane]->K2_GetActorLocation();
+                                    float distToOtherSq = (cc.loc.X - otherLoc.X) * (cc.loc.X - otherLoc.X)
+                                        + (cc.loc.Y - otherLoc.Y) * (cc.loc.Y - otherLoc.Y);
+                                    if (distToOtherSq < distToMyAnchorSq) {
+                                        bIsOnMyLane = false;
+                                        break;
+                                    }
+                                }
+                                if (!bIsOnMyLane) continue;
+
+                                float distToECoreSq = (cc.loc.X - eCoreLoc.X) * (cc.loc.X - eCoreLoc.X)
+                                    + (cc.loc.Y - eCoreLoc.Y) * (cc.loc.Y - eCoreLoc.Y);
+                                if (distToECoreSq < bestFrontMinToEnemyCoreSq) {
+                                    bestFrontMinToEnemyCoreSq = distToECoreSq;
+                                    frontMostLaneMinion = cc.ptr;
+                                }
+                            }
+                        }
+
+                        bool bEnemyTowerOnMyLane = false;
+                        if (bestEnemyTower) {
+                            std::string etName = bestEnemyTower->GetFullName();
+                            std::transform(etName.begin(), etName.end(), etName.begin(), ::tolower);
+                            int etPhysLane = 1;
+                            if (etName.find("_left_") != std::string::npos || etName.find("tower_0") != std::string::npos) {
+                                etPhysLane = bIsBlueTeam ? 0 : 2;
+                            }
+                            else if (etName.find("_right_") != std::string::npos || etName.find("tower_2") != std::string::npos) {
+                                etPhysLane = bIsBlueTeam ? 2 : 0;
+                            }
+                            bEnemyTowerOnMyLane = (etPhysLane == botPhysLane);
+                        }
+
+                        float hpFrac = currentHealth / maxHealth;
+                        bool bHasCloseMinionScreen = (bestFriendlyEscortMinion && closestFriendlyMinionDistSq < 6250000.0f);
+
+                        if (frontMostLaneMinion) {
+                            limboTarget = frontMostLaneMinion;
+                            if (hpFrac > 0.6f && bHasCloseMinionScreen) {
+                                limboAcc = 600.0f;
+                            }
+                            else {
+                                limboAcc = 1500.0f;
+                            }
+                            limboChoice = "FollowFrontMinion";
+                        }
+                        else if (bEnemyTowerOnMyLane && bestEnemyTower && !bV44Threatened) {
+                            limboTarget = bestEnemyTower;
+                            if (hpFrac > 0.6f) {
+                                limboAcc = 3500.0f;
+                            }
+                            else {
+                                limboAcc = 4500.0f;
+                            }
+                            limboChoice = "WaitAtEnemyTower";
+                        }
+                        else if (friendlyCore) {
+                            limboTarget = friendlyCore;
+                            limboAcc = 1500.0f;
+                            limboChoice = "LastResortCore";
+                        }
+
+                        if (limboTarget) {
+                            moveTarget = limboTarget;
+                            accRadius = limboAcc;
+                            bIsIdle = true;
+                            BotIdleTicks[bot] = 10;
+                        }
+
+                    }
+
+                   {
+                       constexpr bool ENABLE_TOWER_DMG_GAS = true;
+
+                       static UObject*   g_geMinDmgCDO   = nullptr;
+                       static UFunction* g_makeSpecFunc  = nullptr;
+                       static UFunction* g_applySpecFunc = nullptr;
+                       static UObject*   g_ascLibCDO     = nullptr;
+                       if (!g_geMinDmgCDO) g_geMinDmgCDO = UObject::FindObject<UObject>(
+                           "GE_Minion_Damage_Ranged_C GE_Minion_Damage_Ranged.Default__GE_Minion_Damage_Ranged_C");
+                       if (!g_makeSpecFunc) g_makeSpecFunc = UObject::FindObject<UFunction>(
+                           "Function GameplayAbilities.AbilitySystemBlueprintLibrary.MakeSpecHandle");
+                       if (!g_applySpecFunc) g_applySpecFunc = UObject::FindObject<UFunction>(
+                           "Function GameplayAbilities.AbilitySystemComponent.BP_ApplyGameplayEffectSpecToTarget");
+                       if (!g_ascLibCDO) g_ascLibCDO = reinterpret_cast<UObject*>(
+                           SDK::UAbilitySystemBlueprintLibrary::GetDefaultObj());
+
+                       static std::map<AOrionAIBot*, float> g_gasDmgLastApply;
+
+                       const std::string& gasAct = LastMacroAction[bot];
+                       bool gasTowerState = (gasAct == "TowerObjective" || gasAct == "Attack");
+
+                       bool gasGuardsClear =
+                            !bDoingBoss && gasAct != "Boss"
+                         && !BotNeedsHeal[bot] && !bNeedsTacticalRecall
+                         && !bIsFleeing && gasAct != "Recall"
+                         && !bAntiKiteActive
+                         && !bV44Threatened
+                         && !bLanePushVetoActive
+                         && (!bestEnemyHero || closestEnemyHeroDistSq > 3240000.0f);
+
+                       bool gasPreGate =
+                            ENABLE_TOWER_DMG_GAS
+                         && !bIsJungler
+                         && gasTowerState
+                         && bestEnemyTower
+                         && closestEnemyTowerDistSq < 3240000.0f
+                         && !bHasRealEnemy
+                         && gasGuardsClear
+                         && g_geMinDmgCDO && g_makeSpecFunc && g_applySpecFunc && g_ascLibCDO;
+
+                       int gasFriendlyMinAtTwr = 0;
+                       if (gasPreGate) {
+                           FVector gasTwrLoc = bestEnemyTower->K2_GetActorLocation();
+                           for (const CachedChar& cc : LiveChars) {
+                               if (cc.team != botTeam) continue;
+                               if (cc.bIsHero || cc.bIsNeutral) continue;
+                               if (cc.fullName.find("minion") == std::string::npos) continue;
+                               float mtSq =
+                                     (cc.loc.X - gasTwrLoc.X) * (cc.loc.X - gasTwrLoc.X)
+                                   + (cc.loc.Y - gasTwrLoc.Y) * (cc.loc.Y - gasTwrLoc.Y)
+                                   + (cc.loc.Z - gasTwrLoc.Z) * (cc.loc.Z - gasTwrLoc.Z);
+                               if (mtSq < 2250000.0f) { gasFriendlyMinAtTwr++; break; }
+                           }
+                       }
+
+                       bool gasTrigger = gasPreGate && (gasFriendlyMinAtTwr >= 1);
+
+                       bool  gasTeamOK  = false;
+                       float gasBaseAtk = 1.0f;
+                       if (gasTrigger) {
+                           gasTeamOK = (bestEnemyTower->TeamNum == enemyTeam);
+                           if (gasTeamOK) {
+                               if (botChar->CombatSetRef) {
+                                   float bat = botChar->CombatSetRef->BaseAttackTime;
+                                   if (bat > 0.05f && bat < 10.0f) gasBaseAtk = bat;
+                               }
+                               float lastApply = g_gasDmgLastApply.count(bot)
+                                   ? g_gasDmgLastApply[bot] : -999.0f;
+                               if (matchTimeB - lastApply >= gasBaseAtk) {
+                                   UAbilitySystemComponent* botASC =
+                                       reinterpret_cast<UAbilitySystemComponent*>(botChar->AbilitySystemComponent);
+                                   UAbilitySystemComponent* twrASC =
+                                       reinterpret_cast<UAbilitySystemComponent*>(bestEnemyTower->AbilitySystemComponent);
+                                   AActor* botPawnActor = reinterpret_cast<AActor*>(botChar);
+                                   if (botASC && IsValidUE4Object(botASC)
+                                       && twrASC && IsValidUE4Object(twrASC)) {
+                                       std::string gasCharNm = botChar->GetFullName();
+                                       bool gasIsMelee =
+                                              gasCharNm.find("Steel") != std::string::npos
+                                           || gasCharNm.find("WarDrum") != std::string::npos
+                                           || gasCharNm.find("Chains") != std::string::npos
+                                           || gasCharNm.find("Kwang") != std::string::npos
+                                           || gasCharNm.find("Grux") != std::string::npos
+                                           || gasCharNm.find("Tomahawk") != std::string::npos
+                                           || gasCharNm.find("FallenAngel") != std::string::npos
+                                           || gasCharNm.find("Rampage") != std::string::npos
+                                           || gasCharNm.find("Vamp") != std::string::npos
+                                           || gasCharNm.find("Justice") != std::string::npos
+                                           || gasCharNm.find("Kurohane") != std::string::npos
+                                           || gasCharNm.find("Sword") != std::string::npos
+                                           || gasCharNm.find("Crunch") != std::string::npos
+                                           || gasCharNm.find("Mudang") != std::string::npos
+                                           || gasCharNm.find("Hammer") != std::string::npos
+                                           || gasCharNm.find("Wukong") != std::string::npos
+                                           || gasCharNm.find("Ice") != std::string::npos
+                                           || gasCharNm.find("Femme") != std::string::npos
+                                           || gasCharNm.find("ArcBlade") != std::string::npos;
+                                       float gasTarget = gasIsMelee ? 50.0f : 40.0f;
+                                       int gasK = (int)((gasTarget / 4.0f) + 0.999f);
+                                       if (gasK < 1)  gasK = 1;
+                                       if (gasK > 40) gasK = 40;
+
+                                       SDK::Params::AbilitySystemBlueprintLibrary_MakeSpecHandle msParams{};
+                                       msParams.InGameplayEffect = reinterpret_cast<UGameplayEffect*>(g_geMinDmgCDO);
+                                       msParams.InInstigator = botPawnActor;
+                                       msParams.InEffectCauser = botPawnActor;
+                                       msParams.InLevel = 1.0f;
+                                       g_ascLibCDO->ProcessEvent(g_makeSpecFunc, &msParams);
+                                       for (int gasKi = 0; gasKi < gasK; ++gasKi) {
+                                           SDK::Params::AbilitySystemComponent_BP_ApplyGameplayEffectSpecToTarget apParams{};
+                                           apParams.SpecHandle = msParams.ReturnValue;
+                                           apParams.Target = twrASC;
+                                           botASC->ProcessEvent(g_applySpecFunc, &apParams);
+                                       }
+                                       g_gasDmgLastApply[bot] = matchTimeB;
+                                   }
+                               }
+                           }
+                       }
+
+                   }
+
+
+
+
+
+                   bool retreatInCover = (closestFriendlyTower && closestFriendlyTowerDistSq < RETREAT_COVER_TWR_SQ)
+                                      || (akvFrM18 >= 2 && akvFrM18 >= akvEnM18
+                                          && (rwAheadM25 >= 1 || (rearWaveAnchor && rearWaveAnchorDistSq <= 640000.0f)));
+                   if (ENABLE_BLINDRETREAT_PROBE && g_brActiveUntil.count(bot) && botChar) {
+                       bool  brBlind   = (BotIsBlind.count(bot) && BotIsBlind[bot]);
+                       float brTwrM    = sqrtf(closestFriendlyTowerDistSq) / 100.0f;
+                       float brHeroM   = bestEnemyHero ? (sqrtf(closestEnemyHeroDistSq) / 100.0f) : 999.0f;
+                       bool  brTimeout = (matchTimeB >= g_brActiveUntil[bot]);
+                       bool  brAtTower = (closestFriendlyTower && closestFriendlyTowerDistSq < 2890000.0f);
+                       bool  brSafe    = (brHeroM > 25.0f)
+                                       ;
+                       bool  n1KeepFar = ENABLE_N1_BR_FAR_DEFEND_KEEP && m1DefFar
+                                      && ((akvEnM18 >= akvFrM18 + 2) || (akvFrM18 == 0 && akvEnM18 >= 1));
+                       bool  brHandoff = bIsRotatingToObjective
+                           || LastMacroAction[bot] == "Boss"  || LastMacroAction[bot] == "Gank"
+                           || LastMacroAction[bot] == "Recall" || LastMacroAction[bot] == "Rotate"
+                           || (LastMacroAction[bot] == "Defend" && !n1KeepFar);
+                       bool brWaveSupport = false;
+                       if (brHandoff) {
+                           g_brActiveUntil.erase(bot);
+#if F4_LOG_LEVEL >= 1
+                           std::cout << "[BLINDRETREAT] CLEAR " << botChar->GetFullName() << " Team=" << (bIsBlueTeam ? "B" : "R")
+                               << " reason=handoff(" << LastMacroAction[bot] << (bIsRotatingToObjective ? ",rot" : "") << ")"
+                               << " twrD=" << (int)brTwrM << "m heroD=" << (int)brHeroM << "m"
+                               << " n1=0 m1=" << (m1DefFar ? 1 : 0) << " FrM18/EnM18=" << akvFrM18 << "/" << akvEnM18
+                               << " T=" << (int)matchTimeB << "s" << std::endl;
+#endif
+                       } else if (brAtTower || brSafe || brTimeout || brWaveSupport) {
+                           bool brSvStillOwns = ((ENABLE_SOLO1V1_VETO)
+                                              && g_svActiveUntil.count(bot) && matchTimeB < g_svActiveUntil[bot])
+                                              || (ENABLE_WAVE_FALLBACK && g_wfbUntil.count(bot) && matchTimeB < g_wfbUntil[bot]);
+                           if (brBlind && !brSvStillOwns) { bot->K2_SetIgnoreEnemies(false); BotIsBlind[bot] = false; }
+                           g_brActiveUntil.erase(bot); g_brFireT.erase(bot);
+                           {
+                               bool p5RelAtTwr = (brAtTower || brSafe || brWaveSupport) && closestFriendlyTower && closestFriendlyTowerDistSq < RETREAT_COVER_TWR_SQ;
+                               if (ENABLE_POST_RELEASE_HOLD && p5RelAtTwr && !bIsJungler) g_postRelUntil[bot] = matchTimeB + POST_RELEASE_HOLD_S;
+                           }
+#if F4_LOG_LEVEL >= 1
+                           std::cout << "[BLINDRETREAT] CLEAR " << botChar->GetFullName() << " Team=" << (bIsBlueTeam ? "B" : "R")
+                               << " reason=" << (brAtTower ? "atTower" : brSafe ? "safe" : brTimeout ? "timeout" : "wave")
+                               << " inCover=" << (retreatInCover ? 1 : 0)
+                               << " lowHP=" << ((maxHealth > 0.0f && (currentHealth / maxHealth) < 0.50f) ? 1 : 0)
+                               << " heldS=" << (g_brFireT.count(bot) ? (int)(matchTimeB - g_brFireT[bot]) : -1)
+                               << " twrD=" << (int)brTwrM << "m heroD=" << (int)brHeroM << "m"
+                               << " n1=" << ((n1KeepFar && LastMacroAction[bot] == "Defend") ? 1 : 0) << " act=" << (LastMacroAction[bot].empty() ? std::string("(none)") : LastMacroAction[bot])
+                               << " HP=" << (int)((currentHealth / maxHealth) * 100) << "% T=" << (int)matchTimeB << "s" << std::endl;
+#endif
+                       } else {
+                           AActor* brTgt = g_brMoveTarget.count(bot) ? g_brMoveTarget[bot] : nullptr;
+                           if (!brTgt || !IsValidUE4Object(brTgt)) {
+                               brTgt = static_cast<AActor*>(closestFriendlyTower);
+                           }
+                           bool brWakeActive = (ENABLE_BR_WAKE && !brBlind);
+                           if (brTgt && !brWakeActive) {
+                               moveTarget = brTgt;
+                               accRadius  = (g_brAccRadius.count(bot) && g_brAccRadius[bot] > 0.0f) ? g_brAccRadius[bot] : 300.0f;
+                               bIsIdle    = true;
+                               BotIdleTicks[bot] = 10;
+                           }
+                       }
+                   }
+
+                   if ((ENABLE_SOLO1V1_VETO) && g_svActiveUntil.count(bot) && botChar) {
+                       float svmTwrM  = closestFriendlyTower ? sqrtf(closestFriendlyTowerDistSq) / 100.0f : 999.0f;
+                       float svmHeroM = bestEnemyHero ? sqrtf(closestEnemyHeroDistSq) / 100.0f : 999.0f;
+                       bool  svmAtTwr = (closestFriendlyTower && closestFriendlyTowerDistSq < 2890000.0f);
+                       bool  svmWaveOK = false, svmTowerHold = false;
+                       int   svmFrM = 0, svmEnM = 0;
+                       if (ENABLE_SOLO1V1_WAVEHOLD) {
+                           int svmFrH = 0;
+                           for (const CachedChar& cc : LiveChars) {
+                               if (cc.ptr == botChar || cc.bIsNeutral) continue;
+                               float mdx = cc.loc.X - botLoc.X, mdy = cc.loc.Y - botLoc.Y;
+                               if (mdx * mdx + mdy * mdy >= 3240000.0f) continue;
+                               if (cc.bIsHero) { if (cc.team == botTeam) svmFrH++; }
+                               else if (cc.team == botTeam) svmFrM++;
+                               else if (cc.team == enemyTeam) svmEnM++;
+                           }
+                           svmWaveOK = (svmFrM >= svmEnM)
+                                    && (!ENABLE_SOLO1V1_HOLDFIX || svmFrM >= 1);
+                           if (ENABLE_P8_SV_POS_RELEASE && svmWaveOK && !bIsJungler && !bDoingBoss && !bLateGame && rwAheadM25 == 0) {
+                               auto p8FtIt = g_svFireT.find(bot);
+                               bool p8Early   = (p8FtIt != g_svFireT.end()) && (matchTimeB - p8FtIt->second) < P8_SVPOS_MAX_S;
+                               bool p8HeroNear = bestEnemyHero && closestEnemyHeroDistSq <= 4000000.0f;
+                               if (p8Early || p8HeroNear) svmWaveOK = false;
+                           }
+                           svmTowerHold = (closestFriendlyTower && closestFriendlyTowerDistSq < TOWER_SAFE_SQ
+                                           && bestEnemyHero && closestEnemyHeroDistSq < 4000000.0f
+                                           && svmFrH == 0 && svmEnM > svmFrM + 1);
+                       }
+                       float svmHeldS = g_svFireT.count(bot) ? (matchTimeB - g_svFireT[bot]) : -1.0f;
+                       bool  svmHandoff = bIsRotatingToObjective
+                           || LastMacroAction[bot] == "Boss"   || LastMacroAction[bot] == "Gank"
+                           || LastMacroAction[bot] == "Recall" || LastMacroAction[bot] == "Rotate"
+                           || (LastMacroAction[bot] == "Defend" && !bP8FarDefend);
+                       bool svmArrivedWave = false, svmArrivedOk = false, svmTgtGone = false;
+                       if (ENABLE_SV_TARGET_LATCH && !svmHandoff && g_svTarget.count(bot) && g_svTarget[bot]) {
+                           AActor* svmSt     = g_svTarget[bot];
+                           bool    svmStWave = g_svTgtIsWave.count(bot) && g_svTgtIsWave[bot];
+                           bool    svmStValid = svTgtAlive(svmSt, svmStWave);
+                           bool    svmStPassed = false;
+                           float   svmStDSq = 1e18f;
+                           if (svmStValid && svmStWave) {
+                               for (const CachedChar& svmC : LiveChars) {
+                                   if (static_cast<AActor*>(svmC.ptr) != svmSt) continue;
+                                   float sdx = svmC.loc.X - botLoc.X, sdy = svmC.loc.Y - botLoc.Y;
+                                   svmStDSq = sdx * sdx + sdy * sdy;
+                                   if (enemyCore) {
+                                       float bex = enemyCoreLoc.X - botLoc.X, bey = enemyCoreLoc.Y - botLoc.Y;
+                                       float mex = enemyCoreLoc.X - svmC.loc.X, mey = enemyCoreLoc.Y - svmC.loc.Y;
+                                       svmStPassed = (mex * mex + mey * mey) <= (bex * bex + bey * bey);
+                                   }
+                                   break;
+                               }
+                           }
+                           if (svmStValid && svmStWave && !svmStPassed && svmStDSq < 640000.0f) svmArrivedWave = true;
+                           if (!svmStValid || svmStPassed) {
+                               bool svmNewWave = false;
+                               AActor* svmNew = svPickTarget(false, svmNewWave);
+                               g_svTarget[bot] = svmNew; g_svTgtIsWave[bot] = svmNewWave;
+                           }
+                           svmArrivedOk = svmArrivedWave && akvFrM18 >= akvEnM18;
+                           svmTgtGone   = (g_svTarget[bot] == nullptr);
+                       }
+                       bool  svmInCover = !ENABLE_RETREAT_COVER_RELEASE || retreatInCover;
+                       bool  svmSafe    = (svmHeroM > 25.0f) && svmInCover;
+                       bool  svmMaxHold = ENABLE_RETREAT_COVER_RELEASE && svmHeldS >= RETREAT_MAX_HOLD_S;
+                       float svmExtS    = 0.0f;
+                       if (ENABLE_RETREAT_COVER_RELEASE && !retreatInCover && !bLanePushVetoActive && !bIsJungler && !svmHandoff
+                           && g_svFireT.count(bot) && matchTimeB < g_svActiveUntil[bot] && svmHeldS < RETREAT_MAX_HOLD_S
+                           && (!ENABLE_SV_TARGET_LATCH || (g_svTarget.count(bot) && g_svTarget[bot]))) {
+                           float svmExt = matchTimeB + 1.5f;
+                           float svmCap = g_svFireT[bot] + RETREAT_MAX_HOLD_S;
+                           if (svmExt > svmCap) svmExt = svmCap;
+                           if (g_svActiveUntil[bot] < svmExt) { svmExtS = svmExt - g_svActiveUntil[bot]; g_svActiveUntil[bot] = svmExt; }
+                       }
+                       bool  svmTO    = (matchTimeB >= g_svActiveUntil[bot]);
+                       bool  svmHpTermRaw = (maxHealth > 0.0f && (currentHealth / maxHealth) >= SV_RELEASE_MIN_HP)
+                                         && !(bestEnemyHero && closestEnemyHeroDistSq < SV_RELEASE_HERO_SQ);
+                       bool  svmHpOK = !ENABLE_SV_RELEASE_HPTERM || svmHpTermRaw;
+                       if (ENABLE_SV_RELEASE_HP_V2)
+                           svmHpOK = (maxHealth > 0.0f && (currentHealth / maxHealth) >= SV_RELEASE_MIN_HP) || (svmFrM >= svmEnM + 2);
+                       bool  svmWaveRelease = svmWaveOK && svmHpOK
+                           && (!ENABLE_RETREAT_COVER_RELEASE || retreatInCover)
+                           && (!ENABLE_SOLO1V1_HOLDFIX || svmHeldS < 0.0f || svmHeldS >= SOLO1V1_MIN_HOLD_SEC);
+                       bool  svmClear = ENABLE_SOLO1V1_WAVEHOLD
+                           ? (svmWaveRelease || svmSafe || svmTO || svmTowerHold || svmMaxHold || svmArrivedOk || svmTgtGone)
+                           : (svmAtTwr || svmSafe || svmTO || svmMaxHold || svmTgtGone);
+                       if (svmHandoff) {
+                           g_svActiveUntil.erase(bot);
+                           g_svTarget.erase(bot); g_svTgtIsWave.erase(bot);
+                           g_svFireT.erase(bot);
+                           g_svFireHP.erase(bot);
+                       } else if (svmClear) {
+                           bool svmBrStillOwns = (ENABLE_BLINDRETREAT_PROBE
+                                               && g_brActiveUntil.count(bot) && matchTimeB < g_brActiveUntil[bot])
+                                               || (ENABLE_WAVE_FALLBACK && g_wfbUntil.count(bot) && matchTimeB < g_wfbUntil[bot]);
+                           if (BotIsBlind.count(bot) && BotIsBlind[bot] && !svmBrStillOwns) { bot->K2_SetIgnoreEnemies(false); BotIsBlind[bot] = false; }
+                           g_svActiveUntil.erase(bot);
+                           {
+                               bool p5RelAtTwr = (svmWaveRelease || svmArrivedOk || svmSafe) && closestFriendlyTower && closestFriendlyTowerDistSq < RETREAT_COVER_TWR_SQ;
+                               if (ENABLE_POST_RELEASE_HOLD && p5RelAtTwr && !bIsJungler) g_postRelUntil[bot] = matchTimeB + POST_RELEASE_HOLD_S;
+                           }
+#if F4_LOG_LEVEL >= 1
+                           std::cout << "[SOLO1V1-VETO] CLEAR " << botChar->GetFullName().substr(0, 24)
+                               << " ahead=" << rwAheadM25 << " late=" << (bLateGame ? 1 : 0) << " p8far=" << (bP8FarDefend ? 1 : 0)
+                               << " reason=" << (ENABLE_SOLO1V1_WAVEHOLD
+                                                   ? (svmWaveRelease ? "waveOK" : svmTowerHold ? "towerHold" : svmTgtGone ? "tgtGone" : svmArrivedOk ? "arrived" : svmSafe ? "safe" : svmMaxHold ? "maxHold" : "timeout")
+                                                   : (svmAtTwr ? "atTower" : svmTgtGone ? "tgtGone" : svmSafe ? "safe" : svmMaxHold ? "maxHold" : "timeout"))
+                               << " inCover=" << (retreatInCover ? 1 : 0) << " arrived=" << (svmArrivedWave ? 1 : 0)
+                               << " par=" << ((akvFrM18 >= akvEnM18) ? 1 : 0) << " extS=" << svmExtS
+                               << " tgt=" << (!ENABLE_SV_TARGET_LATCH ? "legacy" : !(g_svTarget.count(bot) && g_svTarget[bot]) ? "none"
+                                              : (g_svTgtIsWave.count(bot) && g_svTgtIsWave[bot]) ? "wave" : "tower")
+                               << " hpV2=" << (((maxHealth > 0.0f && (currentHealth / maxHealth) >= SV_RELEASE_MIN_HP) || (svmFrM >= svmEnM + 2)) ? 1 : 0)
+                               << " FrM=" << svmFrM << " EnM=" << svmEnM
+                               << " mwhA=" << rwAheadM25 << " jungler=" << (bIsJungler ? 1 : 0)
+                               << " Team=" << (bIsBlueTeam ? "B" : "R")
+                               << " heldS=" << svmHeldS
+                               << " brOwns=" << (svmBrStillOwns ? 1 : 0)
+                               << " waveOK=" << (svmWaveOK ? 1 : 0)
+                               << " twrM=" << (int)svmTwrM << " heroM=" << (int)svmHeroM;
+                           std::cout << " T=" << (int)matchTimeB << "s" << std::endl;
+#endif
+                           {
+                               int svmBotHPnow = (maxHealth > 0.0f) ? (int)((currentHealth / maxHealth) * 100.0f) : -1;
+                               bool svmNoLoss = g_svFireHP.count(bot) && (svmBotHPnow >= g_svFireHP[bot]);
+                               if (ENABLE_SOLO1V1_ANCHORRESET && svmNoLoss) {
+                                   g_svEpBotHP.erase(bot);
+                                   g_svEpHeroHP.erase(bot);
+                                   g_svLastT.erase(bot);
+                               }
+                           }
+                           if (svmMaxHold && !svmWaveRelease && !svmSafe && !svmTowerHold && !svmArrivedOk && !svmTgtGone)
+                               g_svMaxHoldT[bot] = matchTimeB;
+                           g_svTarget.erase(bot); g_svTgtIsWave.erase(bot);
+                           g_svFireT.erase(bot);
+                           g_svFireHP.erase(bot);
+                       } else if ((ENABLE_SV_TARGET_LATCH && g_svTarget.count(bot)) ? (g_svTarget[bot] != nullptr) : (closestFriendlyTower != nullptr)) {
+                           if (ENABLE_SV_TARGET_LATCH && g_svTarget.count(bot)) {
+                               moveTarget = g_svTarget[bot];
+                               accRadius = ENABLE_SOLO1V1_WAVEHOLD ? 500.0f : 1500.0f;
+                               bIsActivelyFighting = false;
+                               bIsIdle = true; BotIdleTicks[bot] = 10;
+                               if (ENABLE_RETREAT_COVER_RELEASE && ENABLE_SOLO1V1_STICKY) lastThreatRetreatTime[bot] = matchTimeB;
+                           } else {
+                           moveTarget = closestFriendlyTower;
+                           if (ENABLE_SOLO1V1_DEATHBALL && rearWaveAnchor
+                               && rearWaveAnchorDistSq > 2250000.0f
+                               && rearWaveAnchorDistSq < closestFriendlyTowerDistSq)
+                               moveTarget = rearWaveAnchor;
+                           accRadius = ENABLE_SOLO1V1_WAVEHOLD ? 500.0f : 1500.0f;
+                           bIsActivelyFighting = false;
+                           bIsIdle = true; BotIdleTicks[bot] = 10;
+                           if (ENABLE_RETREAT_COVER_RELEASE && ENABLE_SOLO1V1_STICKY) lastThreatRetreatTime[bot] = matchTimeB;
+                           }
+                       }
+                   }
+
+                   if (ENABLE_WAVE_FALLBACK && g_wfbUntil.count(bot) && botChar) {
+                       if (!(BotIsBlind.count(bot) && BotIsBlind[bot])) g_wfbEngineBlind[bot] = false;
+                       AActor* wfbT = g_wfbTarget.count(bot) ? g_wfbTarget[bot] : nullptr;
+                       bool  wfbValid   = (wfbT != nullptr) && IsValidUE4Object(wfbT);
+                       bool  wfbKnowCls = g_wfbTgtIsWave.count(bot) > 0;
+                       bool  wfbIsWave  = wfbKnowCls && g_wfbTgtIsWave[bot];
+                       if (wfbValid && wfbIsWave) {
+                           bool wfbAlive = false;
+                           for (const CachedChar& wv : LiveChars) {
+                               if (static_cast<AActor*>(wv.ptr) == wfbT) { wfbAlive = true; break; }
+                           }
+                           wfbValid = wfbAlive;
+                       }
+                       else if (wfbValid && wfbKnowCls) {
+                           AOrionDamageableObjective_Base* wfbTwr =
+                               static_cast<AOrionDamageableObjective_Base*>(wfbT);
+                           wfbValid = (wfbTwr->GetHealth() > 0.0f);
+                       }
+                       float wfbDSq = 0.0f;
+                       if (wfbValid) {
+                           FVector wl = wfbT->K2_GetActorLocation();
+                           wfbDSq = (wl.X - botLoc.X) * (wl.X - botLoc.X) + (wl.Y - botLoc.Y) * (wl.Y - botLoc.Y);
+                       }
+                       float wfbHeroSq = bestEnemyHero ? closestEnemyHeroDistSq : 1e18f;
+                       bool wfbStalled = false;
+                       if (wfbValid) {
+                           float best = g_wfbBestDistSq.count(bot) ? g_wfbBestDistSq[bot] : wfbDSq;
+                           float gainM = (sqrtf(best) - sqrtf(wfbDSq)) / 100.0f;
+                           if (gainM >= WFB_STALL_MIN_M) { g_wfbBestDistSq[bot] = wfbDSq; g_wfbStall[bot] = 0; }
+                           else                          { g_wfbStall[bot] = (g_wfbStall.count(bot) ? g_wfbStall[bot] : 0) + 1; }
+                           wfbStalled = (g_wfbStall[bot] >= WFB_STALL_TICKS);
+                       }
+                       bool wfbDef  = ENABLE_WFB_DEFICIT_EXT && g_wfbDefPath.count(bot) && g_wfbDefPath[bot];
+                       bool wfbWake = bestEnemyHero && (wfbHeroSq < WFB_WAKE_HERO_SQ) && !wfbDef;
+                       bool wfbHandoffSV = wfbDef && g_svActiveUntil.count(bot) && matchTimeB < g_svActiveUntil[bot];
+                       bool wfbHandoff = bIsRotatingToObjective
+                           || LastMacroAction[bot] == "Boss"   || LastMacroAction[bot] == "Gank"
+                           || LastMacroAction[bot] == "Recall" || LastMacroAction[bot] == "Rotate"
+                           || (LastMacroAction[bot] == "Defend" && !bP8FarDefend)
+                           || wfbHandoffSV;
+                       bool wfbArrived = wfbValid && (wfbDSq < WFB_WAVE_MIN_SQ);
+                       bool wfbSafe    = (wfbHeroSq > WFB_SAFE_HERO_SQ)
+                                      && (!ENABLE_RETREAT_COVER_RELEASE || retreatInCover);
+                       bool rbrEp = ENABLE_R_BLIND_RETREAT && !bIsMeleeChar && g_rbrFireT.count(bot) && g_wfbFireT.count(bot)
+                                 && g_rbrFireT[bot] == g_wfbFireT[bot];
+                       bool rwhxEp = rbrEp && ENABLE_R_WH_ESCALATE && g_rwhxFireT.count(bot) && g_rwhxFireT[bot] == g_rbrFireT[bot];
+                       bool rbrEnd = false; const char* rbrWhy = "-";
+                       if (rbrEp) {
+                           g_rbrWaveN[bot]   = (ENABLE_R_WFB_COVER_END
+                                                ? (akvFrM18 >= 2 && akvFrM18 >= akvEnM18 && (rwAheadM25 >= 1 || (rearWaveAnchor && rearWaveAnchorDistSq <= 640000.0f)))
+                                                : (rwAheadM25 >= 1)) ? (g_rbrWaveN[bot] + 1) : 0;
+                           g_rbrNoHeroN[bot] = (!bestEnemyHero || closestEnemyHeroDistSq >= RBR_HERO_MAX_SQ) ? (g_rbrNoHeroN[bot] + 1) : 0;
+                           bool rbrHeld = (matchTimeB - g_rbrFireT[bot]) >= RBR_MIN_COMMIT_S;
+                           bool rbrMeleeNear = false;
+                           for (const CachedChar& ec : LiveChars) {
+                               if (!ec.bIsHero || ec.team != enemyTeam) continue;
+                               float ex = ec.loc.X - botLoc.X, ey = ec.loc.Y - botLoc.Y;
+                               if (ex * ex + ey * ey >= RBR_MELEE_PURSUER_SQ) continue;
+                               if (RIsMeleeHeroName(ec.ptr->GetFullName())) { rbrMeleeNear = true; break; }
+                           }
+                           if (rwhxEp && RWHX_ARRIVE_BEHIND && wfbArrived && rwAheadM25 == 0
+                               && wfbDSq > RWHX_ARRIVE_STOP_SQ) wfbArrived = false;
+                           if (closestFriendlyTower && closestFriendlyTowerDistSq < TOWER_SAFE_SQ)                     { rbrEnd = true; rbrWhy = "inTwr16"; }
+                           else if (bestEnemyHero && rbrMeleeNear
+                                    && closestEnemyHeroDistSq >= WFB_WAKE_HERO_SQ)                                   { rbrEnd = true; rbrWhy = "meleeNear"; }
+                           else if (rbrHeld && g_rbrWaveN[bot] >= 2)                                                 { rbrEnd = true; rbrWhy = "wave"; }
+                           else if (rbrHeld && g_rbrNoHeroN[bot] >= 2 && !rwhxEp)                                    { rbrEnd = true; rbrWhy = "heroGone"; }
+                       }
+                       if (rbrEnd) g_wfbUntil[bot] = matchTimeB;
+                       bool wfbTO      = (matchTimeB >= g_wfbUntil[bot]);
+                       if (wfbDef) {
+                           g_wfbDefParity[bot] = (akvFrM18 >= 1 && akvFrM18 >= akvEnM18)
+                                               ? ((g_wfbDefParity.count(bot) ? g_wfbDefParity[bot] : 0) + 1) : 0;
+                       }
+                       bool wfbDefParityClear = wfbDef && g_wfbDefParity.count(bot) && g_wfbDefParity[bot] >= 2;
+                       bool wfbClear   = !wfbValid || wfbArrived || wfbSafe || wfbTO || wfbStalled || wfbDefParityClear;
+                       if (rbrEp) {
+                           if (ENABLE_R_DEFEND_CARRY && (!wfbClear || wfbHandoff)) { g_rdcRetreatT[bot] = matchTimeB; g_rdcRetreatSrc[bot] = 4; }
+                           const char* rbrRes = wfbHandoff ? "handoff" : wfbClear ? (rbrEnd ? rbrWhy : !wfbValid ? "tgtGone" : wfbArrived ? "arrived"
+                                              : wfbSafe ? "safe" : wfbStalled ? "stall" : "timeout") : (wfbWake ? "wake" : "hold");
+                           float rbrMoved = g_rbrPrevPos.count(bot) ? sqrtf((botLoc.X - g_rbrPrevPos[bot].X) * (botLoc.X - g_rbrPrevPos[bot].X)
+                                          + (botLoc.Y - g_rbrPrevPos[bot].Y) * (botLoc.Y - g_rbrPrevPos[bot].Y)) / 100.0f : -1.0f;
+                           int rwsAct = 0;
+                           if (ENABLE_R_WFB_STALL_RE && !bIsJungler) {
+                               if (!g_rwsEpT.count(bot) || g_rwsEpT[bot] != g_rbrFireT[bot]) { g_rwsEpT[bot] = g_rbrFireT[bot]; g_rwsN[bot] = 0; g_rwsTwrDone[bot] = 0; g_rwsPrevTgtSq.erase(bot); }
+                               float rwsStoreSq  = wfbDSq;
+                               bool  rwsHoldTick = !wfbHandoff && !wfbClear && !wfbWake && g_rbrFireT[bot] != matchTimeB;
+                               if (!rwsHoldTick || wfbDSq <= WFB_WAVE_MIN_SQ) g_rwsN[bot] = 0;
+                               else if (rbrMoved >= RWS_MOVED_MIN_M) g_rwsN[bot] = 0;
+                               else if (wfbValid && rbrMoved >= 0.0f) {
+                                   float rwsApproachM = g_rwsPrevTgtSq.count(bot) ? (sqrtf(g_rwsPrevTgtSq[bot]) - sqrtf(wfbDSq)) / 100.0f : 0.0f;
+                                   g_rwsN[bot]++;
+                                   float rwsTwrSq  = closestFriendlyTower ? closestFriendlyTowerDistSq : 1e18f;
+                                   float rwsLeftS  = g_wfbUntil[bot] - matchTimeB;
+                                   if (g_rwsN[bot] == 1) {
+                                       if (MeleeLockbreakStopFn) bot->ProcessEvent(MeleeLockbreakStopFn, nullptr);
+                                       rwsAct = 1;
+                                   }
+                                   else if (!rwhxEp && !g_rwsTwrDone[bot] && LastMacroAction[bot] == "TowerObjective"
+                                            && closestFriendlyTower && wfbT != static_cast<AActor*>(closestFriendlyTower)
+                                            && rwsTwrSq <= WFB_TOWER_MAX_SQ && (sqrtf(rwsTwrSq) / 100.0f) / RWS_TWR_SPEED_MS < rwsLeftS
+                                            && (!RWS_TWR_NEEDS_NOAPPROACH || rwsApproachM < WFB_STALL_MIN_M)) {
+                                       wfbT = static_cast<AActor*>(closestFriendlyTower);
+                                       FVector rwsTl = wfbT->K2_GetActorLocation();
+                                       rwsStoreSq = (rwsTl.X - botLoc.X) * (rwsTl.X - botLoc.X) + (rwsTl.Y - botLoc.Y) * (rwsTl.Y - botLoc.Y);
+                                       g_wfbTarget[bot] = wfbT; g_wfbTgtIsWave[bot] = false; g_wfbBestDistSq[bot] = rwsStoreSq; g_wfbStall[bot] = 0;
+                                       g_rwsTwrDone[bot] = 1;
+                                       if (MeleeLockbreakStopFn) bot->ProcessEvent(MeleeLockbreakStopFn, nullptr);
+                                       rwsAct = 2;
+                                   }
+                                   else rwsAct = 3;
+                               }
+                               if (wfbValid) g_rwsPrevTgtSq[bot] = rwsStoreSq; else g_rwsPrevTgtSq.erase(bot);
+                           }
+                           g_rbrPrevPos[bot] = botLoc;
+                           if (wfbHandoff || wfbClear) g_rbrEndT[bot] = matchTimeB;
+#if F4_LOG_LEVEL >= 1
+                           UObject* rbrEqs = *reinterpret_cast<UObject**>(reinterpret_cast<uintptr_t>(bot) + 0x0650);
+                           const char* rbrEqsName = (rbrEqs == nullptr) ? "NULL" : (rbrEqs == HeroFocusQuery) ? "HeroFocus" : (rbrEqs == JustMinionsQuery) ? "JustMinions" : "other";
+                           AActor* rbrNat = nullptr;
+                           if (GetEnemyCharacterFunc) { struct { class AActor* ReturnValue; } rbrNp{}; rbrNp.ReturnValue = nullptr; bot->ProcessEvent(GetEnemyCharacterFunc, &rbrNp); rbrNat = rbrNp.ReturnValue; }
+                           float rbrVel = -1.0f; int rbrMvMode = -1;
+                           { UObject* rbrMc = *reinterpret_cast<UObject**>(reinterpret_cast<uintptr_t>(botChar) + 0x0380);
+                             if (rbrMc) { FVector* rbrVp = reinterpret_cast<FVector*>(reinterpret_cast<uintptr_t>(rbrMc) + 0x0104);
+                                          rbrVel = sqrtf(rbrVp->X * rbrVp->X + rbrVp->Y * rbrVp->Y) / 100.0f;
+                                          rbrMvMode = (int)*reinterpret_cast<uint8_t*>(reinterpret_cast<uintptr_t>(rbrMc) + 0x01AC); } }
+                           std::cout << "[R-BR] " << ((wfbHandoff || wfbClear) ? "END " : "TRACE ") << botChar->GetFullName()
+                               << " Team=" << (bIsBlueTeam ? "B" : "R") << " R=" << roleSlot << " res=" << rbrRes
+                               << " heldS=" << (int)(matchTimeB - g_rbrFireT[bot]) << " movedM=" << (int)rbrMoved
+                               << " twrM=" << (closestFriendlyTower ? (int)(sqrtf(closestFriendlyTowerDistSq) / 100.0f) : -1)
+                               << " tgtM=" << (wfbValid ? (int)(sqrtf(wfbDSq) / 100.0f) : -1)
+                               << " heroM=" << (bestEnemyHero ? (int)(sqrtf(closestEnemyHeroDistSq) / 100.0f) : -1) << " heroRanged=" << (bAkHeroIsRanged ? 1 : 0)
+                               << " FrM18/EnM18=" << akvFrM18 << "/" << akvEnM18 << " EnH18=" << akvEnH18 << " FrH18=" << akvFrH18 << " rwAhead=" << rwAheadM25 << " core=" << rbrCoreWhy
+                               << " sw=" << (g_rbrStartWhy.count(bot) ? g_rbrStartWhy[bot] : -1) << " v44offN=" << (g_rbrV44OffN.count(bot) ? g_rbrV44OffN[bot] : 0)
+                               << " inTurret=" << (bInsideEnemyTurretGlobal ? 1 : 0)
+                               << " velMs=" << rbrVel << " mvMode=" << rbrMvMode
+                               << " stallRe=" << rwsAct << " stallN=" << (g_rwsN.count(bot) ? g_rwsN[bot] : 0) << " x=" << (rwhxEp ? 1 : 0)
+                               << " blind=" << ((BotIsBlind.count(bot) && BotIsBlind[bot]) ? 1 : 0) << " eqs650=" << rbrEqsName
+                               << " natTgt=" << (rbrNat == nullptr ? "NULL" : (static_cast<AActor*>(bestEnemyHero) == rbrNat ? "Hero" : "other"))
+                               << " HP=" << (maxHealth > 0.0f ? (int)((currentHealth / maxHealth) * 100.0f) : -1)
+                               << " T=" << (int)matchTimeB << "s" << std::endl;
+#endif
+                       }
+                       bool wfbOtherOwns =
+                           (g_svActiveUntil.count(bot) && matchTimeB < g_svActiveUntil[bot])
+                        || (ENABLE_BLINDRETREAT_PROBE && g_brActiveUntil.count(bot) && matchTimeB < g_brActiveUntil[bot]);
+
+                       if (wfbHandoff) {
+#if F4_LOG_LEVEL >= 1
+                           {
+                               std::cout << "[WAVE-FALLBACK] CLEAR " << botChar->GetFullName().substr(0, 24)
+                                   << " reason=" << (wfbHandoffSV ? "handoffSV" : "handoff")
+                                   << " act=" << (bIsRotatingToObjective ? std::string("rotObj")
+                                                  : (LastMacroAction[bot].empty() ? std::string("(none)") : LastMacroAction[bot]))
+                                   << " path=" << (wfbDef ? "def" : "P2b") << " Team=" << (bIsBlueTeam ? "B" : "R")
+                                   << " tier=" << bestThreatenedTowerTier
+                                   << " inCover=" << (retreatInCover ? 1 : 0) << " lrCommit=" << (p8LrLive() ? 1 : 0)
+                                   << " heldS=" << (g_wfbFireT.count(bot) ? (int)(matchTimeB - g_wfbFireT[bot]) : -1)
+                                   << " heroM=" << (bestEnemyHero ? (int)(sqrtf(closestEnemyHeroDistSq) / 100.0f) : -1)
+                                   << " HP=" << (maxHealth > 0.0f ? (int)((currentHealth / maxHealth) * 100.0f) : -1) << "%"
+                                   << " T=" << (int)matchTimeB << "s" << std::endl;
+                           }
+#endif
+                           g_wfbUntil.erase(bot); g_wfbTarget.erase(bot);
+                           g_wfbBestDistSq.erase(bot); g_wfbStall.erase(bot); g_wfbFireT.erase(bot);
+                           g_wfbEngineBlind.erase(bot); g_wfbTgtIsWave.erase(bot);
+                           g_wfbDefPath.erase(bot); g_wfbDefParity.erase(bot);
+                       }
+                       else if (wfbClear) {
+                           if (!wfbOtherOwns) {
+                               if (g_wfbEngineBlind.count(bot) && g_wfbEngineBlind[bot]) bot->K2_SetIgnoreEnemies(false);
+                               BotIsBlind[bot] = false;
+                           }
+                           {
+                               bool p5RelAtTwr = (wfbValid && (wfbArrived || wfbSafe || wfbDefParityClear)) && closestFriendlyTower && closestFriendlyTowerDistSq < RETREAT_COVER_TWR_SQ;
+                               if (ENABLE_POST_RELEASE_HOLD && p5RelAtTwr && !bIsJungler) g_postRelUntil[bot] = matchTimeB + POST_RELEASE_HOLD_S;
+                           }
+#if F4_LOG_LEVEL >= 1
+                           std::cout << "[WAVE-FALLBACK] CLEAR " << botChar->GetFullName().substr(0, 24)
+                               << " reason=" << (!wfbValid ? "tgtGone" : wfbArrived ? "arrived"
+                                                : wfbSafe ? "safe" : wfbStalled ? "stall" : wfbDefParityClear ? "parity" : "timeout")
+                               << " path=" << (wfbDef ? "def" : "P2b") << " othOwns=" << (wfbOtherOwns ? 1 : 0)
+                               << " heldS=" << (g_wfbFireT.count(bot) ? (int)(matchTimeB - g_wfbFireT[bot]) : -1)
+                               << " tgtM=" << (wfbValid ? (int)(sqrtf(wfbDSq) / 100.0f) : -1)
+                               << " heroM=" << (bestEnemyHero ? (int)(sqrtf(closestEnemyHeroDistSq) / 100.0f) : -1)
+                               << " HP=" << (maxHealth > 0.0f ? (int)((currentHealth / maxHealth) * 100.0f) : -1) << "%"
+                               << " T=" << (int)matchTimeB << "s" << std::endl;
+#endif
+                           g_wfbUntil.erase(bot); g_wfbTarget.erase(bot);
+                           g_wfbBestDistSq.erase(bot); g_wfbStall.erase(bot); g_wfbFireT.erase(bot);
+                           g_wfbEngineBlind.erase(bot); g_wfbTgtIsWave.erase(bot);
+                           g_wfbDefPath.erase(bot); g_wfbDefParity.erase(bot);
+                       }
+                       else if (wfbWake) {
+                           if (!wfbOtherOwns) {
+                               if (g_wfbEngineBlind.count(bot) && g_wfbEngineBlind[bot]) {
+                                   bot->K2_SetIgnoreEnemies(false);
+                                   g_wfbEngineBlind[bot] = false;
+                               }
+                               BotIsBlind[bot] = false;
+                               bIsActivelyFighting = true;
+                               moveTarget = nullptr;
+                           }
+                       }
+                       else {
+                           if (!(g_wfbEngineBlind.count(bot) && g_wfbEngineBlind[bot])) {
+                               bot->K2_SetIgnoreEnemies(true);
+                               g_wfbEngineBlind[bot] = true;
+                           }
+                           BotIsBlind[bot] = true;
+                           moveTarget = wfbT;
+                           accRadius  = 500.0f;
+                           bIsActivelyFighting = false;
+                           bIsIdle = true; BotIdleTicks[bot] = 10;
+                           lastThreatRetreatTime[bot] = matchTimeB;
+                       }
+                   }
+
+                   if (ENABLE_P23_COMMIT && bIsMeleeChar && !bIsJungler && botChar) {
+                       bool  p23Active  = g_p23StartT.count(bot) > 0;
+                       float p23HeroM   = bestEnemyHero ? (sqrtf(closestEnemyHeroDistSq) / 100.0f) : 999.0f;
+                       float p23TwrM    = closestFriendlyTower ? (sqrtf(closestFriendlyTowerDistSq) / 100.0f) : -1.0f;
+                       bool  p23Handoff = bIsRotatingToObjective
+                           || LastMacroAction[bot] == "Recall" || LastMacroAction[bot] == "Defend" || LastMacroAction[bot] == "Boss"
+                           || LastMacroAction[bot] == "Gank"   || LastMacroAction[bot] == "Rotate";
+                       if (!p23Active) {
+                           int p23HeroHP = -1;
+                           if (bestEnemyHero) for (const CachedChar& mc : LiveChars) { if (mc.ptr != bestEnemyHero) continue; p23HeroHP = (mc.maxHealth > 0.0f) ? (int)((mc.health / mc.maxHealth) * 100.0f) : -1; break; }
+                           bool p23KillSecure = (p23HeroHP >= 0 && p23HeroHP <= MWH_DANGER_KILL_HP);
+                           float p23HPnow = (maxHealth > 0.0f) ? (currentHealth / maxHealth) * 100.0f : -1.0f;
+                           bool  p23Advantage = ENABLE_P23_ADVANTAGE && (ENABLE_H1_ADV_WIDE ? H1AdvEnter(p23HPnow, p23HeroHP, akvEnH18 > akvFrH18 + 1, bAkHeavyDeficitNoBacking)
+                                                                    : (p23HPnow >= ADV_MIN_HP && p23HeroHP >= 0 && (float)p23HeroHP <= (p23HPnow - ADV_HP_LEAD)))
+                                              && closestFriendlyTower && closestFriendlyTowerDistSq <= ADV_TWR_MAX_SQ
+                                              && !(akvEnH18 > akvFrH18 + 1) && akvFrM18 >= 1;
+                           bool p23Lage    = bestEnemyHero && closestEnemyHeroDistSq < 3240000.0f
+                                          && (akvEnM18 > akvFrM18 + 1 || (akvFrM18 == 0 && akvEnM18 >= 1));
+                           bool p23Retreat = bLanePushVetoActive || bV44Threatened || bAkDeathZoneVeto
+                                          || (g_svActiveUntil.count(bot) && matchTimeB < g_svActiveUntil[bot])
+                                          || (g_wfbUntil.count(bot) && matchTimeB < g_wfbUntil[bot]);
+                           if (ENABLE_MRK_B_MELEE_FINISH) {
+                               int  mrkP23DeadEnInhibs = bIsBlueTeam ? deadInhibitorsRed : deadInhibitorsBlue;
+                               int  mrkP23DeadEnemies  = bIsBlueTeam ? deadRed : deadBlue;
+                               bool mrkP23V45 = (mrkP23DeadEnInhibs >= 2) || (mrkP23DeadEnInhibs >= 1 && mrkP23DeadEnemies >= 2);
+                               if (bestEnemyTowerTier == 0 && mrkP23V45 && closestEnemyTowerDistSq < 9000000.0f) p23Retreat = false;
+                           }
+                           bool p23Solo    = true;
+                           if (p23Lage && p23Retreat) {
+                               for (const CachedChar& cc : LiveChars) {
+                                   if (!cc.bIsHero || cc.bIsNeutral || cc.team != botTeam || cc.ptr == botChar) continue;
+                                   float dqh = (cc.loc.X - botLoc.X) * (cc.loc.X - botLoc.X) + (cc.loc.Y - botLoc.Y) * (cc.loc.Y - botLoc.Y);
+                                   if (dqh < 6250000.0f) { p23Solo = false; break; }
+                               }
+                           }
+                           if (p23Lage && p23Retreat && p23Solo && !retreatInCover && !p23Handoff
+                               && LastMacroAction[bot] == "TowerObjective"
+                               && !p23KillSecure
+                               && !p23Advantage
+                               && closestEnemyHeroDistSq >= 90000.0f && moveTarget) {
+                               bool p23IsTwr  = closestFriendlyTower && moveTarget == static_cast<AActor*>(closestFriendlyTower)
+                                             && closestFriendlyTowerDistSq <= P23_TOWER_MAX_SQ;
+                               bool p23IsWave = !p23IsTwr && (
+                                                (rearWaveAnchor && moveTarget == static_cast<AActor*>(rearWaveAnchor) && rwAnchorSub >= MWH_ANCHOR_MIN_SUB)
+                                             || (g_svTarget.count(bot)     && g_svTarget[bot]     && moveTarget == g_svTarget[bot]     && !(closestFriendlyTower && moveTarget == static_cast<AActor*>(closestFriendlyTower)))
+                                             || (g_wfbTarget.count(bot)    && g_wfbTarget[bot]    && moveTarget == g_wfbTarget[bot]    && !(closestFriendlyTower && moveTarget == static_cast<AActor*>(closestFriendlyTower)))
+                                             || (g_brMoveTarget.count(bot) && g_brMoveTarget[bot] && moveTarget == g_brMoveTarget[bot] && !(closestFriendlyTower && moveTarget == static_cast<AActor*>(closestFriendlyTower))));
+                               if (p23IsTwr || p23IsWave) {
+                                   g_p23Target[bot] = moveTarget; g_p23AccR[bot] = accRadius; g_p23StartT[bot] = matchTimeB;
+                                   g_p23TgtIsWave[bot] = p23IsWave;
+#if F4_LOG_LEVEL >= 1
+                                   std::cout << "[P23-COMMIT] FIRE " << botChar->GetFullName() << " Team=" << (bIsBlueTeam ? "B" : "R") << " R=" << roleSlot
+                                       << " tgt=" << (p23IsTwr ? "Tower" : "Wave") << " accR=" << (int)accRadius
+                                       << " heroM=" << (int)p23HeroM << " twrM=" << (int)p23TwrM << " FrM18/EnM18=" << akvFrM18 << "/" << akvEnM18
+                                       << " HP=" << (maxHealth > 0.0f ? (int)((currentHealth / maxHealth) * 100.0f) : -1) << " heroHP=" << p23HeroHP
+                                       << " src=" << (bLanePushVetoActive ? "LPV" : bV44Threatened ? "V44" : bAkDeathZoneVeto ? "AKDZ" : "SV/WFB")
+                                       << " T=" << (int)matchTimeB << "s" << std::endl;
+#endif
+                               }
+                           }
+                       } else {
+                           AActor* p23T     = g_p23Target[bot];
+                           float   p23HeldS = matchTimeB - g_p23StartT[bot];
+                           bool    p23Alive = false; float p23TgtM = -1.0f;
+                           if (p23T) {
+                               if (g_p23TgtIsWave[bot]) {
+                                   for (const CachedChar& cc : LiveChars)
+                                       if (static_cast<AActor*>(cc.ptr) == p23T) {
+                                           p23Alive = (cc.team == botTeam && !cc.bIsHero && !cc.bIsNeutral);
+                                           p23TgtM  = sqrtf((cc.loc.X - botLoc.X) * (cc.loc.X - botLoc.X) + (cc.loc.Y - botLoc.Y) * (cc.loc.Y - botLoc.Y)) / 100.0f;
+                                           break;
+                                       }
+                               } else {
+                                   p23Alive = IsValidUE4Object(p23T) && static_cast<AOrionDamageableObjective_Base*>(p23T)->GetHealth() > 0.0f;
+                                   if (closestFriendlyTower && p23T == static_cast<AActor*>(closestFriendlyTower)) p23TgtM = p23TwrM;
+                               }
+                           }
+                           if (!p23Alive && closestFriendlyTower && closestFriendlyTowerDistSq <= P23_TOWER_MAX_SQ) {
+                               p23T = static_cast<AActor*>(closestFriendlyTower); g_p23Target[bot] = p23T; g_p23AccR[bot] = 1500.0f; g_p23TgtIsWave[bot] = false;
+                               p23Alive = true; p23TgtM = p23TwrM;
+                           }
+                           const char* p23Clear = nullptr;
+                           if (retreatInCover)                       p23Clear = "cover";
+                           else if (p23Handoff)                      p23Clear = "handoff";
+                           else if (!p23Alive)                       p23Clear = "tgtGone";
+                           else if (p23HeldS >= P23_MAX_HOLD_S)      p23Clear = "maxHold";
+                           if (p23Clear) {
+#if F4_LOG_LEVEL >= 1
+                               std::cout << "[P23-COMMIT] CLEAR " << botChar->GetFullName() << " Team=" << (bIsBlueTeam ? "B" : "R") << " R=" << roleSlot
+                                   << " reason=" << p23Clear << " tgt=" << (g_p23TgtIsWave[bot] ? "Wave" : "Tower") << " tgtM=" << (int)p23TgtM
+                                   << " heldS=" << (int)p23HeldS << " heroM=" << (int)p23HeroM << " twrM=" << (int)p23TwrM
+                                   << " FrM18/EnM18=" << akvFrM18 << "/" << akvEnM18 << " inCover=" << (retreatInCover ? 1 : 0)
+                                   << " HP=" << (maxHealth > 0.0f ? (int)((currentHealth / maxHealth) * 100.0f) : -1)
+                                   << " T=" << (int)matchTimeB << "s" << std::endl;
+#endif
+                               g_p23Target.erase(bot); g_p23AccR.erase(bot); g_p23StartT.erase(bot); g_p23TgtIsWave.erase(bot);
+                           } else {
+                               const char* p23Over = "none";
+                               if (moveTarget == nullptr)                                                                        p23Over = "null";
+                               else if (bestFriendlyEscortMinion && moveTarget == static_cast<AActor*>(bestFriendlyEscortMinion)) p23Over = "Escort";
+                               else if (bestEnemyHero            && moveTarget == static_cast<AActor*>(bestEnemyHero))            p23Over = "Hero";
+                               else if (bestEnemyTower           && moveTarget == static_cast<AActor*>(bestEnemyTower))           p23Over = "EnTower";
+                               if (p23Over[0] != 'n' || moveTarget == nullptr) {
+                                   if (closestEnemyHeroDistSq >= 90000.0f) {
+                                       moveTarget = p23T; accRadius = g_p23AccR[bot];
+                                       bIsActivelyFighting = false;
+                                       bIsIdle = true; BotIdleTicks[bot] = 10;
+                                   }
+                               }
+                           }
+                       }
+                   }
+
+                   if (ENABLE_ADV_HOLD && bIsMeleeChar && !bIsJungler && botChar) {
+                       bool  ahActive = g_advHoldOn.count(bot) > 0;
+                       if (LastMacroAction[bot] != "TowerObjective") {
+                           if (ahActive) { g_advHoldOn.erase(bot); }
+                       } else {
+                           float ahHP = (maxHealth > 0.0f) ? (currentHealth / maxHealth) * 100.0f : -1.0f;
+                           int   ahHeroHP = -1; FVector ahEscLoc = FVector(); bool ahEscSeen = false;
+                           for (const CachedChar& mc : LiveChars) {
+                               if (bestEnemyHero && mc.ptr == bestEnemyHero) ahHeroHP = (mc.maxHealth > 0.0f) ? (int)((mc.health / mc.maxHealth) * 100.0f) : -1;
+                               if (bestFriendlyEscortMinion && mc.ptr == bestFriendlyEscortMinion) { ahEscLoc = mc.loc; ahEscSeen = true; }
+                           }
+                           bool  ahOutnum   = (akvEnH18 > akvFrH18 + 1);
+                           bool  ahTwrNear  = closestFriendlyTower && closestFriendlyTowerDistSq <= ADV_TWR_MAX_SQ;
+                           bool  ahAdvEnter = (ENABLE_H1_ADV_WIDE ? H1AdvEnter(ahHP, ahHeroHP, ahOutnum, bAkHeavyDeficitNoBacking) : (ahHP >= ADV_MIN_HP  && ahHeroHP >= 0 && (float)ahHeroHP <= (ahHP - ADV_HP_LEAD)))   && ahTwrNear && !ahOutnum && akvFrM18 >= 1;
+                           bool  ahAdvKeep  = (ENABLE_H1_ADV_WIDE ? H1AdvKeep(ahHP, ahHeroHP, ahOutnum, bAkHeavyDeficitNoBacking)  : (ahHP >= ADV_KEEP_HP && ahHeroHP >= 0 && (float)ahHeroHP <= (ahHP - ADV_KEEP_LEAD))) && ahTwrNear && !ahOutnum && akvFrM18 >= 1;
+                           bool  ahRetreatTwr = closestFriendlyTower && moveTarget == static_cast<AActor*>(closestFriendlyTower)
+                               && (bAkDeathZoneVeto || bLanePushVetoActive || (g_svActiveUntil.count(bot) && matchTimeB < g_svActiveUntil[bot]) || (g_p23StartT.count(bot) > 0));
+                           bool  ahHeroNear = bestEnemyHero && closestEnemyHeroDistSq <= ADV_HERO_MAX_SQ;
+                           bool  ahBlock = bV44Threatened || (BotIsBlind.count(bot) && BotIsBlind[bot]) || bStickyDangerRetreat
+                               || (g_brActiveUntil.count(bot) && matchTimeB < g_brActiveUntil[bot]) || (bestEnemyHero && closestEnemyHeroDistSq < 90000.0f);
+                           AActor* ahTgt = nullptr; const char* ahKind = "none"; float ahTgtM = -1.0f;
+                           if (ahEscSeen && enemyCore) {
+                               float ex = ahEscLoc.X - botLoc.X, ey = ahEscLoc.Y - botLoc.Y; float escSq = ex * ex + ey * ey;
+                               float mCore = sqrtf((enemyCoreLoc.X - ahEscLoc.X) * (enemyCoreLoc.X - ahEscLoc.X) + (enemyCoreLoc.Y - ahEscLoc.Y) * (enemyCoreLoc.Y - ahEscLoc.Y)) / 100.0f;
+                               float bCore = sqrtf((enemyCoreLoc.X - botLoc.X) * (enemyCoreLoc.X - botLoc.X) + (enemyCoreLoc.Y - botLoc.Y) * (enemyCoreLoc.Y - botLoc.Y)) / 100.0f;
+                               if (escSq <= ADV_ESC_MAX_SQ && (mCore - bCore) <= ADV_BEHIND_MAX_M) { ahTgt = static_cast<AActor*>(bestFriendlyEscortMinion); ahKind = "escort"; ahTgtM = sqrtf(escSq) / 100.0f; }
+                           }
+                           if (!ahTgt && rearWaveAnchor && rwAnchorSub >= MWH_ANCHOR_MIN_SUB) { ahTgt = static_cast<AActor*>(rearWaveAnchor); ahKind = "anchor"; ahTgtM = sqrtf(rearWaveAnchorDistSq) / 100.0f; }
+                           if (ahActive) {
+                               const char* ahClear = nullptr;
+                               if (!ahAdvKeep)        ahClear = "advLost";
+                               else if (ENABLE_K3_ADV_HERO_NEAR && !ahHeroNear) ahClear = "heroFar";
+                               else if (ahBlock)      ahClear = "blocker";
+                               else if (!ahRetreatTwr) ahClear = "noRetreat";
+                               else if (!ahTgt)       ahClear = "noTarget";
+                               if (ahClear) {
+                                   g_advHoldOn.erase(bot);
+                               } else {
+                                   moveTarget = ahTgt; accRadius = 600.0f;
+                                   bIsActivelyFighting = false;
+                                   bIsIdle = true; BotIdleTicks[bot] = 10;
+                               }
+                           } else if (ENABLE_K3_ADV_HERO_NEAR && !ahHeroNear && ahAdvEnter && ahRetreatTwr && !ahBlock && ahTgt) {
+                           } else if (ahAdvEnter && ahRetreatTwr && !ahBlock && ahTgt) {
+                               g_advHoldOn[bot] = matchTimeB;
+                               moveTarget = ahTgt; accRadius = 600.0f;
+                               bIsActivelyFighting = false;
+                               bIsIdle = true; BotIdleTicks[bot] = 10;
+                           }
+                       }
+                   }
+
+
+                   if (ENABLE_MELEE_LOCKBREAK
+                       && bMeleeLockbreakActive
+                       && MeleeLockbreakStopFn
+                       && bIsMeleeChar
+                       && moveTarget && bIsIdle
+                       && !bDoingBoss
+                       && LastMacroAction[bot] != "Boss"
+                       && LastMacroAction[bot] != "Recall")
+                   {
+                       bot->ProcessEvent(MeleeLockbreakStopFn, nullptr);
+
+#if F4_LOG_LEVEL >= 1
+                       static std::map<AOrionAIBot*, FVector> lbPrevPos;
+                       float lbDelta = 999.0f;
+                       auto itLB = lbPrevPos.find(bot);
+                       if (itLB != lbPrevPos.end()) {
+                           lbDelta = sqrt((botLoc.X - itLB->second.X)*(botLoc.X - itLB->second.X)
+                                        + (botLoc.Y - itLB->second.Y)*(botLoc.Y - itLB->second.Y)) / 100.0f;
+                       }
+                       lbPrevPos[bot] = botLoc;
+                       float lbTgtDistM = 999.0f;
+                       int   lbMoveWouldFire = 0;
+                       if (moveTarget) {
+                           FVector lbTL = moveTarget->K2_GetActorLocation();
+                           float lbDSq = (lbTL.X - botLoc.X)*(lbTL.X - botLoc.X)
+                                       + (lbTL.Y - botLoc.Y)*(lbTL.Y - botLoc.Y)
+                                       + (lbTL.Z - botLoc.Z)*(lbTL.Z - botLoc.Z);
+                           lbTgtDistM = sqrt(lbDSq) / 100.0f;
+                           lbMoveWouldFire = (lbDSq > (accRadius * accRadius)) ? 1 : 0;
+                       }
+                       std::cout << "[MELEE-LOCKBREAK] StopMovement fired"
+                           << " bot=" << botChar->GetFullName().substr(0, 28)
+                           << " Role=" << roleSlot
+                           << " HP=" << (int)((currentHealth / maxHealth) * 100) << "%"
+                           << " accR=" << (int)accRadius
+                           << " HeroDistM=" << (bestEnemyHero ? (int)(sqrt(closestEnemyHeroDistSq) / 100.0f) : 999)
+                           << " dPrevTickM=" << lbDelta
+                           << " twrDistM=" << (int)lbTgtDistM
+                           << " moveWouldFire=" << lbMoveWouldFire
+                           << " moveTgt=" << (moveTarget ? moveTarget->GetFullName().substr(0, 24) : "None")
+                           << " pos=(" << (int)botLoc.X << "," << (int)botLoc.Y << ")"
+                           << " LastAction=" << LastMacroAction[bot]
+                           << " T=" << (int)matchTimeB << "s" << std::endl;
+#endif
+                   }
+
+                   if (ENABLE_MELEE_LOCKBREAK
+                       && (bRangedV44Lockbreak || (ENABLE_R_DEFEND_CARRY && bRdcLockbreak) || bR51Lockbreak)
+                       && !(ENABLE_R_WFB_NOSTOP && g_rbrFireT.count(bot) && g_rbrFireT[bot] == matchTimeB)
+                       && MeleeLockbreakStopFn
+                       && !bIsMeleeChar
+                       && moveTarget && bIsIdle
+                       && !bDoingBoss
+                       && LastMacroAction[bot] != "Boss"
+                       && LastMacroAction[bot] != "Recall")
+                   {
+                       bot->ProcessEvent(MeleeLockbreakStopFn, nullptr);
+#if F4_LOG_LEVEL >= 1
+                       if (bIsBlueTeam && bRangedV44Lockbreak) {
+                           static std::map<AOrionAIBot*, FVector> rlbPrevPos;
+                           float rlbDelta = 999.0f;
+                           auto itRLB = rlbPrevPos.find(bot);
+                           if (itRLB != rlbPrevPos.end()) {
+                               rlbDelta = sqrt((botLoc.X - itRLB->second.X)*(botLoc.X - itRLB->second.X)
+                                            + (botLoc.Y - itRLB->second.Y)*(botLoc.Y - itRLB->second.Y)) / 100.0f;
+                           }
+                           rlbPrevPos[bot] = botLoc;
+                           float rlbTgtDistM = 999.0f; int rlbMoveWouldFire = 0;
+                           if (moveTarget) {
+                               FVector rlbTL = moveTarget->K2_GetActorLocation();
+                               float rlbDSq = (rlbTL.X - botLoc.X)*(rlbTL.X - botLoc.X)
+                                            + (rlbTL.Y - botLoc.Y)*(rlbTL.Y - botLoc.Y)
+                                            + (rlbTL.Z - botLoc.Z)*(rlbTL.Z - botLoc.Z);
+                               rlbTgtDistM = sqrt(rlbDSq) / 100.0f;
+                               rlbMoveWouldFire = (rlbDSq > (accRadius * accRadius)) ? 1 : 0;
+                           }
+                           UObject* rlbEqs = *reinterpret_cast<UObject**>(reinterpret_cast<uintptr_t>(bot) + 0x0650);
+                           const char* rlbEqsName = (rlbEqs == nullptr) ? "NULL"
+                               : (rlbEqs == HeroFocusQuery) ? "HeroFocus"
+                               : (rlbEqs == JustMinionsQuery) ? "JustMinions" : "other";
+                           AActor* rlbNat = nullptr;
+                           if (GetEnemyCharacterFunc) {
+                               struct { class AActor* ReturnValue; } rlbEp{}; rlbEp.ReturnValue = nullptr;
+                               bot->ProcessEvent(GetEnemyCharacterFunc, &rlbEp);
+                               rlbNat = rlbEp.ReturnValue;
+                           }
+                           std::string rlbNatName = "NULL"; int rlbNatHero = 0;
+                           if (rlbNat) {
+                               rlbNatName = rlbNat->GetFullName();
+                               size_t rsp = rlbNatName.find(' '); if (rsp != std::string::npos) rlbNatName = rlbNatName.substr(rsp + 1);
+                               size_t rdt = rlbNatName.rfind('.'); if (rdt != std::string::npos) rlbNatName = rlbNatName.substr(rdt + 1);
+                               if (rlbNatName.length() > 20) rlbNatName = rlbNatName.substr(0, 20);
+                               rlbNatHero = (rlbNatName.find("Minion") == std::string::npos
+                                   && rlbNatName.find("Tower") == std::string::npos
+                                   && rlbNatName.find("Jungl") == std::string::npos) ? 1 : 0;
+                           }
+                           std::cout << "[V44-RANGED-LOCKBREAK] StopMovement fired"
+                               << " bot=" << botChar->GetFullName().substr(0, 28)
+                               << " Role=" << roleSlot
+                               << " HP=" << (int)((currentHealth / maxHealth) * 100) << "%"
+                               << " accR=" << (int)accRadius
+                               << " HeroDistM=" << (bestEnemyHero ? (int)(sqrt(closestEnemyHeroDistSq) / 100.0f) : 999)
+                               << " dPrevTickM=" << rlbDelta
+                               << " twrDistM=" << (int)rlbTgtDistM
+                               << " moveWouldFire=" << rlbMoveWouldFire
+                               << " eqs650=" << rlbEqsName << " natTgt=" << rlbNatName << " natHero=" << rlbNatHero
+                               << " LastAction=" << LastMacroAction[bot]
+                               << " T=" << (int)matchTimeB << "s" << std::endl;
+                       }
+#endif
+                   }
+
+                   bool deLockedThisTick = false;
+                   bool dlbFiredThisTick = false;
+                   const bool dlbDetect = ENABLE_DEFEND_LOCKBREAK;
+                   bool dlbCombat = CombatTimer.count(bot) && CombatTimer[bot] > 0.0f;
+                   bool k1bHeroInTwr = false;
+                   if (ENABLE_K1B_DE_NOCOMBAT && !dlbCombat && ENABLE_DEFEND_ENGAGE && !bIsJungler && bIsMeleeChar
+                       && LastMacroAction[bot] == "Defend" && moveTarget && bestEnemyHero && !(m1DefFar && moveTarget != static_cast<AActor*>(threatenedFriendlyTower))) {
+                       FVector kTL = moveTarget->K2_GetActorLocation(); FVector kHL = bestEnemyHero->K2_GetActorLocation();
+                       float kSq = (kTL.X - kHL.X) * (kTL.X - kHL.X) + (kTL.Y - kHL.Y) * (kTL.Y - kHL.Y);
+                       int   kHeroHP = -1;
+                       for (const CachedChar& kc : LiveChars) { if (kc.ptr != bestEnemyHero) continue; kHeroHP = (kc.maxHealth > 0.0f) ? (int)((kc.health / kc.maxHealth) * 100.0f) : -1; break; }
+                       bool  l2Exit16k = ENABLE_L2_DE_EXIT16 && !(kHeroHP >= 0 && kHeroHP <= J1_KILL_HP);
+                       bool  kWas = g_deLeashOn.count(bot) && g_deLeashOn[bot] == 1 && !l2Exit16k;
+                       k1bHeroInTwr = (kSq < (kWas ? DE_HERO_TWR_OUT_SQ : DE_HERO_TWR_IN_SQ));
+                       if (!k1bHeroInTwr) g_deLeashOn[bot] = 0;
+                   }
+                   if ((dlbDetect || k1bHeroInTwr)
+                       && bIsMeleeChar
+                       && LastMacroAction[bot] == "Defend"
+                       && !(m1DefFar && moveTarget != static_cast<AActor*>(threatenedFriendlyTower))
+                       && moveTarget
+                       && (dlbCombat || k1bHeroInTwr)
+                       && bestEnemyHero && closestEnemyHeroDistSq < 3240000.0f
+                       && !(BotIsBlind.count(bot) && BotIsBlind[bot])
+                       && !bMeleeLockbreakActive
+                       && !bDoingBoss
+                       && MeleeLockbreakStopFn && GetEnemyCharacterFunc)
+                   {
+                       FVector dlbTL = moveTarget->K2_GetActorLocation();
+                       float dlbTwrSq = (dlbTL.X - botLoc.X) * (dlbTL.X - botLoc.X)
+                                      + (dlbTL.Y - botLoc.Y) * (dlbTL.Y - botLoc.Y)
+                                      + (dlbTL.Z - botLoc.Z) * (dlbTL.Z - botLoc.Z);
+                       if (dlbTwrSq < 12250000.0f) {
+                           float dlbVelMs = 999.0f;
+                           { UObject* dlbMc = *reinterpret_cast<UObject**>(reinterpret_cast<uintptr_t>(botChar) + 0x0380);
+                             if (dlbMc) { FVector* dvp = reinterpret_cast<FVector*>(reinterpret_cast<uintptr_t>(dlbMc) + 0x0104);
+                                          dlbVelMs = sqrtf(dvp->X * dvp->X + dvp->Y * dvp->Y) / 100.0f; } }
+                           AActor* dlbNat = nullptr;
+                           { struct { class AActor* ReturnValue; } dlbEp{}; dlbEp.ReturnValue = nullptr;
+                             bot->ProcessEvent(GetEnemyCharacterFunc, &dlbEp); dlbNat = dlbEp.ReturnValue; }
+                           if (dlbCombat && dlbVelMs < 2.0f && dlbNat == nullptr) g_dlbFrozenTicks[bot]++;
+                           else if (dlbCombat)                       g_dlbFrozenTicks[bot] = 0;
+
+                           if (dlbCombat && g_dlbFrozenTicks[bot] >= 1) {
+#if F4_LOG_LEVEL >= 1
+                               static std::map<AOrionAIBot*, FVector> dlbPrevPos;
+                               float dlbDelta = 999.0f;
+                               auto itDlb = dlbPrevPos.find(bot);
+                               if (itDlb != dlbPrevPos.end())
+                                   dlbDelta = sqrtf((botLoc.X - itDlb->second.X) * (botLoc.X - itDlb->second.X)
+                                                  + (botLoc.Y - itDlb->second.Y) * (botLoc.Y - itDlb->second.Y)) / 100.0f;
+                               dlbPrevPos[bot] = botLoc;
+                               std::cout << "[DEFEND-LOCKBREAK] bot=" << botChar->GetFullName()
+                                   << " R=" << roleSlot << " Team=" << (bIsBlueTeam ? "B" : "R")
+                                   << " armed=" << (ENABLE_DEFEND_LOCKBREAK ? 1 : 0)
+                                   << " HP=" << (int)((currentHealth / maxHealth) * 100) << "%"
+                                   << " defTwrD=" << (int)(sqrtf(dlbTwrSq) / 100.0f) << "m"
+                                   << " tier=" << bestThreatenedTowerTier
+                                   << " heroD=" << (int)(sqrt(closestEnemyHeroDistSq) / 100.0f) << "m"
+                                   << " dPrevTickM=" << dlbDelta
+                                   << " frozenTicks=" << g_dlbFrozenTicks[bot]
+                                   << " sustained2=" << (g_dlbFrozenTicks[bot] >= 2 ? 1 : 0)
+                                   << " rotObj=" << (bIsRotatingToObjective ? 1 : 0)
+                                   << " attacker=" << (bestEnemyHero ? bestEnemyHero->GetFullName().substr(0, 20) : std::string("None"))
+                                   << " T=" << (int)matchTimeB << "s" << std::endl;
+#endif
+                               if (ENABLE_DEFEND_LOCKBREAK && g_dlbFrozenTicks[bot] >= 1) {
+                                   bot->ProcessEvent(MeleeLockbreakStopFn, nullptr);
+                                   bIsIdle = true;
+                                   BotIdleTicks[bot] = 10;
+                                   accRadius = 300.0f;
+                                   dlbFiredThisTick = true;
+                               }
+                           }
+                           {
+                               const float DE_ENGAGE_RANGE_SQ = 1440000.0f;
+                               const float DE_LEASH_RADIUS_SQ = 1440000.0f;
+                               const float DE_HP_FLOOR        = 0.35f;
+                               FVector deTwrL  = moveTarget->K2_GetActorLocation();
+                               FVector deHeroL = bestEnemyHero->K2_GetActorLocation();
+                               float deBotTwrSq  = (deTwrL.X - botLoc.X)*(deTwrL.X - botLoc.X) + (deTwrL.Y - botLoc.Y)*(deTwrL.Y - botLoc.Y);
+                               float deHeroTwrSq = (deTwrL.X - deHeroL.X)*(deTwrL.X - deHeroL.X) + (deTwrL.Y - deHeroL.Y)*(deTwrL.Y - deHeroL.Y);
+                               int  deHeroHP = -1;
+                               for (const CachedChar& dc : LiveChars) { if (dc.ptr != bestEnemyHero) continue; deHeroHP = (dc.maxHealth > 0.0f) ? (int)((dc.health / dc.maxHealth) * 100.0f) : -1; break; }
+                               bool l2Exit16 = ENABLE_L2_DE_EXIT16 && !(deHeroHP >= 0 && deHeroHP <= J1_KILL_HP);
+                               bool deLeashWas  = g_deLeashOn.count(bot) && g_deLeashOn[bot] == 1 && !l2Exit16;
+                               bool deHeroInTwr = ENABLE_DE_TOWER_LEASH && (deHeroTwrSq < (deLeashWas ? DE_HERO_TWR_OUT_SQ : DE_HERO_TWR_IN_SQ));
+                               bool deLeash2    = ENABLE_DE_TOWER_LEASH
+                                                ? (deHeroInTwr && deBotTwrSq < DE_BOT_TWR_SQ)
+                                                : (deHeroTwrSq < DE_LEASH_RADIUS_SQ && deBotTwrSq < DE_LEASH_RADIUS_SQ);
+                               bool deSoftOk    = !bAkSoftVeto || (deHeroInTwr && !bAkOutnumber && !bAkDeathZoneVeto);
+                               g_deLeashOn[bot] = deLeash2 ? 1 : 0;
+                               bool deEngageOk =
+                                      closestEnemyHeroDistSq < DE_ENGAGE_RANGE_SQ
+                                   && deLeash2
+                                   && deSoftOk
+                                   && !bV44Threatened && !bAkTraitSkip && !bAkOutnumber
+                                   && bestThreatenedTowerTier >= 1 && bestThreatenedTowerTier <= 2
+                                   && (currentHealth / maxHealth) > DE_HP_FLOOR
+                                   && !(BotNeedsHeal.count(bot) && BotNeedsHeal[bot]);
+#if F4_LOG_LEVEL >= 1
+                               std::cout << "[DEFEND-ENGAGE] bot=" << botChar->GetFullName()
+                                   << " armed=" << (ENABLE_DEFEND_ENGAGE ? 1 : 0)
+                                   << " heroD=" << (int)(sqrt(closestEnemyHeroDistSq) / 100.0f) << "m"
+                                   << " botTwrD=" << (int)(sqrtf(deBotTwrSq) / 100.0f) << "m heroTwrD=" << (int)(sqrtf(deHeroTwrSq) / 100.0f) << "m"
+                                   << " engageOk=" << deEngageOk << " akSoftVeto=" << (bAkSoftVeto ? 1 : 0)
+                                   << " Team=" << (bIsBlueTeam ? "B" : "R") << " leash2=" << (deLeash2 ? 1 : 0) << " heroInTwr=" << (deHeroInTwr ? 1 : 0)
+                                   << " combat=" << (CombatTimer.count(bot) ? (int)CombatTimer[bot] : -1) << " k1b=" << (k1bHeroInTwr ? 1 : 0) << " softOk=" << (deSoftOk ? 1 : 0)
+                                   << " V44=" << (bV44Threatened ? 1 : 0) << " traitSkip=" << (bAkTraitSkip ? 1 : 0) << " outnum=" << (bAkOutnumber ? 1 : 0)
+                                   << " EnH18=" << akvEnH18 << " FrH18=" << akvFrH18
+                                   << " tier=" << bestThreatenedTowerTier
+                                   << " HP=" << (int)((currentHealth / maxHealth) * 100) << "%"
+                                   << " natIsHero=" << (dlbNat == bestEnemyHero ? 1 : 0)
+                                   << " T=" << (int)matchTimeB << "s" << std::endl;
+#endif
+                               if (ENABLE_DEFEND_ENGAGE && deEngageOk) {
+                                   *reinterpret_cast<UObject**>(reinterpret_cast<uintptr_t>(bot) + 0x0650) = HeroFocusQuery;
+                                   if (dlbNat != bestEnemyHero) bot->K2_SetEnemy(bestEnemyHero);
+                                   moveTarget = nullptr;
+                                   bIsActivelyFighting = true;
+                                   g_deEngagedLastTick[bot] = true;
+                                   if (ENABLE_L3_J1_AFTER_DE) g_l3DeSeenT[bot] = matchTimeB;
+                                   deLockedThisTick = true;
+                               }
+                           }
+                       }
+                   }
+
+                   if (ENABLE_DEF_POKE_YIELD2 && DPY_ACTION && botChar
+                       && g_dpyEvalT.count(bot) && g_dpyEvalT[bot] == matchTimeB
+                       && g_dpyOnT.count(bot) && g_dpyArrT.count(bot)
+                       && (matchTimeB - g_dpyOnT[bot]) < DPY_MAX_S
+                       && LastMacroAction[bot] == "Defend" && threatenedFriendlyTower
+                       && moveTarget == static_cast<AActor*>(threatenedFriendlyTower)
+                       && !deLockedThisTick && !dlbFiredThisTick
+                       && !(BotIsBlind.count(bot) && BotIsBlind[bot])) {
+                       FVector dhL = threatenedFriendlyTower->K2_GetActorLocation();
+                       float dhSq = (dhL.X - botLoc.X) * (dhL.X - botLoc.X) + (dhL.Y - botLoc.Y) * (dhL.Y - botLoc.Y);
+                       accRadius = DPY_HOLD_ACCR;
+                       if (dhSq > DPY_HOLD_NUDGE_SQ) { bIsIdle = true; BotIdleTicks[bot] = 10; }
+                   }
+
+
+                   if (ENABLE_AK_OPPORTUNITY && bIsMeleeChar && !bIsJungler && botChar) {
+                       float akoHP = (maxHealth > 0.0f) ? (currentHealth / maxHealth) * 100.0f : -1.0f;
+                       int   akoHeroHP = -1; FVector akoHeroLoc = FVector(); bool akoHeroSeen = false;
+                       if (bestEnemyHero) for (const CachedChar& mc : LiveChars) { if (mc.ptr != bestEnemyHero) continue; akoHeroHP = (mc.maxHealth > 0.0f) ? (int)((mc.health / mc.maxHealth) * 100.0f) : -1; akoHeroLoc = mc.loc; akoHeroSeen = true; break; }
+                       const std::string& akoAct = LastMacroAction[bot];
+                       int   akoMode = (akoAct == "TowerObjective" || m1DefFar) ? 0 : (akoAct == "Defend") ? 1 : -1;
+                       float akoTwrSq = -1.0f, akoHeroTwrSq = -1.0f, akoHeroEnTwrSq = -1.0f;
+                       {
+                           AOrionDamageableObjective_Base* akoRefTwr = (akoMode == 1 && threatenedFriendlyTower) ? threatenedFriendlyTower : closestFriendlyTower;
+                           if (akoRefTwr) {
+                               FVector akoRL = akoRefTwr->K2_GetActorLocation();
+                               akoTwrSq = (akoRL.X - botLoc.X) * (akoRL.X - botLoc.X) + (akoRL.Y - botLoc.Y) * (akoRL.Y - botLoc.Y);
+                               if (akoHeroSeen) akoHeroTwrSq = (akoRL.X - akoHeroLoc.X) * (akoRL.X - akoHeroLoc.X) + (akoRL.Y - akoHeroLoc.Y) * (akoRL.Y - akoHeroLoc.Y);
+                           }
+                           if (bestEnemyTower && akoHeroSeen) {
+                               FVector akoEL = bestEnemyTower->K2_GetActorLocation();
+                               akoHeroEnTwrSq = (akoEL.X - akoHeroLoc.X) * (akoEL.X - akoHeroLoc.X) + (akoEL.Y - akoHeroLoc.Y) * (akoEL.Y - akoHeroLoc.Y);
+                           }
+                       }
+                       float i2HeroEnTwrMinSq = -1.0f;
+                       if ((ENABLE_I2_KILL_ENTRY || ENABLE_I2_DIVE_ALL) && akoMode >= 0 && akoHeroSeen && (g_akoUntil.count(bot) > 0 || closestEnemyHeroDistSq <= I2_KILL_MAX_SQ)) {
+                           for (AOrionDamageableObjective_Base* i2t : AllTowers) {
+                               if (!i2t || i2t->TeamNum != enemyTeam || i2t->GetHealth() <= 0.0f) continue;
+                               if (i2t->GetFullName().find("Default__") != std::string::npos) continue;
+                               FVector i2l = i2t->K2_GetActorLocation();
+                               float i2q = (i2l.X - akoHeroLoc.X) * (i2l.X - akoHeroLoc.X) + (i2l.Y - akoHeroLoc.Y) * (i2l.Y - akoHeroLoc.Y);
+                               if (i2HeroEnTwrMinSq < 0.0f || i2q < i2HeroEnTwrMinSq) i2HeroEnTwrMinSq = i2q;
+                           }
+                       }
+                       bool i2Dive = (i2HeroEnTwrMinSq >= 0.0f && i2HeroEnTwrMinSq <= AKO_HBF_ENTWR_SQ) || bInsideEnemyTurretGlobal;
+                       const char* akoOwner = nullptr;
+                       if (bV44Threatened)                                                              akoOwner = "V44";
+                       else if (bLanePushVetoActive)                                                    akoOwner = "LPV";
+                       else if (BotIsBlind.count(bot) && BotIsBlind[bot])                               akoOwner = "blind";
+                       else if (bIsRotatingToObjective)                                                 akoOwner = "rotation";
+                       else if (bAkDeathZoneVeto)                                                       akoOwner = "AKDZ";
+                       else if (bStickyDangerRetreat)                                                   akoOwner = "stickyDanger";
+                       else if (g_svActiveUntil.count(bot) && matchTimeB < g_svActiveUntil[bot])        akoOwner = "SV";
+                       else if (g_wfbUntil.count(bot) && matchTimeB < g_wfbUntil[bot])                  akoOwner = "WFB";
+                       else if (g_brActiveUntil.count(bot) && matchTimeB < g_brActiveUntil[bot])        akoOwner = "BR";
+                       else if (g_p23StartT.count(bot) > 0)                                             akoOwner = "P23";
+                       else if (g_advHoldOn.count(bot) > 0)                                             akoOwner = "ADVHOLD";
+                       if (akoOwner) g_akoRetreatSeenT[bot] = matchTimeB;
+                       const char* akoBlock = akoOwner;
+                       if (!akoBlock && g_mwhUntil.count(bot) && matchTimeB < g_mwhUntil[bot])                          akoBlock = "MWH";
+                       if (!akoBlock && lastThreatRetreatTime.count(bot) && (matchTimeB - lastThreatRetreatTime[bot]) < AKO_STICKY_S) akoBlock = "sticky";
+                       if (!akoBlock && bAkKiteback)                                                                    akoBlock = "kiteback";
+                       if (!akoBlock && p2TraitSkipF2)                                                                   akoBlock = "traitSkip";
+                       if (!akoBlock && bAkOutnumber)                                                                   akoBlock = "outnumber";
+                       if (!akoBlock && bAkHeroBeyondFront && akoMode == 0 && akoHeroEnTwrSq >= 0.0f && akoHeroEnTwrSq <= AKO_HBF_ENTWR_SQ) akoBlock = "beyondFront";
+                       if (!akoBlock && g_akpUntil.count(bot) && matchTimeB < g_akpUntil[bot])                          akoBlock = "fActive";
+                       if (!akoBlock && m1DefFar && bMeleeLockbreakActive)                                              akoBlock = "dty";
+                       bool akoDefGeoBlock = false;
+                       bool akoDefOff = false;
+                       if (!akoBlock && akoMode == 0) {
+                           if (bAkWaveDeficit || bAkHeavyDeficitNoBacking) akoBlock = "deficit";
+                           if (closestFriendlyTower) akoTwrSq = closestFriendlyTowerDistSq;
+                       } else if (!akoBlock && akoMode == 1) {
+                           bool akoDpyHold = g_dpyEvalT.count(bot) && g_dpyEvalT[bot] == matchTimeB && g_dpyOnT.count(bot) && g_dpyArrT.count(bot) && (matchTimeB - g_dpyOnT[bot]) < DPY_MAX_S;
+                           if (ENABLE_L1_F2_NO_DEF && !ENABLE_M5_I2_DEF_KILL)                            akoBlock = "defOff";
+                           else if (!threatenedFriendlyTower)                                            akoBlock = "defNoTower";
+                           else if (!(moveTarget == static_cast<AActor*>(threatenedFriendlyTower) || (g_akoUntil.count(bot) && moveTarget == static_cast<AActor*>(threatenedFriendlyTower)))) akoBlock = "defTgt";
+                           else if (deLockedThisTick || dlbFiredThisTick)                                akoBlock = "dlb";
+                           else if (akoDpyHold)                                                          akoBlock = "dpyHold";
+                           else if (ENABLE_I_F2_DPYWALK_BLOCK && g_dpyEvalT.count(bot) && g_dpyEvalT[bot] == matchTimeB && g_dpyOnT.count(bot) && !g_dpyArrT.count(bot)) akoBlock = "dpyWalk";
+                           if (threatenedFriendlyTower) {
+                               FVector akoTL = threatenedFriendlyTower->K2_GetActorLocation();
+                               akoTwrSq = (akoTL.X - botLoc.X) * (akoTL.X - botLoc.X) + (akoTL.Y - botLoc.Y) * (akoTL.Y - botLoc.Y);
+                               if (akoHeroSeen) akoHeroTwrSq = (akoTL.X - akoHeroLoc.X) * (akoTL.X - akoHeroLoc.X) + (akoTL.Y - akoHeroLoc.Y) * (akoTL.Y - akoHeroLoc.Y);
+                               if (!akoBlock && akoTwrSq > AKO_DEF_BOT_TWR_SQ)                                           akoBlock = "defLeash";
+                               if (!akoBlock && (akoHeroTwrSq < 0.0f || akoHeroTwrSq > AKO_DEF_HERO_TWR_SQ))           { akoBlock = "defHeroFar"; akoDefGeoBlock = true; }
+                               if (!akoBlock && bAkHeavyDeficitNoBacking && akoTwrSq > AKO_TWR_RANGE_SQ)                 akoBlock = "defDeficit";
+                           }
+                           if (ENABLE_L1_F2_NO_DEF && ENABLE_M5_I2_DEF_KILL && !akoBlock) { akoBlock = "defOff"; akoDefOff = true; }
+                       } else if (!akoBlock) akoBlock = "act";
+                       float akoHeroM = bestEnemyHero ? (sqrtf(closestEnemyHeroDistSq) / 100.0f) : 999.0f;
+                       bool  akoActive = g_akoUntil.count(bot) > 0;
+                       auto  akoLogLine = [&](const char* kind, const char* reason) {
+#if F4_LOG_LEVEL >= 1
+                           std::cout << "[AK-OPP] " << kind << " " << botChar->GetFullName() << " Team=" << (bIsBlueTeam ? "B" : "R") << " R=" << roleSlot
+                               << " mode=" << (akoMode == 0 ? "TO" : akoMode == 1 ? "DEF" : "-") << " hero=" << (bestEnemyHero ? bestEnemyHero->GetFullName().substr(bestEnemyHero->GetFullName().rfind('.') + 1) : std::string("-"))
+                               << " heroM=" << (int)akoHeroM << " HP=" << (int)akoHP << " heroHP=" << akoHeroHP
+                               << " FrM18/EnM18=" << akvFrM18 << "/" << akvEnM18 << " FrH18/EnH18=" << akvFrH18 << "/" << akvEnH18
+                               << " twrM=" << (akoTwrSq >= 0.0f ? (int)(sqrtf(akoTwrSq) / 100.0f) : -1) << " heroTwrM=" << (akoHeroTwrSq >= 0.0f ? (int)(sqrtf(akoHeroTwrSq) / 100.0f) : -1)
+                               << " heroEnTwrM=" << (akoHeroEnTwrSq >= 0.0f ? (int)(sqrtf(akoHeroEnTwrSq) / 100.0f) : -1) << " hbf=" << (bAkHeroBeyondFront ? 1 : 0)
+                               << " waveAhead=" << (bAkWaveAhead ? 1 : 0) << " soft=" << (bAkSoftVeto ? 1 : 0);
+                           if (reason) std::cout << " reason=" << reason;
+                           if (g_akoStartT.count(bot)) std::cout << " heldS=" << (int)(matchTimeB - g_akoStartT[bot])
+                               << " dHP=" << (g_akoStartHP.count(bot) ? (int)(g_akoStartHP[bot] - akoHP) : -999)
+                               << " dHeroHP=" << ((g_akoStartHeroHP.count(bot) && g_akoStartHeroHP[bot] >= 0 && akoHeroHP >= 0) ? (g_akoStartHeroHP[bot] - akoHeroHP) : -999);
+                           std::cout << " T=" << (int)matchTimeB << "s" << std::endl;
+#endif
+                       };
+                       bool  p2I2Finish = ENABLE_P2_I2_FINISH && akoHeroHP >= 0 && (float)akoHeroHP <= P2_I2_FINISH_HERO_HP && akvEnH18 <= 1;
+                       float p2I2BotMin = p2I2Finish ? P2_I2_FINISH_BOT_MIN_HP : I2_KILL_BOT_MIN_HP;
+                       bool  p2I2FinEp  = ENABLE_P2_I2_FINISH && akvEnH18 <= 1 && g_akoKill.count(bot) && g_akoKill[bot] == 2 && akoHeroHP >= 0 && (float)akoHeroHP <= P2_I2_FINISH_KEEP_HERO_HP;
+                       bool i2DefGeoOk = (akoMode != 1) || (akoHeroTwrSq >= 0.0f && akoHeroTwrSq <= I2_DEF_HERO_TWR_SQ);
+                       bool i2Cand = ENABLE_I2_KILL_ENTRY && !akoActive && akoMode >= 0 && bestEnemyHero && bAkHeroIsRanged && !bDoingBoss
+                                  && akoHeroHP >= 0 && (float)akoHeroHP <= I2_KILL_HP
+                                  && akoHP >= p2I2BotMin && akoHP >= (float)akoHeroHP + I2_KILL_LEAD
+                                  && closestEnemyHeroDistSq >= AKO_HERO_MIN_SQ && closestEnemyHeroDistSq <= I2_KILL_MAX_SQ;
+                       const char* i2Why = nullptr;
+                       if (i2Cand) {
+                           i2Why = (akoBlock && !akoDefGeoBlock && !akoDefOff) ? akoBlock : nullptr;
+                           if (!i2Why && !i2DefGeoOk)                                                          i2Why = "i2Leash";
+                           if (!i2Why && akoMode == 1 && bAkHeavyDeficitNoBacking && akoTwrSq > AKO_TWR_RANGE_SQ) i2Why = "defDeficit";
+                           if (!i2Why && i2Dive)                                                               i2Why = "i2Dive";
+                           if (!i2Why && trLose3s != -999 && trLose3s >= I2_TRADE_LOST)                        i2Why = "i2TradeLost";
+                           if (!i2Why && g_deEngagedLastTick.count(bot) && g_deEngagedLastTick[bot] && !deLockedThisTick) i2Why = "deHandoff";
+                           if (!i2Why && g_akoRetreatSeenT.count(bot) && (matchTimeB - g_akoRetreatSeenT[bot]) < AKO_RETREAT_GRACE_S) i2Why = "grace";
+                           if (!i2Why && g_akoLastT.count(bot) && (matchTimeB - g_akoLastT[bot]) < AKO_COOLDOWN_S)                     i2Why = "cooldown";
+                       }
+                       if (akoActive) {
+                           const char* akoClear = nullptr;
+                           if (!(ENABLE_I2_KILL_ENTRY || ENABLE_I2_KILL_EXTEND || ENABLE_I2_TRADE_EXTEND)) {
+                               if (matchTimeB >= g_akoUntil[bot])                                                        akoClear = "expired";
+                               else if (akoMode < 0 || akoMode != (g_akoMode.count(bot) ? g_akoMode[bot] : akoMode))    akoClear = "handoff";
+                               else if (!bestEnemyHero || closestEnemyHeroDistSq > AKO_HERO_CLEAR_SQ)                   akoClear = "heroFar";
+                               else if (akoHP >= 0.0f && akoHP < AKO_KEEP_HP)                                            akoClear = "lowHP";
+                               else if (akoHeroHP >= 0 && (float)akoHeroHP > akoHP + AKO_KEEP_LEAD)                      akoClear = "advLost";
+                               else if (akoBlock)                                                                        akoClear = akoBlock;
+                           } else {
+                               bool i2Kill = g_akoKill.count(bot) > 0;
+                               float i2ClearSq = i2Kill ? I2_KILL_CLEAR_SQ : AKO_HERO_CLEAR_SQ;
+                               const char* i2BlockEff = (i2Kill && akoDefGeoBlock) ? (i2DefGeoOk ? nullptr : "i2Leash")
+                                                      : (i2Kill && akoDefOff) ? nullptr : akoBlock;
+                               const char* i2Other = nullptr;
+                               if      (akoMode < 0 || akoMode != (g_akoMode.count(bot) ? g_akoMode[bot] : akoMode))       i2Other = "handoff";
+                               else if (!bestEnemyHero || closestEnemyHeroDistSq > i2ClearSq)                             i2Other = "heroFar";
+                               else if (akoHP >= 0.0f && akoHP < (i2Kill ? ((p2I2FinEp ? P2_I2_FINISH_BOT_MIN_HP : I2_KILL_BOT_MIN_HP) - 5.0f) : AKO_KEEP_HP))       i2Other = "lowHP";
+                               else if (i2Kill && akoHeroHP > (int)I2_KILL_KEEP_HP)                                       i2Other = "i2Healed";
+                               else if (!i2Kill && akoHeroHP >= 0 && (float)akoHeroHP > akoHP + AKO_KEEP_LEAD)             i2Other = "advLost";
+                               else if (i2Kill && trLose3s != -999 && trLose3s >= I2_TRADE_LOST)                          i2Other = "i2TradeLost";
+                               else if (i2Kill && i2Dive)                                                                 i2Other = "i2Dive";
+                               else if (i2BlockEff)                                                                       i2Other = i2BlockEff;
+                               if (matchTimeB >= g_akoUntil[bot]) {
+                                   bool i2ExtOk = !i2Other && !i2Dive && g_akoStartT.count(bot) && (matchTimeB - g_akoStartT[bot]) < I2_MAX_S;
+                                   bool i2Ext = i2ExtOk && ((i2Kill && ENABLE_I2_KILL_EXTEND)
+                                              );
+                                   if (i2Ext) {
+                                       g_akoUntil[bot] = matchTimeB + I2_EXT_S;
+                                       AActor* i2Nat = nullptr;
+                                       if (GetEnemyCharacterFunc) { struct { class AActor* ReturnValue; } i2Ge{}; i2Ge.ReturnValue = nullptr; bot->ProcessEvent(GetEnemyCharacterFunc, &i2Ge); i2Nat = i2Ge.ReturnValue; }
+                                       bool i2NatWasHero = (i2Nat == static_cast<AActor*>(bestEnemyHero));
+                                       if (!i2NatWasHero) bot->K2_SetEnemy(bestEnemyHero);
+                                       akoLogLine("EXTEND", i2Kill ? (i2NatWasHero ? "kill,natWasHero" : "kill,redirect") : (i2NatWasHero ? "trade,natWasHero" : "trade,redirect"));
+                                   } else akoClear = i2Other ? i2Other : "expired";
+                               } else akoClear = i2Other;
+                           }
+                           if (akoClear) {
+                               akoLogLine("CLEAR", akoClear);
+                               g_akoUntil.erase(bot); g_akoKill.erase(bot); g_akoStartT.erase(bot); g_akoStartHP.erase(bot); g_akoStartHeroHP.erase(bot); g_akoMode.erase(bot);
+                               g_akoLastT[bot] = matchTimeB;
+                           } else {
+                               moveTarget = static_cast<AActor*>(bestEnemyHero); accRadius = 300.0f;
+                               bIsActivelyFighting = false;
+                               bIsIdle = true; BotIdleTicks[bot] = 10;
+                               if (ENABLE_K2_AKO_HEROFOCUS && HeroFocusQuery && (g_akoMode.count(bot) && g_akoMode[bot] == 0) && !i2Dive && !bInsideEnemyTurretGlobal)
+                                   *reinterpret_cast<UObject**>(reinterpret_cast<uintptr_t>(bot) + 0x0650) = HeroFocusQuery;
+                           }
+                       } else if (i2Cand && !i2Why) {
+                           AActor* i2kNat = nullptr;
+                           if (GetEnemyCharacterFunc) { struct { class AActor* ReturnValue; } i2kGe{}; i2kGe.ReturnValue = nullptr; bot->ProcessEvent(GetEnemyCharacterFunc, &i2kGe); i2kNat = i2kGe.ReturnValue; }
+                           bool i2kNatWasHero = (i2kNat == static_cast<AActor*>(bestEnemyHero));
+                           if (!i2kNatWasHero) bot->K2_SetEnemy(bestEnemyHero);
+                           g_akoUntil[bot] = matchTimeB + AKO_WINDOW_S; g_akoStartT[bot] = matchTimeB; g_akoMode[bot] = akoMode;
+                           g_akoStartHP[bot] = akoHP; g_akoStartHeroHP[bot] = akoHeroHP; g_akoKill[bot] = p2I2Finish ? 2 : 1;
+                           moveTarget = static_cast<AActor*>(bestEnemyHero); accRadius = 300.0f;
+                           bIsActivelyFighting = false;
+                           bIsIdle = true; BotIdleTicks[bot] = 10;
+                           if (ENABLE_K2_AKO_HEROFOCUS && HeroFocusQuery && akoMode == 0 && !i2Dive && !bInsideEnemyTurretGlobal)
+                               *reinterpret_cast<UObject**>(reinterpret_cast<uintptr_t>(bot) + 0x0650) = HeroFocusQuery;
+                           akoLogLine("FIRE", i2kNatWasHero ? "natWasHero,entry=kill" : "redirect,entry=kill");
+                       } else if (akoMode >= 0 && bestEnemyHero && bAkHeroIsRanged
+                                  && closestEnemyHeroDistSq >= AKO_HERO_MIN_SQ && closestEnemyHeroDistSq <= AKO_HERO_MAX_SQ
+                                  && akoHeroHP >= 0 && ((akoHP >= AKO_MIN_HP && (float)akoHeroHP <= akoHP)
+                                      || (ENABLE_H4_AKO_LOOSEN && akoHP >= AKO_LEAD_MIN_HP && (float)akoHeroHP <= akoHP + AKO_LEAD_ALLOW))) {
+                           const char* akoWhy = akoBlock;
+                           if (!akoWhy && g_akoRetreatSeenT.count(bot) && (matchTimeB - g_akoRetreatSeenT[bot]) < AKO_RETREAT_GRACE_S) akoWhy = "grace";
+                           if (!akoWhy && g_akoLastT.count(bot) && (matchTimeB - g_akoLastT[bot]) < AKO_COOLDOWN_S)                     akoWhy = "cooldown";
+                           if (!akoWhy && bInsideEnemyTurretGlobal)                                                                      akoWhy = "enemyTurret";
+                           if (!akoWhy && ENABLE_I2_DIVE_ALL && i2Dive)                                                                  akoWhy = "dive";
+                           if (!akoWhy && !(CombatTimer.count(bot) && CombatTimer[bot] > 0.0f)
+                               && !(ENABLE_H4_AKO_LOOSEN && akoHeroHP >= 0 && (float)akoHeroHP <= AKO_CALM_KILL_HP && closestEnemyHeroDistSq <= AKO_CALM_KILL_SQ && !bAkHeavyDeficitNoBacking))                                             akoWhy = "noCombat";
+                           if (!akoWhy) {
+                               AActor* akoNat = nullptr;
+                               if (GetEnemyCharacterFunc) {
+                                   struct { class AActor* ReturnValue; } akoGetEnemy{};
+                                   akoGetEnemy.ReturnValue = nullptr;
+                                   bot->ProcessEvent(GetEnemyCharacterFunc, &akoGetEnemy);
+                                   akoNat = akoGetEnemy.ReturnValue;
+                               }
+                               bool akoNatWasHero = (akoNat == static_cast<AActor*>(bestEnemyHero));
+                               if (!akoNatWasHero) bot->K2_SetEnemy(bestEnemyHero);
+                               g_akoUntil[bot] = matchTimeB + AKO_WINDOW_S; g_akoStartT[bot] = matchTimeB; g_akoMode[bot] = akoMode;
+                               g_akoStartHP[bot] = akoHP; g_akoStartHeroHP[bot] = akoHeroHP; g_akoKill.erase(bot);
+                               moveTarget = static_cast<AActor*>(bestEnemyHero); accRadius = 300.0f;
+                               bIsActivelyFighting = false;
+                               bIsIdle = true; BotIdleTicks[bot] = 10;
+                               if (ENABLE_K2_AKO_HEROFOCUS && HeroFocusQuery && akoMode == 0 && !i2Dive && !bInsideEnemyTurretGlobal)
+                                   *reinterpret_cast<UObject**>(reinterpret_cast<uintptr_t>(bot) + 0x0650) = HeroFocusQuery;
+                               const char* akoEntry = (!(CombatTimer.count(bot) && CombatTimer[bot] > 0.0f)) ? "killCalm" : ((float)akoHeroHP > akoHP) ? "lead10" : "ahead";
+                               std::string akoWhyFire = std::string(akoNatWasHero ? "natWasHero" : "redirect") + ",entry=" + akoEntry;
+                               akoLogLine("FIRE", akoWhyFire.c_str());
+                           } else {
+                           }
+                       } else if (ENABLE_H4_AKO_LOOSEN && akoMode >= 0 && bestEnemyHero && bAkHeroIsRanged
+                                  && closestEnemyHeroDistSq >= AKO_HERO_MIN_SQ && closestEnemyHeroDistSq <= AKO_HERO_MAX_SQ
+                                  && akoHP >= AKO_MIN_HP && akoHeroHP >= 0 && (float)akoHeroHP <= akoHP + AKO_HPLEAD_DIAG) {
+                       }
+                   }
+                   bool bQ2Join = false;
+                   if (ENABLE_Q2_GANK_JOIN && bIsMeleeChar && !bIsJungler && bestEnemyHero && botChar) {
+                       const char* q2Block = nullptr;
+                       bool q2WasOn = g_q2On.count(bot) && g_q2On[bot];
+                       AOrionChar* q2JC = nullptr;
+                       for (AOrionAIBot* q2Ob : AllBots) {
+                           if (!q2Ob || q2Ob == bot) continue;
+                           auto q2R = GBotRoles.find(q2Ob); if (q2R == GBotRoles.end() || q2R->second != 4) continue;
+                           AOrionChar* q2Oc = reinterpret_cast<AOrionChar*>(q2Ob->Pawn);
+                           if (!q2Oc || q2Oc->TeamNum != botTeam || q2Oc->GetHealth() <= 0.0f) continue;
+                           auto q2A = LastMacroAction.find(q2Ob); if (q2A == LastMacroAction.end() || q2A->second != "Gank") continue;
+                           auto q2Tg = LastGankTargetPtr.find(q2Ob); if (q2Tg == LastGankTargetPtr.end() || q2Tg->second != bestEnemyHero) continue;
+                           auto q2E = GankEngaged.find(q2Ob); if (q2E == GankEngaged.end() || !q2E->second) continue;
+                           q2JC = q2Oc; break;
+                       }
+                       FVector q2HL = bestEnemyHero->K2_GetActorLocation();
+                       int q2JglHeroM = -1;
+                       if (q2JC) {
+                           FVector q2JL = q2JC->K2_GetActorLocation();
+                           float q2jx = q2JL.X - q2HL.X, q2jy = q2JL.Y - q2HL.Y;
+                           q2JglHeroM = (int)(sqrtf(q2jx * q2jx + q2jy * q2jy) / 100.0f);
+                           if ((q2jx * q2jx + q2jy * q2jy) > Q2_JGL_NEAR_SQ) q2Block = "jglFar";
+                       }
+                       else q2Block = "noGank";
+                       float q2HP = (maxHealth > 0.0f) ? (currentHealth / maxHealth) * 100.0f : 0.0f;
+                       int q2HeroHP = -1;
+                       for (const CachedChar& q2c : LiveChars) { if (q2c.ptr == bestEnemyHero) { q2HeroHP = (q2c.maxHealth > 0.0f) ? (int)(q2c.health / q2c.maxHealth * 100.0f) : -1; break; } }
+                       if (!q2Block) {
+                           int q2EnH30 = 0, q2FrH30 = 0;
+                           for (const CachedChar& q2c : LiveChars) {
+                               if (!q2c.bIsHero || q2c.bIsNeutral || q2c.ptr == botChar) continue;
+                               float q2x = q2c.loc.X - botLoc.X, q2y = q2c.loc.Y - botLoc.Y;
+                               if (q2x * q2x + q2y * q2y <= Q2_ENH_SQ) { if (q2c.team == enemyTeam) q2EnH30++; else if (q2c.team == botTeam) q2FrH30++; }
+                           }
+                           bool q2HeroAtTwr = false;
+                           for (AOrionDamageableObjective_Base* q2t : AllTowers) {
+                               if (!q2t || q2t->TeamNum != enemyTeam || q2t->GetHealth() <= 0.0f) continue;
+                               FVector q2tl = q2t->K2_GetActorLocation(); float q2tx = q2tl.X - q2HL.X, q2ty = q2tl.Y - q2HL.Y;
+                               if (q2tx * q2tx + q2ty * q2ty <= Q2_TWR_EXCL_SQ) { q2HeroAtTwr = true; break; }
+                           }
+                           bool q2Owner = (g_brActiveUntil.count(bot) && matchTimeB < g_brActiveUntil[bot])
+                                       || (g_svActiveUntil.count(bot) && matchTimeB < g_svActiveUntil[bot])
+                                       || (g_wfbUntil.count(bot) && matchTimeB < g_wfbUntil[bot])
+                                       || (g_dpyOnT.count(bot) > 0)
+                                       || (g_pdyStartT.count(bot) && (matchTimeB - g_pdyStartT[bot]) < PDY_COMMIT_SEC)
+                                       || p8LrLive();
+                           if (bV44Threatened)                                    q2Block = "v44";
+                           else if (bMeleeLockbreakActive)                        q2Block = "mlb";
+                           else if (bIsFleeing)                                   q2Block = "flee";
+                           else if (bStickyDangerRetreat)                         q2Block = "sticky";
+                           else if (bAkDeathZoneVeto)                             q2Block = "dz";
+                           else if (q2Owner)                                      q2Block = "owner";
+                           else if (BotIsBlind.count(bot) && BotIsBlind[bot])     q2Block = "blind";
+                           else if (q2HeroAtTwr || bInsideEnemyTurretGlobal)      q2Block = "enTwr";
+                           else if (q2HP <= Q2_MIN_HP)                            q2Block = "hp";
+                           else if (BotNeedsHeal.count(bot) && BotNeedsHeal[bot]) q2Block = "heal";
+                           else if (bDoingBoss || bIsRotatingToObjective || LastMacroAction[bot] == "Recall" || LastMacroAction[bot] == "Boss" || LastMacroAction[bot] == "Rotate") q2Block = "act";
+                           else if (q2EnH30 > q2FrH30)                            q2Block = "outnum";
+                           else if (deLockedThisTick)                             q2Block = "deLock";
+                       }
+                       if (!q2Block) {
+                           if (closestEnemyHeroDistSq <= Q2_ENTER_SQ) { if (!g_q2EnterT.count(bot)) g_q2EnterT[bot] = matchTimeB; }
+                           else g_q2EnterT.erase(bot);
+                           bool q2Enter = g_q2EnterT.count(bot) && (matchTimeB - g_q2EnterT[bot]) >= 1.0f;
+                           bool q2Hold  = q2WasOn && closestEnemyHeroDistSq <= Q2_HOLD_SQ;
+                           if (q2Enter || q2Hold) g_q2GeoUntil[bot] = matchTimeB + Q2_GEO_LATCH_S;
+                           bool q2Geo = (q2Enter || q2WasOn) && g_q2GeoUntil.count(bot) && matchTimeB < g_q2GeoUntil[bot];
+                           if (q2Geo) bQ2Join = true;
+                           else q2Block = q2WasOn ? "geoExit" : "geo";
+                       }
+                       else g_q2EnterT.erase(bot);
+                       if (bQ2Join) {
+                           AActor* q2Nat = nullptr;
+                           if (GetEnemyCharacterFunc) { struct { class AActor* ReturnValue; } q2Ge{}; q2Ge.ReturnValue = nullptr; bot->ProcessEvent(GetEnemyCharacterFunc, &q2Ge); q2Nat = q2Ge.ReturnValue; }
+                           bool q2HeroChg = !(g_q2Hero.count(bot) && g_q2Hero[bot] == bestEnemyHero);
+                           bool q2K2Due   = !g_q2K2T.count(bot) || (matchTimeB - g_q2K2T[bot]) >= Q2_K2_MIN_S;
+                           if (q2Nat != static_cast<AActor*>(bestEnemyHero) && (!q2WasOn || q2HeroChg || q2K2Due)) {
+                               bot->K2_SetEnemy(bestEnemyHero);
+                               g_q2K2T[bot] = matchTimeB;
+                           }
+                           if (q2WasOn && q2HeroChg) g_q2StartHeroHP[bot] = q2HeroHP;
+                           g_q2Hero[bot] = bestEnemyHero;
+                           moveTarget = static_cast<AActor*>(bestEnemyHero); accRadius = 300.0f;
+                           bIsActivelyFighting = false;
+                           bIsIdle = true; BotIdleTicks[bot] = 10;
+                           if (HeroFocusQuery) *reinterpret_cast<UObject**>(reinterpret_cast<uintptr_t>(bot) + 0x0650) = HeroFocusQuery;
+                           g_deEngagedLastTick[bot] = false;
+                           if (!q2WasOn) { g_q2StartT[bot] = matchTimeB; g_q2StartHP[bot] = (int)q2HP; g_q2StartHeroHP[bot] = q2HeroHP; }
+                           g_q2On[bot] = true;
+                       }
+#if F4_LOG_LEVEL >= 1
+                       {
+                           const char* q2Ev = nullptr;
+                           if (bQ2Join && !q2WasOn) q2Ev = "START";
+                           else if (!bQ2Join && q2WasOn) q2Ev = "END";
+                           if (q2Ev) {
+                               std::string q2HN = bestEnemyHero->GetFullName(); size_t q2Pp = q2HN.rfind('.'); if (q2Pp != std::string::npos) q2HN = q2HN.substr(q2Pp + 1);
+                               std::cout << "[Q2-JOIN] " << q2Ev << " " << botChar->GetFullName() << " Team=" << (bIsBlueTeam ? "B" : "R") << " R=" << roleSlot
+                                   << " | hero=" << q2HN << " heroD=" << (int)(sqrtf(closestEnemyHeroDistSq) / 100.0f) << " jglHeroM=" << q2JglHeroM
+                                   << " HP=" << (int)q2HP << " heroHP=" << q2HeroHP << " FrH18=" << akvFrH18 << " jglName=" << (q2JC ? q2JC->GetFullName().substr(q2JC->GetFullName().rfind('.') + 1) : std::string("-")) << " FrM18/EnM18=" << akvFrM18 << "/" << akvEnM18
+                                   << " block=" << (q2Block ? q2Block : "-") << " Act=" << (LastMacroAction[bot].empty() ? std::string("(none)") : LastMacroAction[bot]);
+                               if (!bQ2Join && q2WasOn && g_q2StartT.count(bot)) {
+                                   AOrionChar* q2EpHero = g_q2Hero.count(bot) ? g_q2Hero[bot] : nullptr;
+                                   int q2EpHeroHP = -1;
+                                   for (const CachedChar& q2c : LiveChars) { if (q2c.ptr == q2EpHero) { q2EpHeroHP = (q2c.maxHealth > 0.0f) ? (int)(q2c.health / q2c.maxHealth * 100.0f) : -1; break; } }
+                                   std::cout << " durS=" << (int)(matchTimeB - g_q2StartT[bot]) << " dHP=" << (g_q2StartHP[bot] - (int)q2HP)
+                                             << " dHeroHP=" << ((g_q2StartHeroHP[bot] >= 0 && q2EpHeroHP >= 0) ? (g_q2StartHeroHP[bot] - q2EpHeroHP) : -999)
+                                             << " epHeroGone=" << (q2EpHeroHP < 0 ? 1 : 0);
+                               }
+                               std::cout << " T=" << (int)matchTimeB << "s" << std::endl;
+                           }
+                       }
+#endif
+                       if (!bQ2Join && q2WasOn) { g_q2On[bot] = false; g_q2GeoUntil.erase(bot); g_q2StartT.erase(bot); g_q2StartHP.erase(bot); g_q2StartHeroHP.erase(bot); }
+                   }
+                   else if (g_q2On.count(bot) && g_q2On[bot]) {
+#if F4_LOG_LEVEL >= 1
+                       std::cout << "[Q2-JOIN] END " << botChar->GetFullName() << " Team=" << (bIsBlueTeam ? "B" : "R") << " R=" << roleSlot
+                           << " | block=noHero durS=" << (g_q2StartT.count(bot) ? (int)(matchTimeB - g_q2StartT[bot]) : -1) << " T=" << (int)matchTimeB << "s" << std::endl;
+#endif
+                       g_q2On[bot] = false; g_q2GeoUntil.erase(bot); g_q2EnterT.erase(bot); g_q2StartT.erase(bot); g_q2StartHP.erase(bot); g_q2StartHeroHP.erase(bot);
+                   }
+
+
+#if F4_LOG_LEVEL >= 1
+                   if (botChar) {
+                       int  p5HP = (maxHealth > 0.0f) ? (int)((currentHealth / maxHealth) * 100.0f) : -1;
+#if F4_LOG_LEVEL >= 1
+                       if (bIsMeleeChar && !bIsJungler) {
+                           auto p7A = g_p7PrevAct.find(bot);
+                           if (p7A != g_p7PrevAct.end() && p7A->second != LastMacroAction[bot]) {
+                               std::cout << "[ACT-SWITCH] " << botChar->GetFullName()
+                                   << " R=" << roleSlot << " Team=" << (bIsBlueTeam ? "B" : "R")
+                                   << " " << (p7A->second.empty() ? std::string("(none)") : p7A->second)
+                                   << "->" << (LastMacroAction[bot].empty() ? std::string("(none)") : LastMacroAction[bot])
+                                   << " | HP=" << p5HP
+                                   << " heroD=" << (bestEnemyHero ? (int)(sqrtf(closestEnemyHeroDistSq) / 100.0f) : -1)
+                                   << " twrM=" << (closestFriendlyTower ? (int)(sqrtf(closestFriendlyTowerDistSq) / 100.0f) : -1)
+                                   << " defTier=" << bestThreatenedTowerTier
+                                   << " FrM18=" << akvFrM18 << " EnM18=" << akvEnM18 << " FrH18=" << akvFrH18 << " EnH18=" << akvEnH18
+                                   << " FrM25=" << rwFrM25 << " ahead=" << rwAheadM25
+                                   << " rearWaveM=" << (rearWaveAnchor ? (int)(sqrtf(rearWaveAnchorDistSq) / 100.0f) : -1)
+                                   << " accR=" << (int)accRadius
+                                   << " blind=" << ((BotIsBlind.count(bot) && BotIsBlind[bot]) ? 1 : 0)
+                                   << " v44=" << (bV44Threatened ? 1 : 0) << " lpv=" << (bLanePushVetoActive ? 1 : 0)
+                                   << " T=" << (int)matchTimeB << "s" << std::endl;
+                           }
+                           g_p7PrevAct[bot] = LastMacroAction[bot];
+                       }
+#endif
+                   }
+#endif
+
+
+
+                   if (moveTarget && MoveFunc && bIsIdle) {
+                       FVector targetLoc = moveTarget->K2_GetActorLocation();
+                       float dSq = (targetLoc.X - botLoc.X) * (targetLoc.X - botLoc.X) +
+                           (targetLoc.Y - botLoc.Y) * (targetLoc.Y - botLoc.Y) +
+                           (targetLoc.Z - botLoc.Z) * (targetLoc.Z - botLoc.Z);
+
+                       if (dSq > (accRadius * accRadius)) {
+                           struct { class AActor* G; float R; bool S; bool P; bool C; uint8 Pad[1]; void* F; bool A; uint8 RV; uint8 Pad2[6]; } moveParams{};
+                           moveParams.G = moveTarget; moveParams.R = accRadius; moveParams.S = true; moveParams.P = true; moveParams.C = true; moveParams.A = true;
+                           bot->ProcessEvent(MoveFunc, &moveParams);
+
+
+                           BotIdleTicks[bot] = (accRadius >= 600.0f) ? 0 : -3;
+                       }
+                   }
+
+                   if (ENABLE_DEFEND_ENGAGE && g_deEngagedLastTick.count(bot) && g_deEngagedLastTick[bot]
+                       && LastMacroAction[bot] == "Defend" && !deLockedThisTick) {
+                       bot->K2_SetEnemy(nullptr);
+                       g_deEngagedLastTick[bot] = false;
+                   }
+
+
+
+
+#if F4_LOG_LEVEL >= 2
+                   if (bIsBlueTeam) {
+                       static std::map<AOrionAIBot*, std::string> bossExitPrevAction;
+                       static std::map<AOrionAIBot*, AOrionChar*> bossExitPrevBossRef;
+                       std::string curAction = LastMacroAction[bot];
+                       bool wasBoss = (bossExitPrevAction.count(bot) && bossExitPrevAction[bot] == "Boss");
+                       bool isBoss = (curAction == "Boss");
+
+                       if (wasBoss && !isBoss) {
+                           AOrionChar* bossRef = bossExitPrevBossRef.count(bot) ? bossExitPrevBossRef[bot] : nullptr;
+                           if (!bossRef) {
+                               bossRef = bIsBlueTeam ? activeBossTargetBlue : activeBossTargetRed;
+                               if (!bossRef) {
+                                   if (LastMacroTargetName[bot].find("Dragon") != std::string::npos)         bossRef = fangtooth;
+                                   else if (LastMacroTargetName[bot].find("PrimeHelix") != std::string::npos) bossRef = orbPrime;
+                               }
+                           }
+                           int distM = -1;
+                           int bossPct = -1;
+                           if (bossRef) {
+                               FVector bxLoc = bossRef->K2_GetActorLocation();
+                               float dSqEx = (bxLoc.X - botLoc.X) * (bxLoc.X - botLoc.X)
+                                           + (bxLoc.Y - botLoc.Y) * (bxLoc.Y - botLoc.Y);
+                               distM = (int)(sqrt(dSqEx) / 100.0f);
+                               float bxHp = 0.0f, bxMax = 1.0f;
+                               if (getHealthFunc)    bossRef->ProcessEvent(getHealthFunc,    &bxHp);
+                               if (getMaxHealthFunc) bossRef->ProcessEvent(getMaxHealthFunc, &bxMax);
+                               bossPct = (bxMax > 0.0f) ? (int)((bxHp / bxMax) * 100.0f) : 0;
+                           }
+                           int botHpPct = (maxHealth > 0.0f) ? (int)((currentHealth / maxHealth) * 100.0f) : 0;
+                           const char* bossName = (bossRef == fangtooth) ? "Fang"
+                                                : (bossRef == orbPrime) ? "Prime"
+                                                : "?";
+
+                           std::cout << "[BOSS-EXIT] Role=" << roleSlot
+                               << " NewAction=" << (curAction.empty() ? "EMPTY" : curAction)
+                               << " Boss=" << bossName
+                               << " | DistAtExit=" << distM << "m"
+                               << " BossHP=" << bossPct << "%"
+                               << " BotHP=" << botHpPct << "%"
+                               << " | NeedsHeal=" << (BotNeedsHeal.count(bot) && BotNeedsHeal[bot] ? 1 : 0)
+                               << " Tactical=" << (bNeedsTacticalRecall ? 1 : 0)
+                               << " Fleeing=" << (bIsFleeing ? 1 : 0)
+                               << " Blind=" << (BotIsBlind.count(bot) && BotIsBlind[bot] ? 1 : 0)
+                               << " Combat=" << (int)CombatTimer[bot]
+                               << " ThreatTwrTier=" << (threatenedFriendlyTower ? bestThreatenedTowerTier : 0)
+                               << " | T=" << (int)matchTimeB << "s"
+                               << std::endl;
+                       }
+
+                       bossExitPrevAction[bot] = curAction;
+
+                       if (isBoss) {
+                           AOrionChar* curBossRef = nullptr;
+                           if (LastMacroTargetName[bot].find("Dragon") != std::string::npos) curBossRef = fangtooth;
+                           else if (LastMacroTargetName[bot].find("PrimeHelix") != std::string::npos) curBossRef = orbPrime;
+                           if (!curBossRef) curBossRef = bIsBlueTeam ? activeBossTargetBlue : activeBossTargetRed;
+                           if (curBossRef) bossExitPrevBossRef[bot] = curBossRef;
+                       } else {
+                           bossExitPrevBossRef.erase(bot);
+                       }
+                   }
+#endif
+
+                   LastKnownObjective[bot] = *reinterpret_cast<UBotObjective**>(
+                       reinterpret_cast<uintptr_t>(bot) + 0x0748);
+
+                   PrevTickV44Threatened[bot]    = bV44Threatened;
+                   PrevTickInsideEnemyTurret[bot] = bInsideEnemyTurretGlobal;
+                   PrevTickIsSafeToPush[bot]     = bIsSafeToPush;
+                   PrevTickIsFleeing[bot]        = bIsFleeing;
+                   PrevTickFrTowerM[bot]         = closestFriendlyTower ? (int)(sqrt(closestFriendlyTowerDistSq) / 100.0f) : -1;
+                   PrevTickEnTowerM[bot]         = bestEnemyTower ? (int)(sqrt(closestEnemyTowerDistSq) / 100.0f) : -1;
+                   PrevTickHeroDistM[bot]        = bestEnemyHero ? (int)(sqrt(closestEnemyHeroDistSq) / 100.0f) : -1;
+                   PrevTickVisEnemyBit[bot]      = botChar
+                       ? ((*reinterpret_cast<unsigned char*>(reinterpret_cast<char*>(botChar) + 0x07D4) >> (int)enemyTeam) & 1) : -1;
+                   WasAlive[bot]                 = true;
+                   if (ENABLE_R_DEFEND_CARRY && !bIsMeleeChar && !bIsJungler && (bRangedV44Lockbreak || bLanePushVetoActive))
+                       g_rdcRetreatT[bot] = matchTimeB;
+#if F4_LOG_LEVEL >= 1
+                   if (ENABLE_R_DEFEND_CARRY && !bIsMeleeChar && !bIsJungler && (bRangedV44Lockbreak || bLanePushVetoActive))
+                       g_rdcRetreatSrc[bot] = bRangedV44Lockbreak ? 1 : ((closestFriendlyTower && closestFriendlyTowerDistSq < TOWER_SAFE_SQ) ? 3 : 2);
+#endif
+
+
+
+
+                   {
+                       std::string cn = botChar->GetFullName();
+                       if (cn.length() > 30) cn = cn.substr(0, 30);
+                       LastBotCharName[bot] = cn;
+                   }
+
+                }
+
+            }
+        }
+
+
+
+    
+        while (GameplayAbilities::instantConfirmTasks.size() > 0) {
+            UOrionAbilityTask_StartTargeting* s13i_t = GameplayAbilities::instantConfirmTasks.back();
+            std::string s13i_ab;
+            if (s13i_t && s13i_t->Ability) s13i_ab = s13i_t->Ability->GetFullName();
+            const bool s13i_rev = GameplayAbilities::s13_NeedsForceDeliver(s13i_ab);
+            if (s13i_t && GameplayAbilities::g_nativeReceivedReplicatedTargetData && s13i_rev) {
+                reinterpret_cast<void(__fastcall*)(UOrionAbilityTask_StartTargeting*)>(
+                    GameplayAbilities::g_nativeReceivedReplicatedTargetData)(s13i_t);
+            }
+            else if (s13i_t) {
+                s13i_t->ConfirmOrWait();
+            }
+            GameplayAbilities::instantConfirmTasks.pop_back();
+        }
+
+        if (Globals::shouldStartMatch) {
+            numTicksWaitedToStartMatch++;
+
+            if (numTicksWaitedToStartMatch >= maxNumTicksWaitedToStartMatch) {
+                Globals::shouldStartMatch = false;
+                GameLogic::StartMatch();
+            }
+        }
+
+        unsigned long long currentTick = 0;
+        {
+            static uint64_t tickCounterPre = 0;
+            tickCounterPre++;
+            currentTick = tickCounterPre;
+
+        }
+
+        g_diagTickCounter++;
+
+
+        if (!g_liveLocks.empty()) {
+            const uintptr_t expectVtbl = Globals::ModuleBase + 0x3914aa0ull;
+            for (auto it = g_liveLocks.begin(); it != g_liveLocks.end(); ) {
+                if (g_diagTickCounter > it->expiryTick) {
+                    it = g_liveLocks.erase(it); continue;
+                }
+                uintptr_t td0 = s13_RefetchTd0(it->asc, it->handle, it->predkey);
+                if (!td0) {
+                    it = g_liveLocks.erase(it); continue;
+                }
+                if (IsBadReadPtr(reinterpret_cast<void*>(td0), 8)
+                    || *reinterpret_cast<uintptr_t*>(td0) != expectVtbl) { ++it; continue; }
+                if (it->actorIdx <= 0 || !UObject::GObjects || it->actorIdx >= UObject::GObjects->Num()) { ++it; continue; }
+                auto obj = UObject::GObjects->GetByIndex(it->actorIdx);
+                if (!obj || !IsValidUE4Object(obj) || !obj->IsA(AActor::StaticClass())) { ++it; continue; }
+                FVector live = reinterpret_cast<AActor*>(obj)->K2_GetActorLocation();
+                uintptr_t dst = td0 + it->dstOff;
+                if (!IsBadReadPtr(reinterpret_cast<void*>(dst), 12)) {
+                    *reinterpret_cast<float*>(dst + 0) = live.X;
+                    *reinterpret_cast<float*>(dst + 4) = live.Y;
+                    *reinterpret_cast<float*>(dst + 8) = live.Z;
+                    it->writes++;
+                }
+                ++it;
+            }
+        }
+
+
+
+
+        return SafeOrigGameEngineTick(origGameEngineTick, gameengine, deltatime, a3, currentTick, ShadowBots.size());
+    }
+
+    void* origApproveLogin = nullptr;
+    __int64 ApproveLoginHook(FString* options) {
+        std::cout << "Approved Login!" << std::endl;
+        return 0;
+    }
+
+    void* origStopDemo = nullptr;
+    void StopDemoHook(UDemoNetDriver* a1,
+        __int64 a2,
+        __int64 a3,
+        __int64 a4,
+        __int64 a5,
+        __int64 a6) {
+        return;
+    }
+
+    void* origDemoTickFlush = nullptr;
+    __int64 DemoTickFlushHook(UDemoNetDriver* a1, float a2) {
+        return 0;
+    }
+
+    void* origAIBotUpdateNearbyAlly = nullptr;
+    __int64 __fastcall AIBotUpdateNearbyAllyHook(AOrionAIBot* thisBot) {
+
+        for (AOrionAIBot* sb : ShadowBots) {
+            if (sb == thisBot) {
+                return 0;
+            }
+        }
+        return reinterpret_cast<__int64(__fastcall*)(AOrionAIBot*)>(origAIBotUpdateNearbyAlly)(thisBot);
+    }
+
+    void* origNewObjectStartTargeting = nullptr;
+    UOrionAbilityTask_StartTargeting* NewObjectStartTargetingHook(UObject* obj, FName* name, EGameplayTargetingConfirmation targetingType, int32_t idk) {
+        UOrionAbilityTask_StartTargeting* target = reinterpret_cast<UOrionAbilityTask_StartTargeting * (*)(UObject*, FName*, EGameplayTargetingConfirmation, int32_t)>(origNewObjectStartTargeting)(obj, name, targetingType, idk);
+
+        if (target) {
+
+            if (target->Ability && target->Ability->GetFullName().find("Primary") != std::string::npos) {
+                GameplayAbilities::instantConfirmTasks.push_back(target);
+            }
+            else {
+                bool wasPending = false;
+                if (target->AbilitySystemComponent) {
+                    const long long nowTick = g_diagTickCounter;
+                    for (auto it = GameplayAbilities::pendingConfirmASCs.begin();
+                        it != GameplayAbilities::pendingConfirmASCs.end(); ) {
+                        const long long age = nowTick - it->pushTick;
+                        if (age > GameplayAbilities::PENDING_TTL_TICKS) {
+                            it = GameplayAbilities::pendingConfirmASCs.erase(it);
+                            continue;
+                        }
+                        if (it->asc == target->AbilitySystemComponent) {
+                            GameplayAbilities::pendingConfirmASCs.erase(it);
+                            wasPending = true;
+                            break;
+                        }
+                        ++it;
+                    }
+                }
+
+                if (wasPending) {
+                    std::string _abFn = target->Ability ? target->Ability->GetFullName() : std::string();
+                    bool isBeamAbility = target->Ability && (
+                        _abFn.find("Vamp_Ultimate")         != std::string::npos ||
+                        _abFn.find("Wukong_Poke")           != std::string::npos ||
+                        _abFn.find("Grux_DoublePain")       != std::string::npos ||
+                        _abFn.find("Steel_Bash")            != std::string::npos ||
+                        _abFn.find("HyperBreach_DetCharge") != std::string::npos ||
+                        _abFn.find("Shrapnel_Ultimate")     != std::string::npos);
+                    if (isBeamAbility) {
+                        GameplayAbilities::targetingTasks.push_back(target);
+                    }
+                    else {
+                        GameplayAbilities::deferredConfirms.push_back({ target, 0 });
+                    }
+                }
+                else {
+                    GameplayAbilities::targetingTasks.push_back(target);
+                }
+            }
+        }
+
+        return target;
+    }
+
+    void* origReceivedTargetData = nullptr;
+    void __fastcall ReceivedTargetDataHook(UOrionAbilityTask_StartTargeting* Task) {
+        std::string s13r_ab;
+        if (Task && Task->Ability) s13r_ab = Task->Ability->GetFullName();
+        const bool s13r_rev = GameplayAbilities::s13_NeedsForceDeliver(s13r_ab);
+        if (Task && origReceivedTargetData && s13r_rev) {
+            reinterpret_cast<void(__fastcall*)(UOrionAbilityTask_StartTargeting*)>(origReceivedTargetData)(Task);
+        }
+        else {
+            Task->ConfirmOrWait();
+        }
+    }
+
+    void* origConfirmCb = nullptr;
+    __int64 __fastcall ConfirmCbProbeHook(__int64 a1) {
+        static const bool ENABLE_POP_FILL = true;
+        static const bool POP_FILL_SCOPED = false;
+        if (ENABLE_POP_FILL && a1 && !IsBadReadPtr(reinterpret_cast<void*>(a1), 0xB8)) {
+            uintptr_t tgtA = *reinterpret_cast<uintptr_t*>(a1 + 0xB0);
+            if (tgtA && !IsBadReadPtr(reinterpret_cast<void*>(tgtA), 0x6C8)) {
+                uintptr_t vt   = *reinterpret_cast<uintptr_t*>(tgtA);
+                uint8_t   md   = *reinterpret_cast<uint8_t*>(tgtA + 0x3C0);
+                int       num  = *reinterpret_cast<int*>(tgtA + 0x3E0);
+                int       maxc = *reinterpret_cast<int*>(tgtA + 0x3E4);
+                uintptr_t pf   = (vt && !IsBadReadPtr(reinterpret_cast<void*>(vt + 1584), 8))
+                               ? *reinterpret_cast<uintptr_t*>(vt + 1584) : 0;
+                if (md == 1 && num == 0 && maxc >= 1 && pf == Globals::ModuleBase + 0x3E90F0ull) {
+                    uintptr_t owner = *reinterpret_cast<uintptr_t*>(tgtA + 0x6B8);
+                    void* abilW = *reinterpret_cast<void**>(a1 + 0x68);
+                    if (owner && abilW && IsValidUE4Object(abilW)) {
+                        std::string anW = static_cast<UObject*>(abilW)->GetFullName();
+                        bool fdW = GameplayAbilities::s13_NeedsForceDeliver(anW);
+                        bool scopeOk = POP_FILL_SCOPED ? GameplayAbilities::s13_isWatchedHero(anW) : true;
+                        if (!fdW && scopeOk) {
+                            uintptr_t td0 = s13_RefetchTd0(reinterpret_cast<void*>(owner),
+                                                           g_lastSSRTHandle, static_cast<int32_t>(g_lastSSRTPredKey));
+                            void* actor = nullptr;
+                            if (td0 && !IsBadReadPtr(reinterpret_cast<void*>(td0), 8)
+                                && (*reinterpret_cast<uintptr_t*>(td0) - Globals::ModuleBase) == 0x3914aa0ull
+                                && !IsBadReadPtr(reinterpret_cast<void*>(td0 + 0x80), 4)) {
+                                uintptr_t arrD = *reinterpret_cast<uintptr_t*>(td0 + 0x78);
+                                int tnum = *reinterpret_cast<int*>(td0 + 0x80);
+                                if (arrD && tnum > 0 && !IsBadReadPtr(reinterpret_cast<void*>(arrD), 4)) {
+                                    int oi = *reinterpret_cast<int32_t*>(arrD);
+                                    if (oi > 0 && UObject::GObjects && oi < UObject::GObjects->Num()) {
+                                        auto o = UObject::GObjects->GetByIndex(oi);
+                                        if (o && IsValidUE4Object(o) && o->IsA(AActor::StaticClass())) actor = o;
+                                    }
+                                }
+                            }
+                            if (actor) {
+                                reinterpret_cast<__int64(__fastcall*)(uintptr_t, void*)>(
+                                    Globals::ModuleBase + 0x3CC140)(tgtA + 0x360, &actor);
+                                int newNum = (!IsBadReadPtr(reinterpret_cast<void*>(tgtA + 0x3E0), 4))
+                                           ? *reinterpret_cast<int*>(tgtA + 0x3E0) : -1;
+                                uintptr_t cdata = (!IsBadReadPtr(reinterpret_cast<void*>(tgtA + 0x3D8), 8))
+                                                ? *reinterpret_cast<uintptr_t*>(tgtA + 0x3D8) : 0;
+                                void* readBack = nullptr;
+                                if (newNum >= 1 && cdata
+                                    && !IsBadReadPtr(reinterpret_cast<void*>(cdata + 8ull * (newNum - 1)), 8))
+                                    readBack = *reinterpret_cast<void**>(cdata + 8ull * (newNum - 1));
+                                bool ok = (newNum == 1 && readBack == actor);
+                                if (!ok && !IsBadReadPtr(reinterpret_cast<void*>(tgtA + 0x3E0), 4))
+                                    *reinterpret_cast<int*>(tgtA + 0x3E0) = num;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        return reinterpret_cast<__int64(__fastcall*)(__int64)>(origConfirmCb)(a1);
+    }
+
+    void* origOnRemoteInstanceEnded = nullptr;
+    __int64 __fastcall OnRemoteInstanceEndedHook(__int64 a1) {
+        if (a1) {
+            UObject* abil = reinterpret_cast<UObject*>(a1);
+            std::string an = abil->GetFullName();
+            if (an.find("Wukong_Poke")          != std::string::npos ||
+                an.find("Price_SpreadShot")     != std::string::npos ||
+                an.find("Totem_SlowField")      != std::string::npos ||
+                an.find("WarDrum_Ultimate")     != std::string::npos ||
+                an.find("FallenAngel_Ascend")   != std::string::npos ||
+                an.find("FallenAngel_Chastise") != std::string::npos ||
+                an.find("Ghost_ScopedShot")     != std::string::npos ||
+                an.find("Shrapnel_Ultimate")    != std::string::npos ||
+                an.find("Ghost_TeleportTarget") != std::string::npos ||
+                an.find("Mambo_StabDoll")       != std::string::npos) {
+                *reinterpret_cast<uint8_t*>(a1 + 0x2A8) = 1;
+                return 0;
+            }
+        }
+        return reinterpret_cast<__int64(__fastcall*)(__int64)>(origOnRemoteInstanceEnded)(a1);
+    }
+
+    void* origLogin = nullptr;
+    APlayerController* LoginHook(AOrionGameMode_MOBA* GameMode, UPlayer* player, ENetRole role, FString* portal, FString* options, FUniqueNetIdRepl* NetID, FString* err) {
+        APlayerController* ret = reinterpret_cast<APlayerController* (*)(AOrionGameMode_MOBA * GameMode, UPlayer * player, ENetRole role, FString * portal, FString * options, FUniqueNetIdRepl * NetID, FString * err)>(origLogin)(GameMode, player, role, portal, options, NetID, err);
+
+
+        std::wstring optionsWString(options->Data);
+
+        std::string optionsString(optionsWString.begin(), optionsWString.end());
+
+        PlayerInfo info = PlayerInfo();
+
+        info.hero = optionsString.substr(optionsString.find("?hero=") + std::string("?hero=").size());
+        info.hero = info.hero.substr(0, info.hero.find("?"));
+
+        info.name = optionsString.substr(optionsString.find("?displayname=") + std::string("?displayname=").size());
+        info.name = info.name.substr(0, info.name.find("?"));
+
+        info.team = optionsString.substr(optionsString.find("?team=") + std::string("?team=").size());
+        info.team = info.team.substr(0, info.team.find("?"));
+
+        {
+            size_t rolePos = optionsString.find("?role=");
+            if (rolePos != std::string::npos) {
+                info.role = optionsString.substr(rolePos + std::string("?role=").size());
+                info.role = info.role.substr(0, info.role.find("?"));
+            }
+        }
+
+        {
+            size_t skinPos = optionsString.find("?skin=");
+            if (skinPos != std::string::npos) {
+                info.skin = optionsString.substr(skinPos + std::string("?skin=").size());
+                info.skin = info.skin.substr(0, info.skin.find("?"));
+            }
+        }
+
+        {
+            size_t deckPos = optionsString.find("?deck=");
+            if (deckPos != std::string::npos) {
+                info.deck = optionsString.substr(deckPos + std::string("?deck=").size());
+                info.deck = info.deck.substr(0, info.deck.find("?"));
+            }
+        }
+
+        std::cout << info.hero << std::endl;
+        std::cout << info.name << std::endl;
+        std::cout << info.team << std::endl;
+        if (!info.role.empty()) std::cout << "[LOGIN] role=" << info.role << std::endl;
+        if (!info.skin.empty()) std::cout << "[LOGIN] skin=" << info.skin << std::endl;
+        if (!info.deck.empty()) std::cout << "[LOGIN] deck=" << info.deck << std::endl;
+
+        playerInfoArray.push_back(std::pair<APlayerController*, PlayerInfo>(ret, info));
+
+        return ret;
+    }
+
+
+    void* origTArrayRemoveSound = nullptr;
+    bool TArrayRemoveSoundHook(__int64 a1, __int64 a2) {
+        return 1;
+    }
+
+    static UOrionHeroData* botHeroDataOverride = nullptr;
+
+    void* origSpawnActor = nullptr;
+    AActor* SpawnActorHook(UWorld* a1, UClass* a2, FVector* a3, FRotator* a4) {
+        if (a2) {
+            std::string className = a2->GetName();
+            if (className.find("Ice_Decoy") != std::string::npos) {
+                return nullptr;
+            }
+        }
+
+        AActor* ret = reinterpret_cast<AActor * (*)(UWorld*, UClass*, FVector*, FRotator*)>(origSpawnActor)(a1, a2, a3, a4);
+        if (botHeroDataOverride) {
+            FOrionHeroDataSpec spec = FOrionHeroDataSpec();
+            spec.HeroData = botHeroDataOverride;
+            spec.Skin = botHeroDataOverride->DefaultSkin;
+            reinterpret_cast<AOrionPlayerState_Base*>(ret)->HeroDataSpec = spec;
+            botHeroDataOverride = nullptr;
+        }
+        return ret;
+    }
+    void* origSpawnBot = nullptr;
+    AOrionAIBot* SpawnBotHook(UOrionAISystem* a1, UOrionHeroData* a2, EOrionTeam a3, EAIBotDifficulty a4, FVector a5, FRotator a6) {
+        botHeroDataOverride = a2;
+        return reinterpret_cast<AOrionAIBot * (*)(UOrionAISystem * a1, UOrionHeroData * a2, EOrionTeam a3, EAIBotDifficulty a4, FVector a5, FRotator a6)>(origSpawnBot)(a1, a2, a3, a4, a5, a6);
+
+
+    }
+
+
+
+    void* origTeamBuilderInfo = nullptr;
+    bool TeamBuilderInfoCheck(AOrionTeamInfo* a1) {
+
+        return Globals::overrideTeamBuilderInfoCheck && (a1->TeamIndex == EOrionTeam::TeamRed || a1->TeamIndex == EOrionTeam::TeamBlue);
+    }
+
+
+    void InitHooking() {
+        MH_Initialize();
+
+        void* ProcessEventHookLocal = (void*)(Globals::ModuleBase + PLOffsets::PROCESSEVENT);
+
+        MH_CreateHook(ProcessEventHookLocal, reinterpret_cast<void*>(ProcessEventHook), &origProcessEvent);
+
+        MH_EnableHook(ProcessEventHookLocal);
+
+
+        void* statManagerCrashHook = (void*)(Globals::ModuleBase + PLOffsets::STATMANAGER_CRASH);
+
+        MH_CreateHook(statManagerCrashHook, reinterpret_cast<void*>(StatManagerCrashHook), &origStatManagerCrash);
+
+        MH_EnableHook(statManagerCrashHook);
+
+        void* destroyActor = (void*)(Globals::ModuleBase + PLOffsets::UWORLD_DESTROY_ACTOR);
+        MH_CreateHook(destroyActor, reinterpret_cast<void*>(DestroyActorHook), &origDestroyActor);
+        MH_EnableHook(destroyActor);
+
+
+        void* tickFlushHook = (void*)(Globals::ModuleBase + PLOffsets::NETDRIVER_TICKFLUSH);
+
+        MH_CreateHook(tickFlushHook, reinterpret_cast<void*>(NetDriverTickFlushHook), &origNetDriverTickFlush);
+
+        MH_EnableHook(tickFlushHook);
+
+        void* postLoginHook = (void*)(Globals::ModuleBase + PLOffsets::GAMEMODE_MOBA_POSTLOGIN);
+
+        MH_CreateHook(postLoginHook, reinterpret_cast<void*>(GameModeMOBAPostLogin), &origGameModeMOBAPostLogin);
+
+        MH_EnableHook(postLoginHook);
+
+        void* notifyAcceptingConnection = (void*)(Globals::ModuleBase + PLOffsets::NOTIFY_ACCEPTING_CONNECTION);
+
+        MH_CreateHook(notifyAcceptingConnection, reinterpret_cast<void*>(NotifyAcceptingConnectionHook), &origNotifyAcceptingConnection);
+
+        MH_EnableHook(notifyAcceptingConnection);
+
+        void* notifyAcceptedConnection = (void*)(Globals::ModuleBase + PLOffsets::NOTIFY_ACCEPTED_CONNECTION);
+
+        MH_CreateHook(notifyAcceptedConnection, reinterpret_cast<void*>(NotifyAcceptedConnectionHook), &origNotifyAcceptedConnection);
+
+        MH_EnableHook(notifyAcceptedConnection);
+
+        void* notifyAcceptingChannel = (void*)(Globals::ModuleBase + PLOffsets::NOTIFY_ACCEPTING_CHANNEL);
+
+        MH_CreateHook(notifyAcceptingChannel, reinterpret_cast<void*>(NotifyAcceptingChannelHook), &origNotifyAcceptingChannel);
+
+        MH_EnableHook(notifyAcceptingChannel);
+
+        void* notifyControlMessage = (void*)(Globals::ModuleBase + PLOffsets::NOTIFY_CONTROL_MESSAGE);
+
+        MH_CreateHook(notifyControlMessage, reinterpret_cast<void*>(NotifyControlMessage), &origNotifyControlMessage);
+
+        MH_EnableHook(notifyControlMessage);
+
+
+        void* canRestartPlayer = (void*)(Globals::ModuleBase + PLOffsets::CAN_RESTART_PLAYER);
+
+        MH_CreateHook(canRestartPlayer, reinterpret_cast<void*>(CanRestartPlayerHook), &origCanRestartPlayer);
+
+        MH_EnableHook(canRestartPlayer);
+
+        void* collectGarbage = (void*)(Globals::ModuleBase + PLOffsets::COLLECT_GARBAGE);
+
+        MH_CreateHook(collectGarbage, reinterpret_cast<void*>(CollectGarbageHook), &origCollectGarbage);
+
+        MH_EnableHook(collectGarbage);
+
+        void* gameEngineTick = (void*)(Globals::ModuleBase + PLOffsets::GAME_ENGINE_TICK);
+
+        MH_CreateHook(gameEngineTick, reinterpret_cast<void*>(GameEngineTickHook), &origGameEngineTick);
+
+        MH_EnableHook(gameEngineTick);
+
+        void* aibotUpdateNearbyAlly = (void*)(Globals::ModuleBase + PLOffsets::AIBOT_UPDATE_NEARBY_ALLY);
+        MH_CreateHook(aibotUpdateNearbyAlly, reinterpret_cast<void*>(AIBotUpdateNearbyAllyHook), &origAIBotUpdateNearbyAlly);
+        MH_EnableHook(aibotUpdateNearbyAlly);
+        std::cout << "[INIT] AIBot-UpdateNearbyAlly-Hook installiert (RVA 0x450950)" << std::endl;
+
+        void* approveLogin = (void*)(Globals::ModuleBase + PLOffsets::APPROVE_LOGIN);
+
+        MH_CreateHook(approveLogin, reinterpret_cast<void*>(ApproveLoginHook), &origApproveLogin);
+
+        MH_EnableHook(approveLogin);
+
+        void* stopDemo = (void*)(Globals::ModuleBase + PLOffsets::STOP_DEMO);
+
+        MH_CreateHook(stopDemo, reinterpret_cast<void*>(StopDemoHook), &origStopDemo);
+
+        MH_EnableHook(stopDemo);
+
+        void* demoTickFlush = (void*)(Globals::ModuleBase + PLOffsets::DEMO_TICK_FLUSH);
+
+        MH_CreateHook(demoTickFlush, reinterpret_cast<void*>(DemoTickFlushHook), &origDemoTickFlush);
+
+        MH_EnableHook(demoTickFlush);
+
+        void* startTargeting = (void*)(Globals::ModuleBase + PLOffsets::NEW_OBJECT_START_TARGETING);
+
+        MH_CreateHook(startTargeting, reinterpret_cast<void*>(NewObjectStartTargetingHook), &origNewObjectStartTargeting);
+
+        MH_EnableHook(startTargeting);
+
+        void* receivedTargetData = (void*)(Globals::ModuleBase + 0x3D30C0);
+        MH_CreateHook(receivedTargetData, reinterpret_cast<void*>(ReceivedTargetDataHook), &origReceivedTargetData);
+        MH_EnableHook(receivedTargetData);
+        GameplayAbilities::g_nativeReceivedReplicatedTargetData = origReceivedTargetData;
+
+        void* confirmCb = (void*)(Globals::ModuleBase + 0x3D3200);
+        MH_CreateHook(confirmCb, reinterpret_cast<void*>(ConfirmCbProbeHook), &origConfirmCb);
+        MH_EnableHook(confirmCb);
+
+        void* onRemoteInstanceEnded = (void*)(Globals::ModuleBase + 0x3188E10);
+        MH_CreateHook(onRemoteInstanceEnded, reinterpret_cast<void*>(OnRemoteInstanceEndedHook), &origOnRemoteInstanceEnded);
+        MH_EnableHook(onRemoteInstanceEnded);
+
+        void* loginHook = (void*)(Globals::ModuleBase + PLOffsets::LOGIN);
+
+        MH_CreateHook(loginHook, reinterpret_cast<void*>(LoginHook), &origLogin);
+
+        MH_EnableHook(loginHook);
+
+
+        void* uchannelCleanup = (void*)(Globals::ModuleBase + PLOffsets::UCHANNEL_CLEANUP);
+
+        MH_CreateHook(uchannelCleanup, reinterpret_cast<void*>(TArrayRemoveSoundHook), &origTArrayRemoveSound);
+
+        MH_EnableHook(uchannelCleanup);
+
+        void* gameModeCanRestartPlayer = (void*)(Globals::ModuleBase + PLOffsets::GAME_MODE_CAN_RESTART_PLAYER);
+
+        MH_CreateHook(gameModeCanRestartPlayer, reinterpret_cast<void*>(GameModeCanRestartPlayer), &origGameModeCanRestartPlayer);
+
+        MH_EnableHook(gameModeCanRestartPlayer);
+
+        void* uworldSpawnActor = (void*)(Globals::ModuleBase + PLOffsets::UWORLD_SPAWN_ACTOR);
+
+        MH_CreateHook(uworldSpawnActor, reinterpret_cast<void*>(SpawnActorHook), &origSpawnActor);
+
+        MH_EnableHook(uworldSpawnActor);
+
+        void* spawnBot = (void*)(Globals::ModuleBase + PLOffsets::AISYSTEM_SPAWN_BOT);
+
+        MH_CreateHook(spawnBot, reinterpret_cast<void*>(SpawnBotHook), &origSpawnBot);
+
+       MH_EnableHook(spawnBot);
+
+        void* teamBuilderInfo = (void*)(Globals::ModuleBase + PLOffsets::HAS_TEAM_BUILDER_INFO);
+
+        MH_CreateHook(teamBuilderInfo, reinterpret_cast<void*>(TeamBuilderInfoCheck), &origTeamBuilderInfo);
+
+        MH_EnableHook(teamBuilderInfo);
+    }
+}
+
+class TeeStreamBuf : public std::streambuf {
+public:
+    TeeStreamBuf(std::streambuf* a, std::streambuf* b) : m_a(a), m_b(b) {}
+protected:
+    int overflow(int c) override {
+        if (c == traits_type::eof()) return c;
+        int r1 = m_a ? m_a->sputc(static_cast<char>(c)) : c;
+        int r2 = m_b ? m_b->sputc(static_cast<char>(c)) : c;
+        return (r1 == traits_type::eof() || r2 == traits_type::eof()) ? traits_type::eof() : c;
+    }
+    std::streamsize xsputn(const char* s, std::streamsize n) override {
+        std::streamsize r1 = m_a ? m_a->sputn(s, n) : n;
+        std::streamsize r2 = m_b ? m_b->sputn(s, n) : n;
+        return (r1 < r2) ? r1 : r2;
+    }
+    int sync() override {
+        int r1 = m_a ? m_a->pubsync() : 0;
+        int r2 = m_b ? m_b->pubsync() : 0;
+        return (r1 != 0 || r2 != 0) ? -1 : 0;
+    }
+private:
+    std::streambuf* m_a;
+    std::streambuf* m_b;
+};
+
+void InitConsole() {
+    AllocConsole();
+    FILE* fc = nullptr;
+    freopen_s(&fc, "CONOUT$", "w", stdout);
+
+    char logPath[MAX_PATH] = { 0 };
+    HMODULE hSelf = nullptr;
+    GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                       reinterpret_cast<LPCSTR>(&InitConsole), &hSelf);
+    DWORD n = hSelf ? GetModuleFileNameA(hSelf, logPath, MAX_PATH) : 0;
+    if (n > 0 && n < MAX_PATH) {
+        char* slash = strrchr(logPath, '\\');
+        if (slash) strcpy_s(slash + 1, MAX_PATH - static_cast<size_t>(slash + 1 - logPath), "debugger.txt");
+        else       strcpy_s(logPath, MAX_PATH, "debugger.txt");
+    } else {
+        strcpy_s(logPath, MAX_PATH, "debugger.txt");
+    }
+    static std::ofstream* logFile = new std::ofstream(logPath, std::ios::out | std::ios::trunc);
+    if (logFile && logFile->is_open()) {
+        static TeeStreamBuf* tee = new TeeStreamBuf(std::cout.rdbuf(), logFile->rdbuf());
+        std::cout.rdbuf(tee);
+    }
+}
+
+void OnMatchInit() {
+    std::cout << "Setting up teams..." << std::endl;
+    GameLogic::SetupTeams();
+
+    std::cout << "Hiding loading screen..." << std::endl;
+    GameLogic::HideLoadingScreen();
+
+    std::cout << "Listening for connections..." << std::endl;
+    Networking::Listen();
+}
+
+void OnGameInit() {
+    EngineLogic::EnableGameConsole();
+
+    std::cout << "Loading map..." << std::endl;
+    EngineLogic::LoadMap(L"Monolith02", L"game=/Game/GameTypes/BP_GMM_BaseMOBA.BP_GMM_BaseMOBA_C");
+
+}
+
+void Main() {
+
+    InitConsole();
+
+    Globals::ModuleBase = (uintptr_t)GetModuleHandleA("OrionClient-Win64-Shipping-Server.exe");
+
+    Hooking::InitHooking();
+
+
+    Sleep(1 * 1000 * 1000 * 1000);
+
+    while (true) {
+
+    }
+}
+
+BOOL APIENTRY DllMain( HMODULE hModule,
+                       DWORD  ul_reason_for_call,
+                       LPVOID lpReserved
+                     )
+{
+    if (ul_reason_for_call == DLL_PROCESS_ATTACH) {
+        std::thread t(Main);
+
+        t.detach();
+    }
+}
