@@ -363,30 +363,43 @@ namespace Hooking {
 
     void* origBrowse = nullptr;
     __int64 UEngineBrowseHook(void* UEngine, void* WorldContext, FURL& URL, FString& Error) {
+        bool blocked = false;
+        std::string ops;
         for (FString op: URL.Op) {
-            if (op.ToString().find("closed") != std::string::npos) {
-                return 0;
+            std::string s = op.ToString();
+            if (s.find("closed") != std::string::npos) blocked = true;
+            ops += s; ops += ";";
+        }
+        // Join diagnostics: log every Browse call (URL parts + decision).
+        {
+            FILE* mf = fopen("/tmp/client_marker_browse.txt", "a");
+            if (mf) {
+                fprintf(mf, "Browse tick=%lu host='%s' port=%d map='%s' ops=[%s] %s\n",
+                        GetTickCount(), URL.Host.ToString().c_str(), (int)URL.Port,
+                        URL.Map.ToString().c_str(), ops.c_str(), blocked ? "BLOCKED" : "passed");
+                fclose(mf);
             }
         }
+        if (blocked) return 0;
 
         return reinterpret_cast<__int64(*)(void*, void*, FURL&, FString&)>(origBrowse)(UEngine, WorldContext, URL, Error);
     }
 
     void* origSetUIState = 0;
 
-    // --- connect gating ------------------------------------------------------
-    // "open <ip>" is only honored once the client left InitialPreload. Issued
-    // during InitialPreload (as OnGameInit used to do) it is silently dropped
-    // by the engine - under Wine the boot is slow enough that this ALWAYS
-    // happened, so the join never connected. Offline under Wine the client
-    // parks on the EOS Login screen (state 3) and never reaches Title(2)/
-    // FrontEnd(5), so fire on the FIRST post-preload state of any kind;
-    // MainLoop keeps a fallback timer.
-    volatile LONG g_connectFired = 0;
+    // --- connect / join tracking ---------------------------------------------
+    // The first "open" fires at startup (OnGameInit, like upstream). If the
+    // engine drops it in the current UI state (observed under Wine), the
+    // MainLoop watchdog retries every 45 s until the local PlayerController
+    // appears or 4 attempts are used up.
+    volatile LONG g_connectAttempts = 0;   // "open" commands actually executed
+    volatile DWORD s_lastConnectTick = 0;  // tick of last attempt (game thread)
+    volatile int s_currentUIState = -1;    // last state seen by SetUIStateHook
     static int s_lastLoggedUIState = -1;
 
     bool SetUIStateHook(__int64 manager, EOrionUIState state) {
         Globals::UIManager = manager;
+        s_currentUIState = (int)state;
 
         if ((int)state != s_lastLoggedUIState) {
             s_lastLoggedUIState = (int)state;
@@ -394,14 +407,8 @@ namespace Hooking {
             if (mf) { fprintf(mf, "SetUIState state=%d tick=%lu\n", (int)state, GetTickCount()); fclose(mf); }
         }
 
-        if (state != EOrionUIState::Invalid && state != EOrionUIState::InitialPreload &&
-            InterlockedCompareExchange(&g_connectFired, 1, 0) == 0) {
-            std::cout << "[CLIENT] UI-State " << (int)state
-                      << " (post-preload) erreicht - verbinde jetzt mit Match-Server..." << std::endl;
-            { FILE* mf = fopen("/tmp/client_marker_title.txt", "w");
-              if (mf) { fprintf(mf, "title trigger fired state=%d tick=%lu\n", (int)state, GetTickCount()); fclose(mf); } }
-            ProcInGameThread(reinterpret_cast<void*>(ConnectToMatch));
-        }
+        // The join is triggered by OnGameInit (startup) and retried by the
+        // MainLoop watchdog - see there for the rationale.
 
         std::cout << "CHANGING UI STATE" << std::endl;
 
@@ -465,8 +472,11 @@ void InitConsole() {
 }
 
 void ConnectToMatch() {
+    long attempt = InterlockedIncrement(&Hooking::g_connectAttempts);
+    Hooking::s_lastConnectTick = GetTickCount();
     { FILE* mf = fopen("/tmp/client_marker_connect.txt", "w");
-      if (mf) { fprintf(mf, "ConnectToMatch running tick=%lu\n", GetTickCount()); fclose(mf); } }
+      if (mf) { fprintf(mf, "ConnectToMatch running tick=%lu attempt=%ld\n", GetTickCount(), attempt); fclose(mf); } }
+    std::cout << "[CLIENT] ConnectToMatch - Versuch #" << attempt << std::endl;
     std::ifstream config("config.json");
     std::stringstream sstream;
     std::string configString;
@@ -541,11 +551,11 @@ void ConnectToMatch() {
 void OnGameInit() {
     std::cout << "Enabling game console..." << std::endl;
     EngineLogic::EnableGameConsole();
-    // NOTE: ConnectToMatch is deliberately NOT fired here. The engine drops
-    // "open <ip>" while the client is still in InitialPreload (always the case
-    // under Wine). It is triggered from Hooking::SetUIStateHook on the first
-    // post-preload UI state (offline that is the Login screen), with a
-    // fallback timer in MainLoop.
+    // Fire the join at startup, like upstream does. If the engine drops it
+    // in the current UI state (observed under Wine), the MainLoop watchdog
+    // retries every 45 s until the local PlayerController appears or 4
+    // attempts are used up.
+    Hooking::ProcInGameThread(reinterpret_cast<void*>(ConnectToMatch));
 }
 
 void SetUIToInGame() {
@@ -756,16 +766,16 @@ void MainLoop() {
     bool hackApplied = false;
 
     while (true) {
-        // Fallback: if the UI-state trigger never fired (state transition
-        // missed or set before the hook was installed), connect once after 3 min.
-        if (Hooking::g_connectFired == 0) {
-            static DWORD s_mainLoopStart = 0;
-            if (!s_mainLoopStart) s_mainLoopStart = GetTickCount();
-            else if (GetTickCount() - s_mainLoopStart > 180000) {
-                InterlockedExchange(&Hooking::g_connectFired, 1);
-                std::cout << "[CLIENT] Fallback: UI-State-Trigger nie gefeuert - verbinde jetzt..." << std::endl;
-                Hooking::ProcInGameThread(reinterpret_cast<void*>(ConnectToMatch));
-            }
+        // Join watchdog: retry "open" every 45 s until the local
+        // AOrionPlayerController_Game exists (join completed) or 4 attempts
+        // are used up. The first attempt fires at startup (OnGameInit); under
+        // Wine it can be dropped depending on the current UI state, so the
+        // retries from later states are what complete the join.
+        if (!hackApplied && Hooking::g_connectAttempts < 4 && Hooking::s_lastConnectTick != 0 &&
+            GetTickCount() - Hooking::s_lastConnectTick > 45000) {
+            std::cout << "[CLIENT] Kein PlayerController nach Versuch #"
+                      << Hooking::g_connectAttempts << " - wiederhole open..." << std::endl;
+            Hooking::ProcInGameThread(reinterpret_cast<void*>(ConnectToMatch));
         }
 
         if (!hackApplied) {
@@ -785,6 +795,21 @@ void MainLoop() {
                         Hooking::ProcInGameThread(reinterpret_cast<void*>(SetUIToInGame));
                         hackApplied = true;
                         break;
+                    }
+                }
+
+                // Join diagnostics: dump status every 10 s while still waiting
+                // for the local PlayerController (no F7 needed).
+                static DWORD s_lastJoinDump = 0;
+                if (GetTickCount() - s_lastJoinDump > 10000) {
+                    s_lastJoinDump = GetTickCount();
+                    FILE* mf = fopen("/tmp/client_marker_join.txt", "a");
+                    if (mf) {
+                        fprintf(mf, "tick=%lu uiState=%d attempts=%ld pc=%d playerstate=%d\n",
+                                GetTickCount(), Hooking::s_currentUIState,
+                                (long)Hooking::g_connectAttempts,
+                                PC ? 1 : 0, (PC && PC->PlayerState) ? 1 : 0);
+                        fclose(mf);
                     }
                 }
             }

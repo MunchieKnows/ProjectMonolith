@@ -325,5 +325,12 @@ echo
 # -noepicportal / -skippatchcheck are REQUIRED under Wine (the Epic handshake
 # cannot complete); the Client DLL reads ip/hero/etc. from config.json in CWD.
 echo "Launching client (Ctrl+C to stop)..."
+# Clear previous run's join-diagnostic markers so this run starts fresh:
+#   /tmp/client_marker_states.txt  UI state transitions
+#   /tmp/client_marker_browse.txt  every engine Browse call (join travel)
+#   /tmp/client_marker_connect.txt last "open" attempt + command
+#   /tmp/client_marker_join.txt    periodic join status (PC/PlayerState)
+rm -f /tmp/client_marker_states.txt /tmp/client_marker_browse.txt \
+      /tmp/client_marker_connect.txt /tmp/client_marker_join.txt
 WINEPREFIX="$WINE_PREFIX" WINEDLLOVERRIDES="mscoree,mshtml=" WINEDEBUG=-all \
     exec "$WINE_BIN" "$CLIENTEXE" -noepicportal -skippatchcheck

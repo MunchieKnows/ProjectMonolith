@@ -4196,7 +4196,7 @@ namespace Hooking {
                 if (automationTimer >= 20.0f && !frankensteinTriggered) {
                     frankensteinTriggered = true;
                     std::cout << "[HOST] Automatik (20s): Ernte Karten von Schatten-Bots..." << std::endl;
-                    Hooking::ProcInGameThread(StealBotDeckForHumans);
+                    Hooking::ProcInGameThread(reinterpret_cast<void*>(StealBotDeckForHumans));
                 }
 
             if (automationTimer >= 55.0f && !aiCommanderTriggered) {
