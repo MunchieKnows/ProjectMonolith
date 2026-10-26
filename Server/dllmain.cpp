@@ -2853,6 +2853,7 @@ namespace Hooking {
         static bool mapInit = false;
         static bool waitingForMatchInit = false;
         static float matchInitTimer = 0.0f;
+        static ULONGLONG matchInitDeadline = 0;
 
         static const bool ENABLE_AUTO_MAPLOAD = true;
         static const float AUTO_MAPLOAD_DELAY = 3.0f;
@@ -2897,16 +2898,25 @@ namespace Hooking {
                 std::cout << "[HOST] F8 gedrueckt: Map laedt. Starte 20-Sekunden-Timer fuer MatchInit..." << std::endl;
 
             waitingForMatchInit = true;
+            // Wall-clock deadline: under Wine the engine's tick rate collapses
+            // while it waits for the map load, so the game-time timer below can
+            // stall for minutes and OnMatchInit (which opens UDP 7777) never
+            // runs. The async asset loaders run on their own threads and finish
+            // within this window, so real time is a safe trigger. Windows
+            // behavior is unchanged: the game-time timer fires first as before.
+            matchInitDeadline = GetTickCount64() + 15000;
         }
 
         if (waitingForMatchInit && !mapInit) {
             matchInitTimer += deltatime;
 
-            if (matchInitTimer >= 10.0f) {
+            bool due = matchInitTimer >= 10.0f || GetTickCount64() >= matchInitDeadline;
+            if (due) {
                 mapInit = true;
                 waitingForMatchInit = false;
 
-                std::cout << "[HOST] 20 Sekunden vergangen: OnMatchInit() wird jetzt automatisch ausgefuehrt!" << std::endl;
+                std::cout << "[HOST] MatchInit-Timer erreicht (game-time=" << matchInitTimer
+                          << " s, wall-clock-Fallback aktiviert) - OnMatchInit() wird jetzt automatisch ausgefuehrt!" << std::endl;
                 OnMatchInit();
             }
         }
