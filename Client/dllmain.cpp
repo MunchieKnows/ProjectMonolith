@@ -550,6 +550,9 @@ void OnGameInit() {
 
 void SetUIToInGame() {
     GameLogic::SetUIState(EOrionUIState::Match);
+    // Clear any stuck loading screen (e.g. the Mode 7 "ReturnToMainMenu" one that
+    // appears when the join is slow under Wine) now that we're in the Match UI.
+    GameLogic::HideLoadingScreen();
     std::cout << "[CLIENT] UI State auf Match gesetzt!" << std::endl;
 
 
@@ -770,15 +773,17 @@ void MainLoop() {
             if (PC && PC->PlayerState) {
                 for (UOrionItemizationComponent* Comp : SDKUtils::GetAllObjectsOfType<UOrionItemizationComponent>()) {
                     if (Comp && reinterpret_cast<UObject*>(Comp)->Outer == PC->PlayerState) {
+                        // Wine: the deck (AllCards) can populate slowly or not at all, which
+                        // used to keep this trigger from ever firing and left the client stuck
+                        // on the loading screen. Fire once the itemization component exists;
+                        // SetUIToInGame's card fixup is guarded and the periodic
+                        // FixClientCardSpecs below catches up when cards arrive.
+                        std::cout << "[CLIENT] ItemizationComponent gefunden - wechsle UI auf Match..." << std::endl;
 
-                        if (Comp->AllCards.Data && Comp->AllCards.NumElements > 0) {
-                            std::cout << "[CLIENT] Server-Karten entdeckt! Warte 2 Sekunden auf Netzwerk-Sync..." << std::endl;
+                        Sleep(2000);
 
-                            Sleep(2000);
-
-                            Hooking::ProcInGameThread(reinterpret_cast<void*>(SetUIToInGame));
-                            hackApplied = true;
-                        }
+                        Hooking::ProcInGameThread(reinterpret_cast<void*>(SetUIToInGame));
+                        hackApplied = true;
                         break;
                     }
                 }
