@@ -1108,6 +1108,7 @@ namespace Networking {
 
             for (FNetworkObjectInfo* actorInfo : ConsiderList) {
                 AActor* Actor = actorInfo->actor;
+                if (!Actor || (uintptr_t)Actor == ~(uintptr_t)0) continue;
 
                 UActorChannel* Channel = nullptr;
 
@@ -1115,7 +1116,10 @@ namespace Networking {
                 for (ConnectionChannels ccs : connectionChannels) {
                     if (ccs.connection == connection) {
                         for (UActorChannel* ch : *ccs.channels) {
-                            if (ch->Actor == Actor) {
+                            // channel entries can hold a -1 sentinel when native
+                            // channel creation failed (real client connections);
+                            // never dereference those.
+                            if (ch && (uintptr_t)ch != ~(uintptr_t)0 && ch->Actor == Actor) {
                                 Channel = ch;
                                 break;
                             }
@@ -1123,7 +1127,7 @@ namespace Networking {
                         break;
                     }
                 }
-                
+
 
                 if (Actor->NetTag != NetTag) {
                     Actor->NetTag = NetTag;
@@ -1152,6 +1156,8 @@ namespace Networking {
 
         for (int j = 0; j < PriorityActors.size(); j++) {
             UActorChannel* Channel = PriorityActors[j].channel;
+            // -1 sentinel from a failed native channel creation: treat as no channel
+            if ((uintptr_t)Channel == ~(uintptr_t)0) Channel = nullptr;
 
             if (!Channel || Channel->Actor) {
                 AActor* Actor = PriorityActors[j].actor;
@@ -1170,7 +1176,7 @@ namespace Networking {
                 if (Channel == nullptr && Actor) {
                     Channel = reinterpret_cast<UActorChannel * (*)(UNetConnection*, EChannelType, bool, int)>(Globals::ModuleBase + PLOffsets::CREATE_CHANNEL)(Connection, EChannelType::CHTYPE_Actor, true, -1);
 
-                    if (Channel) {
+                    if (Channel && (uintptr_t)Channel != ~(uintptr_t)0) {
                         reinterpret_cast<void(*)(UActorChannel*, AActor*)>(Globals::ModuleBase + PLOffsets::SET_CHANNEL_ACTOR)(Channel, Actor);
 
                         bool found = false;
@@ -1282,7 +1288,7 @@ namespace Networking {
                 continue;
             }
 
-            if (Connection->PlayerController) {
+            if (Connection->PlayerController && (uintptr_t)Connection->PlayerController != ~(uintptr_t)0) {
                 reinterpret_cast<void(*)(APlayerController*)>(Globals::ModuleBase + PLOffsets::SEND_CLIENT_ADJUSTMENT)(Connection->PlayerController);
             }
 
@@ -2164,7 +2170,26 @@ namespace Hooking {
     void NetDriverTickFlushHook(__int64 NetDriver, float DeltaTime) {
         reinterpret_cast<void(*)(__int64, float)>(origNetDriverTickFlush)(NetDriver, DeltaTime);
 
-        Networking::ServerReplicateActors();
+        // Wine compatibility: with real client connections the extra monolith
+        // replication pass corrupts engine state under Wine (native channel
+        // creation yields garbage pointers; even contained faults leave the
+        // engine half-modified and it dies later). The Linux launchers set
+        // PM_NO_EXTRA_REPL=1 to disable the pass; NATIVE engine replication
+        // (run above) carries the real session. Default stays enabled so
+        // Windows behavior is unchanged.
+        static int s_extraRepl = -1;
+        if (s_extraRepl < 0) {
+            const char* e = getenv("PM_NO_EXTRA_REPL");
+            s_extraRepl = (e && *e && atoi(e) != 0) ? 0 : 1;
+        }
+        if (!s_extraRepl) return;
+
+        // Contain ANY exception here regardless: a failing extra pass must
+        // never abort the engine tick.
+        __try {
+            Networking::ServerReplicateActors();
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER) {}
     }
 
     struct PlayerInfo {
@@ -2813,6 +2838,9 @@ namespace Hooking {
                 for (int i = 0; i < Networking::GetNetDriver()->ClientConnections.Count(); i++) {
                     UNetConnection* conn = Networking::GetNetDriver()->ClientConnections[i];
                     if (conn && conn->PlayerController) {
+                        { FILE* mf = fopen("/tmp/server_marker_player.txt", "w");
+                          if (mf) { fprintf(mf, "client connection WITH PlayerController seen tick=%lu count=%d\n",
+                                           GetTickCount(), (int)Networking::GetNetDriver()->ClientConnections.Count()); fclose(mf); } }
                         InstallUnPossessHook(reinterpret_cast<AController*>(conn->PlayerController));
                         break;
                     }
@@ -14763,15 +14791,47 @@ void Main() {
     }
 }
 
+// --- thread start that is safe in DllMain ------------------------------------
+// Do NOT use std::thread here: under Wine 11, CreateThread while holding the
+// loader lock can fail or raise (EXCEPTION_WINE_STUB), and a joinable
+// std::thread destroyed during unwinding calls std::terminate("terminate
+// called without an active exception"), killing the game process. Raw
+// CreateThread has no C++ objects to unwind; if it is unavailable anyway, the
+// start is deferred to a WH_GETMESSAGE hook, which runs in a normal thread
+// context (no loader lock). On Windows the direct CreateThread succeeds and
+// behavior is unchanged.
+static DWORD WINAPI MainTrampoline(LPVOID) { Main(); return 0; }
+
+static HHOOK s_deferHook = nullptr;
+static LRESULT CALLBACK DeferredStartProc(int nCode, WPARAM wParam, LPARAM lParam) {
+    if (nCode == HC_ACTION && s_deferHook) {
+        UnhookWindowsHookEx(s_deferHook);
+        s_deferHook = nullptr;
+        HANDLE h = CreateThread(nullptr, 0, MainTrampoline, nullptr, 0, nullptr);
+        if (h) CloseHandle(h);
+    }
+    return CallNextHookEx(nullptr, nCode, wParam, lParam);
+}
+
+static void StartMainOrDefer() {
+    HANDLE h = nullptr;
+    __try {
+        h = CreateThread(nullptr, 0, MainTrampoline, nullptr, 0, nullptr);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        h = nullptr;   // e.g. Wine loader-lock stub exception
+    }
+    if (h) { CloseHandle(h); return; }
+    s_deferHook = SetWindowsHookExW(WH_GETMESSAGE, DeferredStartProc,
+                                    GetModuleHandleW(nullptr), 0);
+}
+
 BOOL APIENTRY DllMain( HMODULE hModule,
                        DWORD  ul_reason_for_call,
                        LPVOID lpReserved
                      )
 {
     if (ul_reason_for_call == DLL_PROCESS_ATTACH) {
-        std::thread t(Main);
-
-        t.detach();
+        StartMainOrDefer();
     }
     return TRUE;
 }

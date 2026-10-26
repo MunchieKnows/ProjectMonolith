@@ -177,6 +177,8 @@ namespace GameLogic {
     }
 }
 
+void ConnectToMatch();   // fwd decl (global scope; defined below the Hooking namespace)
+
 namespace Hooking {
     bool procingCurrentFuncPtrs = false;
 
@@ -372,8 +374,34 @@ namespace Hooking {
 
     void* origSetUIState = 0;
 
+    // --- connect gating ------------------------------------------------------
+    // "open <ip>" is only honored once the client left InitialPreload. Issued
+    // during InitialPreload (as OnGameInit used to do) it is silently dropped
+    // by the engine - under Wine the boot is slow enough that this ALWAYS
+    // happened, so the join never connected. Offline under Wine the client
+    // parks on the EOS Login screen (state 3) and never reaches Title(2)/
+    // FrontEnd(5), so fire on the FIRST post-preload state of any kind;
+    // MainLoop keeps a fallback timer.
+    volatile LONG g_connectFired = 0;
+    static int s_lastLoggedUIState = -1;
+
     bool SetUIStateHook(__int64 manager, EOrionUIState state) {
         Globals::UIManager = manager;
+
+        if ((int)state != s_lastLoggedUIState) {
+            s_lastLoggedUIState = (int)state;
+            FILE* mf = fopen("/tmp/client_marker_states.txt", "a");
+            if (mf) { fprintf(mf, "SetUIState state=%d tick=%lu\n", (int)state, GetTickCount()); fclose(mf); }
+        }
+
+        if (state != EOrionUIState::Invalid && state != EOrionUIState::InitialPreload &&
+            InterlockedCompareExchange(&g_connectFired, 1, 0) == 0) {
+            std::cout << "[CLIENT] UI-State " << (int)state
+                      << " (post-preload) erreicht - verbinde jetzt mit Match-Server..." << std::endl;
+            { FILE* mf = fopen("/tmp/client_marker_title.txt", "w");
+              if (mf) { fprintf(mf, "title trigger fired state=%d tick=%lu\n", (int)state, GetTickCount()); fclose(mf); } }
+            ProcInGameThread(reinterpret_cast<void*>(ConnectToMatch));
+        }
 
         std::cout << "CHANGING UI STATE" << std::endl;
 
@@ -437,6 +465,8 @@ void InitConsole() {
 }
 
 void ConnectToMatch() {
+    { FILE* mf = fopen("/tmp/client_marker_connect.txt", "w");
+      if (mf) { fprintf(mf, "ConnectToMatch running tick=%lu\n", GetTickCount()); fclose(mf); } }
     std::ifstream config("config.json");
     std::stringstream sstream;
     std::string configString;
@@ -502,13 +532,20 @@ void ConnectToMatch() {
         }
     }
 
+    { FILE* mf = fopen("/tmp/client_marker_cmd.txt", "w");
+      if (mf) { for (wchar_t const* p = finalCmd.c_str(); *p; ++p) fputc(*p, mf); fclose(mf); } }
+
     EngineLogic::ExecuteConsoleCommand(finalCmd.c_str());
 }
 
 void OnGameInit() {
     std::cout << "Enabling game console..." << std::endl;
     EngineLogic::EnableGameConsole();
-    Hooking::ProcInGameThread(ConnectToMatch);
+    // NOTE: ConnectToMatch is deliberately NOT fired here. The engine drops
+    // "open <ip>" while the client is still in InitialPreload (always the case
+    // under Wine). It is triggered from Hooking::SetUIStateHook on the first
+    // post-preload UI state (offline that is the Login screen), with a
+    // fallback timer in MainLoop.
 }
 
 void SetUIToInGame() {
@@ -716,6 +753,18 @@ void MainLoop() {
     bool hackApplied = false;
 
     while (true) {
+        // Fallback: if the UI-state trigger never fired (state transition
+        // missed or set before the hook was installed), connect once after 3 min.
+        if (Hooking::g_connectFired == 0) {
+            static DWORD s_mainLoopStart = 0;
+            if (!s_mainLoopStart) s_mainLoopStart = GetTickCount();
+            else if (GetTickCount() - s_mainLoopStart > 180000) {
+                InterlockedExchange(&Hooking::g_connectFired, 1);
+                std::cout << "[CLIENT] Fallback: UI-State-Trigger nie gefeuert - verbinde jetzt..." << std::endl;
+                Hooking::ProcInGameThread(reinterpret_cast<void*>(ConnectToMatch));
+            }
+        }
+
         if (!hackApplied) {
             AOrionPlayerController_Game* PC = SDKUtils::GetLastOfType<AOrionPlayerController_Game>();
             if (PC && PC->PlayerState) {
@@ -727,7 +776,7 @@ void MainLoop() {
 
                             Sleep(2000);
 
-                            Hooking::ProcInGameThread(SetUIToInGame);
+                            Hooking::ProcInGameThread(reinterpret_cast<void*>(SetUIToInGame));
                             hackApplied = true;
                         }
                         break;
@@ -743,25 +792,25 @@ void MainLoop() {
         }
 
         if (GetAsyncKeyState(VK_F6) & 0x8000) {
-            Hooking::ProcInGameThread(SetUIToInGame);
+            Hooking::ProcInGameThread(reinterpret_cast<void*>(SetUIToInGame));
             hackApplied = true;
             while (GetAsyncKeyState(VK_F6) & 0x8000) { Sleep(10); }
         }
 
         if (GetAsyncKeyState(VK_F7) & 0x8000) {
-            Hooking::ProcInGameThread(DumpClientCardSpecs);
+            Hooking::ProcInGameThread(reinterpret_cast<void*>(DumpClientCardSpecs));
             while (GetAsyncKeyState(VK_F7) & 0x8000) { Sleep(10); }
         }
 
         if (GetAsyncKeyState(VK_F8) & 0x8000) {
-            Hooking::ProcInGameThread(FixClientCardSpecs);
+            Hooking::ProcInGameThread(reinterpret_cast<void*>(FixClientCardSpecs));
             while (GetAsyncKeyState(VK_F8) & 0x8000) { Sleep(10); }
         }
 
         if (hackApplied) {
             static int s_fixTick = 0;
             if (++s_fixTick % 5 == 0) {
-                Hooking::ProcInGameThread(FixClientCardSpecs);
+                Hooking::ProcInGameThread(reinterpret_cast<void*>(FixClientCardSpecs));
             }
         }
 
@@ -786,15 +835,47 @@ void Main() {
     }
 }
 
+// --- thread start that is safe in DllMain ------------------------------------
+// Do NOT use std::thread here: under Wine 11, CreateThread while holding the
+// loader lock can fail or raise (EXCEPTION_WINE_STUB), and a joinable
+// std::thread destroyed during unwinding calls std::terminate("terminate
+// called without an active exception"), killing the game process. Raw
+// CreateThread has no C++ objects to unwind; if it is unavailable anyway, the
+// start is deferred to a WH_GETMESSAGE hook, which runs in a normal thread
+// context (no loader lock). On Windows the direct CreateThread succeeds and
+// behavior is unchanged.
+static DWORD WINAPI MainTrampoline(LPVOID) { Main(); return 0; }
+
+static HHOOK s_deferHook = nullptr;
+static LRESULT CALLBACK DeferredStartProc(int nCode, WPARAM wParam, LPARAM lParam) {
+    if (nCode == HC_ACTION && s_deferHook) {
+        UnhookWindowsHookEx(s_deferHook);
+        s_deferHook = nullptr;
+        HANDLE h = CreateThread(nullptr, 0, MainTrampoline, nullptr, 0, nullptr);
+        if (h) CloseHandle(h);
+    }
+    return CallNextHookEx(nullptr, nCode, wParam, lParam);
+}
+
+static void StartMainOrDefer() {
+    HANDLE h = nullptr;
+    __try {
+        h = CreateThread(nullptr, 0, MainTrampoline, nullptr, 0, nullptr);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        h = nullptr;   // e.g. Wine loader-lock stub exception
+    }
+    if (h) { CloseHandle(h); return; }
+    s_deferHook = SetWindowsHookExW(WH_GETMESSAGE, DeferredStartProc,
+                                    GetModuleHandleW(nullptr), 0);
+}
+
 BOOL APIENTRY DllMain(HMODULE hModule,
     DWORD  ul_reason_for_call,
     LPVOID lpReserved
 )
 {
     if (ul_reason_for_call == DLL_PROCESS_ATTACH) {
-        std::thread t(Main);
-
-        t.detach();
+        StartMainOrDefer();
     }
     return TRUE;
 }
