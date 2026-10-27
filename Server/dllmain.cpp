@@ -15,6 +15,7 @@
 #include <format>
 #include <algorithm>
 #include <map>
+#include <unordered_map>
 #include <set>
 #include <vector>
 #include <cmath>
@@ -48,6 +49,8 @@ namespace ServerConfig {
     float BossRegenMult            = 0.5f;
     float BossStatEpsilon          = 0.5f;
     float BossPeriodicLogInterval  = 60.0f;
+
+    bool  EnableNetThrottle        = true;
 
     inline SDK::EAIBotDifficulty ParseDifficulty(const std::string& s) {
         std::string lo; lo.reserve(s.size());
@@ -110,6 +113,7 @@ namespace ServerConfig {
         readFloat ("boss_attack_mult",               BossAttackMult,           0.01f, 10.0f);
         readFloat ("boss_stat_epsilon",              BossStatEpsilon,          0.0f,  1000.0f);
         readFloat ("boss_periodic_log_interval_sec", BossPeriodicLogInterval,  1.0f,  3600.0f);
+        readBool  ("enable_net_throttle",            EnableNetThrottle);
 
         std::cout << "[CONFIG] Loaded server.json:" << std::endl
                   << "[CONFIG]   enable_buff_patch              = " << (EnableBuffPatch ? "true" : "false") << std::endl
@@ -123,7 +127,8 @@ namespace ServerConfig {
                   << "[CONFIG]   boss_maxhp_mult                = " << BossMaxHpMult << std::endl
                   << "[CONFIG]   boss_attack_mult               = " << BossAttackMult << std::endl
                   << "[CONFIG]   boss_stat_epsilon              = " << BossStatEpsilon << std::endl
-                  << "[CONFIG]   boss_periodic_log_interval_sec = " << BossPeriodicLogInterval << std::endl;
+                  << "[CONFIG]   boss_periodic_log_interval_sec = " << BossPeriodicLogInterval << std::endl
+                  << "[CONFIG]   enable_net_throttle            = " << (EnableNetThrottle ? "true" : "false") << std::endl;
     }
 }
 
@@ -991,7 +996,44 @@ namespace DamageCalculations {
 
 
 
+static std::string ServerTimeStamp() {
+    SYSTEMTIME st;
+    GetLocalTime(&st);
+    char buf[16];
+    sprintf_s(buf, "%02u:%02u:%02u.%03u", st.wHour, st.wMinute, st.wSecond, st.wMilliseconds);
+    return std::string(buf);
+}
+
 namespace Networking {
+    static const bool ENABLE_NET_RATE_BOOST = true;
+    static const int32_t NET_CLIENT_RATE = 50000;
+
+    static unsigned long long g_netBailCount = 0;
+    static ULONGLONG g_netBailWindowStart = 0;
+    static void NoteNetBail() {
+        g_netBailCount++;
+        const ULONGLONG now = GetTickCount64();
+        if (g_netBailWindowStart == 0) g_netBailWindowStart = now;
+        if (now - g_netBailWindowStart >= 10000) {
+            F4_LOG_EVENT("[NET-BAIL] " << ServerTimeStamp() << " Verbindung ausgelastet: " << g_netBailCount
+                << " Replikations-Abbrueche in den letzten " << (now - g_netBailWindowStart) / 1000 << " s" << std::endl);
+            g_netBailCount = 0;
+            g_netBailWindowStart = now;
+        }
+    }
+
+    static std::unordered_map<AActor*, double> g_netNextUpdate;
+    static const float NET_THROTTLE_MIN_HZ = 2.0f;
+    static const float NET_THROTTLE_MAX_HZ = 60.0f;
+    static unsigned long long g_netConsidered = 0;
+    static unsigned long long g_netThrottled = 0;
+    static ULONGLONG g_netThrottleWindowStart = 0;
+    static ULONGLONG g_netThrottleLastPurge = 0;
+
+    void MarkActorNetDirty(AActor* actor) {
+        g_netNextUpdate.erase(actor);
+    }
+
     void Listen() {
         EngineLogic::LimitFramerateForServer();
 
@@ -1017,6 +1059,14 @@ namespace Networking {
         reinterpret_cast<void(__thiscall*)(UIpNetDriver*, __int64, FURL*, bool, FString*)>(Globals::ModuleBase + PLOffsets::INIT_LISTEN)(NetDriver, reinterpret_cast<__int64>(Globals::GetGWorld()) + 0x28, url, false, err);
 
         reinterpret_cast<void(__thiscall*)(UNetDriver*, UWorld*)>(Globals::ModuleBase + PLOffsets::SET_WORLD)(NetDriver, Globals::GetGWorld());
+
+        if (ENABLE_NET_RATE_BOOST && NetDriver) {
+            std::cout << "[NET-RATE] MaxClientRate " << NetDriver->MaxClientRate
+                      << " / MaxInternetClientRate " << NetDriver->MaxInternetClientRate
+                      << " -> " << NET_CLIENT_RATE << " Bytes/s" << std::endl;
+            NetDriver->MaxClientRate = NET_CLIENT_RATE;
+            NetDriver->MaxInternetClientRate = NET_CLIENT_RATE;
+        }
     }
 
     UNetDriver* GetNetDriver() {
@@ -1061,6 +1111,15 @@ namespace Networking {
 
             if (OwningActor != nullptr && (*(EConnectionState*)((__int64)Connection + 0x12C)) == USOCK_Open) {
                 bFoundReadyConnection = true;
+
+                if (ENABLE_NET_RATE_BOOST && Connection->CurrentNetSpeed < NET_CLIENT_RATE) {
+                    static std::set<UNetConnection*> s_netRateLogged;
+                    if (s_netRateLogged.insert(Connection).second) {
+                        std::cout << "[NET-RATE] Verbindung " << reinterpret_cast<UObject*>(Connection)->GetName()
+                                  << ": CurrentNetSpeed " << Connection->CurrentNetSpeed << " -> " << NET_CLIENT_RATE << std::endl;
+                    }
+                    Connection->CurrentNetSpeed = NET_CLIENT_RATE;
+                }
 
                 Connection->ViewTarget = Connection->PlayerController ? Connection->PlayerController->GetViewTarget() : OwningActor;
             }
@@ -1211,7 +1270,7 @@ namespace Networking {
 
 
                     if (!(*reinterpret_cast<bool(**)(UNetConnection*, int)>(Globals::ModuleBase + PLOffsets::IS_NET_READY_PTR_PTR))(Connection, 0)) {
-                        std::cout << "Bailing on processing actors..." << std::endl;
+                        NoteNetBail();
                         return j;
                     }
                 }
@@ -1258,6 +1317,20 @@ namespace Networking {
             if (reinterpret_cast<bool(*)(AActor*)>(Globals::ModuleBase + PLOffsets::IS_PENDING_KILL_PENDING)(actor))
                 continue;
 
+            if (ServerConfig::EnableNetThrottle) {
+                const double now = GetTickCount64() / 1000.0;
+                auto it = g_netNextUpdate.find(actor);
+                if (it != g_netNextUpdate.end() && now < it->second) {
+                    g_netThrottled++;
+                    continue;
+                }
+                float hz = actor->NetUpdateFrequency;
+                if (hz < NET_THROTTLE_MIN_HZ) hz = NET_THROTTLE_MIN_HZ;
+                if (hz > NET_THROTTLE_MAX_HZ) hz = NET_THROTTLE_MAX_HZ;
+                g_netNextUpdate[actor] = now + 1.0 / hz;
+                g_netConsidered++;
+            }
+
             FNetworkObjectInfo* newConsider = (FNetworkObjectInfo*)EngineLogic::Malloc(sizeof(FNetworkObjectInfo), 0);
             newConsider->actor = actor;
             newConsider->LastNetReplicateTime = 0;
@@ -1267,6 +1340,27 @@ namespace Networking {
             reinterpret_cast<void(*)(AActor*, UNetDriver*)>(Globals::ModuleBase + PLOffsets::CALL_PRE_REPLICATION)(actor, GetNetDriver());
 
             ConsiderList.push_back(newConsider);
+        }
+
+        if (ServerConfig::EnableNetThrottle) {
+            const ULONGLONG nowMs = GetTickCount64();
+            if (g_netThrottleWindowStart == 0) g_netThrottleWindowStart = nowMs;
+            if (nowMs - g_netThrottleWindowStart >= 10000) {
+                F4_LOG_EVENT("[NET-THROTTLE] " << ServerTimeStamp() << " letzte " << (nowMs - g_netThrottleWindowStart) / 1000 << " s: repliziert "
+                    << g_netConsidered << ", gedrosselt " << g_netThrottled
+                    << ", Eintraege " << g_netNextUpdate.size() << std::endl);
+                g_netConsidered = 0;
+                g_netThrottled = 0;
+                g_netThrottleWindowStart = nowMs;
+            }
+            if (nowMs - g_netThrottleLastPurge >= 30000) {
+                const double cutoff = nowMs / 1000.0 - 5.0;
+                for (auto it = g_netNextUpdate.begin(); it != g_netNextUpdate.end(); ) {
+                    if (it->second < cutoff) it = g_netNextUpdate.erase(it);
+                    else ++it;
+                }
+                g_netThrottleLastPurge = nowMs;
+            }
         }
 
         
@@ -1857,7 +1951,11 @@ namespace Hooking {
                 return ret;
             }
         }
-        std::string funcName = function->GetFullName();
+        static std::unordered_map<UFunction*, std::string> s_funcNameCache;
+        auto funcNameIt = s_funcNameCache.find(function);
+        if (funcNameIt == s_funcNameCache.end())
+            funcNameIt = s_funcNameCache.emplace(function, function->GetFullName()).first;
+        const std::string& funcName = funcNameIt->second;
         if (funcName.find("ServerSetSelectedDeckItem") != std::string::npos) {
             return nullptr;
         }
@@ -2744,6 +2842,10 @@ namespace Hooking {
     static volatile int s_vehCatchCount = 0;
 
     int GameEngineTickHook(UGameEngine* gameengine, float deltatime, char a3) {
+
+        if (deltatime > 0.2f) {
+            std::cout << "[SERVER-HITCH] " << ServerTimeStamp() << " Tick " << deltatime << " s" << std::endl;
+        }
 
         if (s_vehCatchCount > 0) {
             std::cout << "[VEH] Exceptions abgefangen: " << s_vehCatchCount << std::endl;
@@ -14456,6 +14558,12 @@ else if (bIsJungler) {
     }
 
 
+    void* origForceNetUpdate = nullptr;
+    void ForceNetUpdateHook(AActor* actor) {
+        if (actor) Networking::MarkActorNetDirty(actor);
+        reinterpret_cast<void(*)(AActor*)>(origForceNetUpdate)(actor);
+    }
+
     void* origTArrayRemoveSound = nullptr;
     bool TArrayRemoveSoundHook(__int64 a1, __int64 a2) {
         return 1;
@@ -14629,6 +14737,10 @@ else if (bIsJungler) {
         MH_CreateHook(uchannelCleanup, reinterpret_cast<void*>(TArrayRemoveSoundHook), &origTArrayRemoveSound);
 
         MH_EnableHook(uchannelCleanup);
+
+        void* forceNetUpdate = (void*)(Globals::ModuleBase + PLOffsets::FORCE_NET_UPDATE);
+        MH_CreateHook(forceNetUpdate, reinterpret_cast<void*>(ForceNetUpdateHook), &origForceNetUpdate);
+        MH_EnableHook(forceNetUpdate);
 
         void* gameModeCanRestartPlayer = (void*)(Globals::ModuleBase + PLOffsets::GAME_MODE_CAN_RESTART_PLAYER);
 
