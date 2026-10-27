@@ -11,6 +11,8 @@ REM
 REM  PLACEMENT: copy this .bat next to OrionClient-Win64-Shipping-Server.exe
 REM
 REM  Note: boss_periodic_log_interval_sec is fixed at 60.0 (not editable here).
+REM  Note: net_client_rate = upload budget per player, see step 5 (default 50000).
+REM        Asked in full only once; later starts just offer keep / change.
 REM ===========================================================================
 
 set "SCONFIG=%~dp0server.json"
@@ -187,6 +189,68 @@ if "!ENABLESPEED!"=="true" ( echo  -^> Bot speed boost ENABLED ^(~1.49x^) ) else
 echo.
 
 REM ---------------------------------------------------------------------------
+REM  5) NETWORK UPLOAD BUDGET PER PLAYER  (net_client_rate, bytes per second)
+REM     The server sends game updates to every other player through the
+REM     host's internet UPLOAD. This caps how much it may send to each player
+REM     per second. 50000 is the tested default (latency fix 2026-10-26).
+REM     If server.json already holds a valid value, only ask keep / change.
+REM ---------------------------------------------------------------------------
+set "NETRATE=50000"
+set "CURNET="
+if exist "%SCONFIG%" for /f "tokens=2 delims=:, " %%A in ('findstr /c:"net_client_rate" "%SCONFIG%"') do set "CURNET=%%A"
+if defined CURNET (
+    call :ValidRate "!CURNET!"
+    if "!ERR!"=="1" set "CURNET="
+)
+if not defined CURNET goto netExplain
+
+:askKeepNet
+set "NETCHOICE="
+echo NETWORK: current upload budget per player = !CURNET! bytes/s
+set /p "NETCHOICE=Keep this value?  [1] KEEP  [2] CHANGE  (Enter=keep): "
+if not defined NETCHOICE set "NETCHOICE=1"
+if "!NETCHOICE!"=="1" ( set "NETRATE=!CURNET!" & goto netOK )
+if "!NETCHOICE!"=="2" ( echo. & goto netExplain )
+echo   ^>^> Invalid choice. Enter 1 or 2.
+goto askKeepNet
+
+:netExplain
+echo ------------------------------------------------------------
+echo  NETWORK: upload budget per player  ^(bytes per second^)
+echo ------------------------------------------------------------
+echo  The server sends game updates to every other player through
+echo  YOUR internet UPLOAD. This value caps how much it may send to
+echo  each player per second.
+echo   - Too high for your line: lag spikes for EVERYONE.
+echo   - Too low: players jump back in big team fights.
+echo.
+echo  Check your UPLOAD speed ^(not download^) with any speed test.
+echo  Upload needed = value x players connected to you ^(up to 9^).
+echo.
+echo    Your upload        Recommended value
+echo    under 5 Mbit/s      30000   ^(about  2.2 Mbit/s with 9 players^)
+echo    5 - 10 Mbit/s       50000   ^(about  3.6 Mbit/s with 9 players^)  DEFAULT
+echo    10 - 25 Mbit/s     100000   ^(about  7.2 Mbit/s with 9 players^)
+echo    over 25 Mbit/s     200000   ^(about 14.4 Mbit/s with 9 players^)
+echo.
+echo  50000 is tested and recommended. The other values are untested.
+echo  Allowed range: 10000 - 10000000.
+echo.
+:askNet
+set "IN_NET="
+set /p "IN_NET=Upload budget per player (Enter=default 50000): "
+if not defined IN_NET ( set "NETRATE=50000" & goto netOK )
+call :ValidRate "!IN_NET!"
+if "!ERR!"=="1" (
+    echo   ^>^> Invalid. Enter a whole number from 10000 to 10000000, e.g. 50000
+    goto askNet
+)
+set "NETRATE=!IN_NET!"
+:netOK
+echo  -^> Upload budget per player: !NETRATE! bytes/s
+echo.
+
+REM ---------------------------------------------------------------------------
 REM  WRITE server.json   (periodic log interval fixed at 60.0)
 REM ---------------------------------------------------------------------------
 (
@@ -202,6 +266,7 @@ echo     "boss_regen_mult":                !BREGEN!,
 echo     "boss_maxhp_mult":                !BMAXHP!,
 echo     "boss_attack_mult":               !BATTACK!,
 echo     "boss_stat_epsilon":              !BEPS!,
+echo     "net_client_rate":                !NETRATE!,
 echo     "boss_periodic_log_interval_sec": 60.0
 echo }
 ) > "%SCONFIG%"
@@ -246,4 +311,17 @@ REM  Accepts: 0.01-0.09 , 0.1-0.5 , 0.10-0.59 . Rejects 0, 0.0, >=0.6, 1+, etc.
 set "_v=%~1"
 echo(%_v%| findstr /r /c:"^0\.0[1-9]$" /c:"^0\.[1-5]$" /c:"^0\.[1-5][0-9]$" >nul
 if errorlevel 1 ( set "ERR=1" ) else ( set "ERR=0" )
+goto :eof
+
+:ValidRate
+REM  %~1 = candidate ; ERR=0 only for a whole number 10000 .. 10000000.
+REM  No leading zero (cmd would read it as octal), max 8 digits (no overflow).
+set "_v=%~1"
+set "ERR=1"
+echo(%_v%| findstr /r /c:"^[1-9][0-9]*$" >nul
+if errorlevel 1 goto :eof
+if not "%_v:~8%"=="" goto :eof
+if %_v% LSS 10000 goto :eof
+if %_v% GTR 10000000 goto :eof
+set "ERR=0"
 goto :eof

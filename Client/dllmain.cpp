@@ -6,6 +6,7 @@
 #include <iostream>
 #include <format>
 #include <fstream>
+#include <unordered_map>
 
 #include "MinHook/include/MinHook.h"
 #include "json/json.h"
@@ -231,7 +232,11 @@ namespace Hooking {
             procingCurrentFuncPtrs = false;
         }
 
-        std::string funcName = function->GetFullName();
+        static std::unordered_map<UFunction*, std::string> s_funcNameCache;
+        auto funcNameIt = s_funcNameCache.find(function);
+        if (funcNameIt == s_funcNameCache.end())
+            funcNameIt = s_funcNameCache.emplace(function, function->GetFullName()).first;
+        const std::string& funcName = funcNameIt->second;
 
   
         if (funcName.find("OnCardShopOpened") != std::string::npos) {
@@ -332,14 +337,6 @@ namespace Hooking {
             ClientSsrtLog(ss.str());
         }
 
-        if ((object->GetFullName().find("Targeting") != std::string::npos ||
-            funcName.find("Targeting") != std::string::npos) &&
-            funcName.find("Confirm") != std::string::npos)
-        {
-            return reinterpret_cast<void* (__thiscall*)(UObject*, UFunction*, void*)>(
-                origProcessEvent)(object, function, params);
-        }
-
         return reinterpret_cast<void* (__thiscall*)(UObject*, UFunction*, void*)>(
             origProcessEvent)(object, function, params);
     }
@@ -410,11 +407,13 @@ namespace Hooking {
         // The join is triggered by OnGameInit (startup) and retried by the
         // MainLoop watchdog - see there for the rationale.
 
-        std::cout << "CHANGING UI STATE" << std::endl;
-
-        std::cout << (int)state << std::endl;
-
-        std::cout << "CHANGED UI STATE" << std::endl;
+        static int s_lastUiStateLogged = -1;
+        if (static_cast<int>(state) != s_lastUiStateLogged) {
+            std::cout << "CHANGING UI STATE" << std::endl;
+            std::cout << (int)state << std::endl;
+            std::cout << "CHANGED UI STATE" << std::endl;
+            s_lastUiStateLogged = static_cast<int>(state);
+        }
         if (state == EOrionUIState::Invalid) {
             static int numTimesChanged = 0;
 
@@ -727,19 +726,41 @@ void DumpClientCardSpecs() {
     if (af.is_open()) af << out.str();
 }
 
+static bool IsLiveObject(void* p) {
+    if (!p || IsBadReadPtr(p, sizeof(UObject))) return false;
+    UObject* o = reinterpret_cast<UObject*>(p);
+    return UObject::GObjects->GetByIndex(o->Index) == o;
+}
+
 void FixClientCardSpecs() {
-    AOrionPlayerController_Game* PC = SDKUtils::GetLastOfType<AOrionPlayerController_Game>();
+    static AOrionPlayerController_Game* s_pc = nullptr;
+    static UOrionAbilitySystemComponent* s_asc = nullptr;
+    static UOrionItemizationComponent* s_comp = nullptr;
+    if (!IsLiveObject(s_pc)) s_pc = SDKUtils::GetLastOfType<AOrionPlayerController_Game>();
+    AOrionPlayerController_Game* PC = s_pc;
     if (!PC || !PC->PlayerState) { std::cout << "[CLIENT-FIX] kein PC/PlayerState" << std::endl; return; }
-    UOrionAbilitySystemComponent* ASC = nullptr;
-    for (UOrionAbilitySystemComponent* a : SDKUtils::GetAllObjectsOfType<UOrionAbilitySystemComponent>()) {
-        if (!a || IsBadReadPtr(a, 0x10)) continue;
+    auto ascBelongs = [&](UOrionAbilitySystemComponent* a) {
         UObject* ao = reinterpret_cast<UObject*>(a);
-        if (ao->Outer == reinterpret_cast<UObject*>(PC->PlayerState) ||
-            (PC->Pawn && ao->Outer == reinterpret_cast<UObject*>(PC->Pawn))) { ASC = a; break; }
+        return ao->Outer == reinterpret_cast<UObject*>(PC->PlayerState) ||
+               (PC->Pawn && ao->Outer == reinterpret_cast<UObject*>(PC->Pawn));
+    };
+    if (!IsLiveObject(s_asc) || !ascBelongs(s_asc)) {
+        s_asc = nullptr;
+        for (UOrionAbilitySystemComponent* a : SDKUtils::GetAllObjectsOfType<UOrionAbilitySystemComponent>()) {
+            if (!a || IsBadReadPtr(a, 0x10)) continue;
+            if (ascBelongs(a)) { s_asc = a; break; }
+        }
     }
+    UOrionAbilitySystemComponent* ASC = s_asc;
     if (!ASC) { std::cout << "[CLIENT-FIX] Client-ASC nicht gefunden" << std::endl; return; }
-    for (UOrionItemizationComponent* Comp : SDKUtils::GetAllObjectsOfType<UOrionItemizationComponent>()) {
-        if (!Comp || reinterpret_cast<UObject*>(Comp)->Outer != PC->PlayerState) continue;
+    if (!IsLiveObject(s_comp) || reinterpret_cast<UObject*>(s_comp)->Outer != PC->PlayerState) {
+        s_comp = nullptr;
+        for (UOrionItemizationComponent* c : SDKUtils::GetAllObjectsOfType<UOrionItemizationComponent>()) {
+            if (c && reinterpret_cast<UObject*>(c)->Outer == PC->PlayerState) { s_comp = c; break; }
+        }
+    }
+    for (UOrionItemizationComponent* Comp : { s_comp }) {
+        if (!Comp) continue;
         if (Comp->EquippedCards.Data && Comp->EquippedCards.NumElements > 0 && Comp->EquippedCards.NumElements < 50) {
             for (int i = 0; i < Comp->EquippedCards.NumElements; i++) {
                 UOrionGameplayCard* Card = Comp->EquippedCards.Data[i];

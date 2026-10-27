@@ -68,7 +68,10 @@ This is also the first part of playing alone against bots (see above).
    - bot difficulty per team (1-6),
    - optional bot stat multipliers (enemy and friendly bots),
    - optional boss stats for Orb Prime and Fangtooth (max HP, attack, health regen),
-   - optional bot move-speed boost.
+   - optional bot move-speed boost,
+   - upload budget per player (network). The launcher shows a table of recommended values for
+     your internet upload speed; 50000 is the tested default. On later starts it only asks
+     whether to keep the saved value.
 
    It saves the settings to `server.json` and starts the server automatically.
 2. **Wait until the update error message appears** in the game window / log. You don't need to
