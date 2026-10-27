@@ -14743,7 +14743,12 @@ void InitConsole() {
     }
 }
 
+// Set when OnMatchInit has run; the console-nudge thread stops once this is true.
+static volatile LONG g_mapInitDone = 0;
+
 void OnMatchInit() {
+    InterlockedExchange(&g_mapInitDone, 1);
+
     std::cout << "Setting up teams..." << std::endl;
     GameLogic::SetupTeams();
 
@@ -14752,6 +14757,34 @@ void OnMatchInit() {
 
     std::cout << "Listening for connections..." << std::endl;
     Networking::Listen();
+}
+
+// Under Wine the engine's game thread repeatedly blocks on a console-input read
+// (CONIN$) once the map load starts, so GameEngine::Tick stops being called and
+// any tick-based trigger (including OnMatchInit, which opens UDP 7777) never
+// runs. Whether it resumes on its own is a race: some runs recover, most don't.
+// This thread unblocks the engine by writing a newline to CONIN$ every few
+// seconds until OnMatchInit has run (the in-tick wall-clock deadline then fires
+// it on the game thread). The injected newline is an empty console line, which
+// the engine ignores. On Windows the condition clears within ~10 s and at most
+// one harmless newline is ever written.
+static DWORD WINAPI MatchInitNudgeThread(LPVOID) {
+    // Give startup + the auto map load time to begin (we load ~90 s after the
+    // game starts; the map load begins ~15-20 s after that).
+    Sleep(90 * 1000);
+    for (int i = 0; i < 600 && !g_mapInitDone; i++) {   // up to ~30 min
+        Sleep(3000);
+        if (g_mapInitDone) break;
+        HANDLE h = CreateFileA("CONIN$", GENERIC_WRITE,
+                               FILE_SHARE_READ | FILE_SHARE_WRITE,
+                               nullptr, OPEN_EXISTING, 0, nullptr);
+        if (h != INVALID_HANDLE_VALUE) {
+            DWORD written = 0;
+            WriteFile(h, "\n", 1, &written, nullptr);
+            CloseHandle(h);
+        }
+    }
+    return 0;
 }
 
 void OnGameInit() {
@@ -14793,6 +14826,10 @@ void Main() {
 
     Hooking::InitHooking();
 
+    // Unblocks the engine's blocking console-input read under Wine so the game
+    // thread keeps ticking after the map load (see MatchInitNudgeThread).
+    HANDLE nudge = CreateThread(nullptr, 0, MatchInitNudgeThread, nullptr, 0, nullptr);
+    if (nudge) CloseHandle(nudge);
 
     Sleep(1 * 1000 * 1000 * 1000);
 
