@@ -50,7 +50,7 @@ namespace ServerConfig {
     float BossStatEpsilon          = 0.5f;
     float BossPeriodicLogInterval  = 60.0f;
 
-    bool  EnableNetThrottle        = true;
+    int   NetClientRate            = 50000;
 
     inline SDK::EAIBotDifficulty ParseDifficulty(const std::string& s) {
         std::string lo; lo.reserve(s.size());
@@ -94,6 +94,17 @@ namespace ServerConfig {
             }
             target = v;
         };
+        auto readInt = [&](const char* k, int& target, int lo, int hi) {
+            if (!root.isMember(k) || !root[k].isNumeric()) return;
+            double v = root[k].asDouble();
+            if (v < lo || v > hi) {
+                std::cout << "[CONFIG] WARN " << k << "=" << v
+                          << " out of [" << lo << ".." << hi << "] - ignored"
+                          << std::endl;
+                return;
+            }
+            target = (int)v;
+        };
         auto readBool = [&](const char* k, bool& target) {
             if (root.isMember(k) && root[k].isBool()) target = root[k].asBool();
         };
@@ -113,7 +124,7 @@ namespace ServerConfig {
         readFloat ("boss_attack_mult",               BossAttackMult,           0.01f, 10.0f);
         readFloat ("boss_stat_epsilon",              BossStatEpsilon,          0.0f,  1000.0f);
         readFloat ("boss_periodic_log_interval_sec", BossPeriodicLogInterval,  1.0f,  3600.0f);
-        readBool  ("enable_net_throttle",            EnableNetThrottle);
+        readInt   ("net_client_rate",                NetClientRate,            10000, 10000000);
 
         std::cout << "[CONFIG] Loaded server.json:" << std::endl
                   << "[CONFIG]   enable_buff_patch              = " << (EnableBuffPatch ? "true" : "false") << std::endl
@@ -128,7 +139,7 @@ namespace ServerConfig {
                   << "[CONFIG]   boss_attack_mult               = " << BossAttackMult << std::endl
                   << "[CONFIG]   boss_stat_epsilon              = " << BossStatEpsilon << std::endl
                   << "[CONFIG]   boss_periodic_log_interval_sec = " << BossPeriodicLogInterval << std::endl
-                  << "[CONFIG]   enable_net_throttle            = " << (EnableNetThrottle ? "true" : "false") << std::endl;
+                  << "[CONFIG]   net_client_rate                = " << NetClientRate << std::endl;
     }
 }
 
@@ -1006,7 +1017,6 @@ static std::string ServerTimeStamp() {
 
 namespace Networking {
     static const bool ENABLE_NET_RATE_BOOST = true;
-    static const int32_t NET_CLIENT_RATE = 50000;
 
     static unsigned long long g_netBailCount = 0;
     static ULONGLONG g_netBailWindowStart = 0;
@@ -1061,11 +1071,12 @@ namespace Networking {
         reinterpret_cast<void(__thiscall*)(UNetDriver*, UWorld*)>(Globals::ModuleBase + PLOffsets::SET_WORLD)(NetDriver, Globals::GetGWorld());
 
         if (ENABLE_NET_RATE_BOOST && NetDriver) {
+            ServerConfig::LoadFromFile();
             std::cout << "[NET-RATE] MaxClientRate " << NetDriver->MaxClientRate
                       << " / MaxInternetClientRate " << NetDriver->MaxInternetClientRate
-                      << " -> " << NET_CLIENT_RATE << " Bytes/s" << std::endl;
-            NetDriver->MaxClientRate = NET_CLIENT_RATE;
-            NetDriver->MaxInternetClientRate = NET_CLIENT_RATE;
+                      << " -> " << ServerConfig::NetClientRate << " Bytes/s" << std::endl;
+            NetDriver->MaxClientRate = ServerConfig::NetClientRate;
+            NetDriver->MaxInternetClientRate = ServerConfig::NetClientRate;
         }
     }
 
@@ -1112,13 +1123,13 @@ namespace Networking {
             if (OwningActor != nullptr && (*(EConnectionState*)((__int64)Connection + 0x12C)) == USOCK_Open) {
                 bFoundReadyConnection = true;
 
-                if (ENABLE_NET_RATE_BOOST && Connection->CurrentNetSpeed < NET_CLIENT_RATE) {
+                if (ENABLE_NET_RATE_BOOST && Connection->CurrentNetSpeed < ServerConfig::NetClientRate) {
                     static std::set<UNetConnection*> s_netRateLogged;
                     if (s_netRateLogged.insert(Connection).second) {
                         std::cout << "[NET-RATE] Verbindung " << reinterpret_cast<UObject*>(Connection)->GetName()
-                                  << ": CurrentNetSpeed " << Connection->CurrentNetSpeed << " -> " << NET_CLIENT_RATE << std::endl;
+                                  << ": CurrentNetSpeed " << Connection->CurrentNetSpeed << " -> " << ServerConfig::NetClientRate << std::endl;
                     }
-                    Connection->CurrentNetSpeed = NET_CLIENT_RATE;
+                    Connection->CurrentNetSpeed = ServerConfig::NetClientRate;
                 }
 
                 Connection->ViewTarget = Connection->PlayerController ? Connection->PlayerController->GetViewTarget() : OwningActor;
@@ -1317,19 +1328,17 @@ namespace Networking {
             if (reinterpret_cast<bool(*)(AActor*)>(Globals::ModuleBase + PLOffsets::IS_PENDING_KILL_PENDING)(actor))
                 continue;
 
-            if (ServerConfig::EnableNetThrottle) {
-                const double now = GetTickCount64() / 1000.0;
-                auto it = g_netNextUpdate.find(actor);
-                if (it != g_netNextUpdate.end() && now < it->second) {
-                    g_netThrottled++;
-                    continue;
-                }
-                float hz = actor->NetUpdateFrequency;
-                if (hz < NET_THROTTLE_MIN_HZ) hz = NET_THROTTLE_MIN_HZ;
-                if (hz > NET_THROTTLE_MAX_HZ) hz = NET_THROTTLE_MAX_HZ;
-                g_netNextUpdate[actor] = now + 1.0 / hz;
-                g_netConsidered++;
+            const double now = GetTickCount64() / 1000.0;
+            auto it = g_netNextUpdate.find(actor);
+            if (it != g_netNextUpdate.end() && now < it->second) {
+                g_netThrottled++;
+                continue;
             }
+            float hz = actor->NetUpdateFrequency;
+            if (hz < NET_THROTTLE_MIN_HZ) hz = NET_THROTTLE_MIN_HZ;
+            if (hz > NET_THROTTLE_MAX_HZ) hz = NET_THROTTLE_MAX_HZ;
+            g_netNextUpdate[actor] = now + 1.0 / hz;
+            g_netConsidered++;
 
             FNetworkObjectInfo* newConsider = (FNetworkObjectInfo*)EngineLogic::Malloc(sizeof(FNetworkObjectInfo), 0);
             newConsider->actor = actor;
@@ -1342,25 +1351,23 @@ namespace Networking {
             ConsiderList.push_back(newConsider);
         }
 
-        if (ServerConfig::EnableNetThrottle) {
-            const ULONGLONG nowMs = GetTickCount64();
-            if (g_netThrottleWindowStart == 0) g_netThrottleWindowStart = nowMs;
-            if (nowMs - g_netThrottleWindowStart >= 10000) {
-                F4_LOG_EVENT("[NET-THROTTLE] " << ServerTimeStamp() << " letzte " << (nowMs - g_netThrottleWindowStart) / 1000 << " s: repliziert "
-                    << g_netConsidered << ", gedrosselt " << g_netThrottled
-                    << ", Eintraege " << g_netNextUpdate.size() << std::endl);
-                g_netConsidered = 0;
-                g_netThrottled = 0;
-                g_netThrottleWindowStart = nowMs;
+        const ULONGLONG nowMs = GetTickCount64();
+        if (g_netThrottleWindowStart == 0) g_netThrottleWindowStart = nowMs;
+        if (nowMs - g_netThrottleWindowStart >= 10000) {
+            F4_LOG_EVENT("[NET-THROTTLE] " << ServerTimeStamp() << " letzte " << (nowMs - g_netThrottleWindowStart) / 1000 << " s: repliziert "
+                << g_netConsidered << ", gedrosselt " << g_netThrottled
+                << ", Eintraege " << g_netNextUpdate.size() << std::endl);
+            g_netConsidered = 0;
+            g_netThrottled = 0;
+            g_netThrottleWindowStart = nowMs;
+        }
+        if (nowMs - g_netThrottleLastPurge >= 30000) {
+            const double cutoff = nowMs / 1000.0 - 5.0;
+            for (auto it = g_netNextUpdate.begin(); it != g_netNextUpdate.end(); ) {
+                if (it->second < cutoff) it = g_netNextUpdate.erase(it);
+                else ++it;
             }
-            if (nowMs - g_netThrottleLastPurge >= 30000) {
-                const double cutoff = nowMs / 1000.0 - 5.0;
-                for (auto it = g_netNextUpdate.begin(); it != g_netNextUpdate.end(); ) {
-                    if (it->second < cutoff) it = g_netNextUpdate.erase(it);
-                    else ++it;
-                }
-                g_netThrottleLastPurge = nowMs;
-            }
+            g_netThrottleLastPurge = nowMs;
         }
 
         
