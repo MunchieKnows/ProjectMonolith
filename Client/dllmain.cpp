@@ -431,8 +431,33 @@ namespace Hooking {
     }
 
 
+    // Wine's OutputDebugStringA/W implementation RAISES a pseudo-exception
+    // (0x40010006 ANSI / 0x4001000A wide) carrying the log message so a debugger
+    // can see it. Under our setup that exception escapes through the engine tick and
+    // aborts it on every log line, wedging the whole game loop (the client parks on
+    // the "checking patch" screen and never advances UI state). Hooking both to a
+    // no-op stops the raises entirely; messages are still visible in the console.
+    static DWORD OutputDebugStringAHook(const char* s) { (void)s; return 1; }
+    static DWORD OutputDebugStringWHook(const wchar_t* s) { (void)s; return 1; }
+
     void InitHooking() {
         MH_Initialize();
+
+        // Hook OutputDebugStringA/W: resolve via kernel32 first, fall back to
+        // kernelbase. If both modules expose different addresses, hook both so no
+        // call path can reach the exception-raising implementation.
+        {
+            HMODULE k32 = GetModuleHandleA("kernel32.dll");
+            HMODULE kbase = GetModuleHandleA("kernelbase.dll");
+            void* pA = (void*)GetProcAddress(k32 ? k32 : GetModuleHandleA(nullptr), "OutputDebugStringA");
+            void* pW = (void*)GetProcAddress(k32 ? k32 : GetModuleHandleA(nullptr), "OutputDebugStringW");
+            void* pbA = kbase ? (void*)GetProcAddress(kbase, "OutputDebugStringA") : nullptr;
+            void* pbW = kbase ? (void*)GetProcAddress(kbase, "OutputDebugStringW") : nullptr;
+            if (pA) { MH_CreateHook(pA, reinterpret_cast<void*>(OutputDebugStringAHook), nullptr); MH_EnableHook(pA); }
+            if (pW) { MH_CreateHook(pW, reinterpret_cast<void*>(OutputDebugStringWHook), nullptr); MH_EnableHook(pW); }
+            if (pbA && pbA != pA) { MH_CreateHook(pbA, reinterpret_cast<void*>(OutputDebugStringAHook), nullptr); MH_EnableHook(pbA); }
+            if (pbW && pbW != pW) { MH_CreateHook(pbW, reinterpret_cast<void*>(OutputDebugStringWHook), nullptr); MH_EnableHook(pbW); }
+        }
 
         void* ProcessEventHookLocal = (void*)(Globals::ModuleBase + PLOffsets::PROCESSEVENT);
 
@@ -818,20 +843,77 @@ void MainLoop() {
                         break;
                     }
                 }
+            }
 
-                // Join diagnostics: dump status every 10 s while still waiting
-                // for the local PlayerController (no F7 needed).
-                static DWORD s_lastJoinDump = 0;
-                if (GetTickCount() - s_lastJoinDump > 10000) {
-                    s_lastJoinDump = GetTickCount();
-                    FILE* mf = fopen("/tmp/client_marker_join.txt", "a");
-                    if (mf) {
-                        fprintf(mf, "tick=%lu uiState=%d attempts=%ld pc=%d playerstate=%d\n",
-                                GetTickCount(), Hooking::s_currentUIState,
-                                (long)Hooking::g_connectAttempts,
-                                PC ? 1 : 0, (PC && PC->PlayerState) ? 1 : 0);
-                        fclose(mf);
+            // Join diagnostics: dump status every 10 s (always, not only while a
+            // PlayerState exists) so we can see whether the local PC / PlayerState
+            // ever appears after the join. Also count world objects to tell apart
+            // "replication never arrived" from "arrived but not linked".
+            static DWORD s_lastJoinDump = 0;
+            if (GetTickCount() - s_lastJoinDump > 10000) {
+                s_lastJoinDump = GetTickCount();
+                int nPS = 0, nChar = 0, nPC = 0;
+                for (APlayerState* ps : SDKUtils::GetAllObjectsOfType<APlayerState>()) if (ps) nPS++;
+                for (AOrionChar* ch : SDKUtils::GetAllObjectsOfType<AOrionChar>()) if (ch) nChar++;
+                for (AOrionPlayerController_Game* p : SDKUtils::GetAllObjectsOfType<AOrionPlayerController_Game>()) if (p) nPC++;
+                // The canonical local PC is LocalPlayers[0]->PlayerController;
+                // GetLastOfType may return a different (replicated) controller.
+                APlayerController* localPC = nullptr;
+                if (Globals::GetGWorld() && Globals::GetGWorld()->OwningGameInstance &&
+                    Globals::GetGWorld()->OwningGameInstance->LocalPlayers.NumElements > 0 &&
+                    Globals::GetGWorld()->OwningGameInstance->LocalPlayers.Data) {
+                    ULocalPlayer* lp = Globals::GetGWorld()->OwningGameInstance->LocalPlayers.Data[0];
+                    if (lp) localPC = lp->PlayerController;
+                }
+                FILE* mf = fopen("/tmp/client_marker_join.txt", "a");
+                if (mf) {
+                    // localPC identity: a replicated PC arrives with an instance
+                    // name + RemoteRole=3 (AutonomousProxy); a local placeholder
+                    // has no _N suffix and RemoteRole=4 (Authority) or 0.
+                    int localRole = -1; std::string localName = "?";
+                    if (localPC && !IsBadReadPtr(localPC, 0x90)) {
+                        __try {
+                            localRole = (int)*reinterpret_cast<uint8_t*>((char*)localPC + 0x85);
+                            localName = localPC->GetName();
+                        }
+                        __except (EXCEPTION_EXECUTE_HANDLER) {}
                     }
+                    fprintf(mf, "tick=%lu uiState=%d attempts=%ld lastPC=%p lastPS=%d localPC=%p localPS=%d same=%d nPS=%d nChar=%d nPC=%d localRole=%d localName=%s\n",
+                            GetTickCount(), Hooking::s_currentUIState,
+                            (long)Hooking::g_connectAttempts,
+                            (void*)PC, (PC && PC->PlayerState) ? 1 : 0,
+                            (void*)localPC, (localPC && localPC->PlayerState) ? 1 : 0,
+                            (PC == localPC) ? 1 : 0, nPS, nChar, nPC, localRole, localName.c_str());
+                    // Per-PS detail: name + team, to see if OUR PlayerState replicated.
+                    for (APlayerState* ps : SDKUtils::GetAllObjectsOfType<APlayerState>()) {
+                        if (!ps) continue;
+                        AOrionPlayerState_Game* gps = reinterpret_cast<AOrionPlayerState_Game*>(ps);
+                        if (IsBadReadPtr(gps, 0x2F0)) continue;
+                        __try {
+                            int team = -1;
+                            team = (int)gps->GetTeamNum();
+                            fprintf(mf, "   PS %s team=%d\n", ps->GetName().c_str(), team);
+                        }
+                        __except (EXCEPTION_EXECUTE_HANDLER) {}
+                    }
+                    // Replication channels present on the client: proves whether the
+                    // server opened a channel for our PlayerState/PC/Pawn here.
+                    std::vector<UActorChannel*> chs;
+                    for (UActorChannel* c : SDKUtils::GetAllObjectsOfType<UActorChannel>()) if (c) chs.push_back(c);
+                    fprintf(mf, "  nCh=%zu", chs.size());
+                    for (size_t ci = 0; ci < chs.size() && ci < 48; ci++) {
+                        UActorChannel* c = chs[ci];
+                        void* actor = nullptr;
+                        if (!IsBadReadPtr((char*)c + 0x68, 8)) actor = *reinterpret_cast<void**>((char*)c + 0x68);
+                        std::string anm;
+                        if (actor && !IsBadReadPtr(actor, 0x20)) {
+                            __try { anm = reinterpret_cast<AActor*>(actor)->GetName(); }
+                            __except (EXCEPTION_EXECUTE_HANDLER) {}
+                        }
+                        fprintf(mf, " [%s]", anm.empty() ? "?" : anm.c_str());
+                    }
+                    fprintf(mf, "\n");
+                    fclose(mf);
                 }
             }
         }
