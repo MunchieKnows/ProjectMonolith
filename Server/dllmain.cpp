@@ -2360,8 +2360,41 @@ namespace Hooking {
 
     void* origNetDriverTickFlush = nullptr;
 
+    // Ability-trace hook integrity watchdog (temporary diagnostics): 2026-10-29 trace round
+    // proved the factory body executed (helperB return addr 0x3F4CE5) while the factory entry
+    // hook never logged -> its MinHook patch was not effective at runtime (failed enable or
+    // reverted by runtime .text rewriting). Re-check both targets every 2 s on the game thread;
+    // log + re-enable anything that is not patched.
+    static void AbCheckHooksAlive() {
+        static ULONGLONG s_last = 0;
+        static int s_reverts[2] = {0, 0};
+        ULONGLONG now = GetTickCount64();
+        if (now - s_last < 2000) return;
+        s_last = now;
+        struct T { const char* name; void* target; } ts[2] = {
+            {"factory", (void*)(Globals::ModuleBase + 0x3F4C60)},
+            {"helperB", (void*)(Globals::ModuleBase + 0x3C0460)},
+        };
+        for (int i = 0; i < 2; i++) {
+            unsigned char* p = (unsigned char*)ts[i].target;
+            if (p[0] != 0xE9) {
+                if (s_reverts[i] < 10) {
+                    FILE* f = fopen("/tmp/server_ability_trace.txt", "a");
+                    if (f) {
+                        fprintf(f, "[HOOK-REVERTED] %s @%p firstBytes=%02X %02X %02X %02X %02X -> re-enabling (count=%d)\n",
+                                ts[i].name, ts[i].target, p[0], p[1], p[2], p[3], p[4], s_reverts[i] + 1);
+                        fclose(f);
+                    }
+                }
+                s_reverts[i]++;
+                MH_EnableHook(ts[i].target);
+            }
+        }
+    }
+
     void NetDriverTickFlushHook(__int64 NetDriver, float DeltaTime) {
         reinterpret_cast<void(*)(__int64, float)>(origNetDriverTickFlush)(NetDriver, DeltaTime);
+        AbCheckHooksAlive();
 
         // Wine compatibility: with real client connections the extra monolith
         // replication pass corrupts engine state under Wine (native channel
@@ -14899,6 +14932,63 @@ else if (bIsJungler) {
         return Globals::overrideTeamBuilderInfoCheck && (a1->TeamIndex == EOrionTeam::TeamRed || a1->TeamIndex == EOrionTeam::TeamBlue);
     }
 
+    // ================= AbilityTask crash tracing (temporary diagnostics) =================
+    // Server crashes on `movzbl (%r14)` at ModuleBase+0x3F4CED when a client uses an ability.
+    // The function at 0x3F4C60 is a UAbilityTask factory: arg1 = task, [arg1+0x20] = task->Outer,
+    // [arg1+0x28] = task->ThisAbility, arg3 (r8/r14) = ptr to a uint8 written into result+0xA0.
+    // 2026-10-29 trace round: the crashing call arrived with arg3 == NULL (R14=0 at fault,
+    // FaultAddr=0); R8/R9 in the crash context are leftovers from helper_B's subtree, not args.
+    // The factory body provably ran yet the factory entry hook never logged -> its MinHook patch
+    // was NOT effective at runtime. AbCheckHooksAlive() (in NetDriverTickFlushHook) re-checks both
+    // patches every 2 s and re-enables anything reverted. These hooks log every interesting
+    // invocation (args + true return address + Outer/ThisAbility) to /tmp/server_ability_trace.txt.
+    static void AbTrace(const char* tag, void* retaddr, __int64 a1, __int64 a2, __int64 a3, __int64 a4, void* outer, void* thisAbility) {
+        FILE* f = fopen("/tmp/server_ability_trace.txt", "a");
+        if (!f) return;
+        fprintf(f, "%s ret=%p a1=%p a2=%llx a3=%llx a4=%llx outer=%p thisAbility=%p\n",
+                tag, retaddr, (void*)a1, a2, a3, a4, outer, thisAbility);
+        fclose(f);
+    }
+
+    void* origAbFactory = nullptr;
+    static __declspec(noinline) __int64 AbFactoryHook(__int64 a1, __int64 a2, __int64 a3, __int64 a4) {
+        void* retaddr = __builtin_return_address(0);
+        static int s_total = 0, s_logged = 0;
+        ++s_total;
+        void* outer = a1 ? *(void**)(a1 + 0x20) : nullptr;
+        void* thisAbility = a1 ? *(void**)(a1 + 0x28) : nullptr;
+        bool interesting = (s_logged < 40) || !outer || ((unsigned __int64)a3 < 0x10000);
+        if (interesting && s_logged < 500) {
+            ++s_logged;
+            AbTrace("FACTORY", retaddr, a1, a2, a3, a4, outer, thisAbility);
+        }
+        return reinterpret_cast<__int64(__fastcall*)(__int64, __int64, __int64, __int64)>(origAbFactory)(a1, a2, a3, a4);
+    }
+
+    void* origAbHelperB = nullptr;
+    static __declspec(noinline) __int64 AbHelperBHook(__int64 a1, __int64 a2) {
+        void* retaddr = __builtin_return_address(0);
+        static int s_total = 0, s_logged = 0;
+        ++s_total;
+        if (s_logged < 50 || !a1) {
+            if (s_logged < 500) {
+                ++s_logged;
+                AbTrace("HELPERB", retaddr, a1, a2, 0, 0,
+                        a1 ? *(void**)(a1 + 0x20) : nullptr,
+                        a1 ? *(void**)(a1 + 0x28) : nullptr);
+            }
+        }
+        __int64 r = reinterpret_cast<__int64(__fastcall*)(__int64, __int64)>(origAbHelperB)(a1, a2);
+        if (s_logged < 500) {
+            FILE* f = fopen("/tmp/server_ability_trace.txt", "a");
+            if (f) {
+                fprintf(f, "HELPERB-RET ret=%p a1=%p result=%p\n", retaddr, (void*)a1, (void*)r);
+                fclose(f);
+            }
+        }
+        return r;
+    }
+
     // Wine's OutputDebugStringA/W implementation RAISES a pseudo-exception
     // (0x40010006 ANSI / 0x4001000A wide) carrying the message string so a debugger
     // can see it. Under our setup that exception escapes through the engine tick and
@@ -15084,6 +15174,22 @@ else if (bIsJungler) {
         MH_CreateHook(teamBuilderInfo, reinterpret_cast<void*>(TeamBuilderInfoCheck), &origTeamBuilderInfo);
 
         MH_EnableHook(teamBuilderInfo);
+
+        // AbilityTask crash tracing (temporary diagnostics)
+        {
+            void* abFactory = (void*)(Globals::ModuleBase + 0x3F4C60);
+            MH_STATUS sfc = MH_CreateHook(abFactory, reinterpret_cast<void*>(AbFactoryHook), &origAbFactory);
+            MH_STATUS sfe = (sfc == MH_OK) ? MH_EnableHook(abFactory) : sfc;
+            void* abHelperB = (void*)(Globals::ModuleBase + 0x3C0460);
+            MH_STATUS shc = MH_CreateHook(abHelperB, reinterpret_cast<void*>(AbHelperBHook), &origAbHelperB);
+            MH_STATUS she = (shc == MH_OK) ? MH_EnableHook(abHelperB) : shc;
+            unsigned char fbF = ((unsigned char*)abFactory)[0];
+            unsigned char fbH = ((unsigned char*)abHelperB)[0];
+            std::cout << "[INIT] AbilityTask-trace hooks: factory=" << abFactory
+                      << " (create=" << sfc << ", enable=" << sfe << ", firstByte=0x" << std::hex << fbF << ")"
+                      << " helperB=" << abHelperB
+                      << " (create=" << shc << ", enable=" << she << ", firstByte=0x" << fbH << std::dec << ")" << std::endl;
+        }
     }
 }
 
