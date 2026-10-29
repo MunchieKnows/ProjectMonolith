@@ -190,8 +190,12 @@ echo "Launching server (Ctrl+C to stop)..."
 #   DLL over its builtin stub, and that shim LoadLibraryA's Server.dll (this
 #   exe) or Client.dll (the plain client exe) once the engine is ready.
 #   mscoree,mshtml= disables the mono/gecko install prompts.
-# PM_NO_EXTRA_REPL=1: the Server DLL's extra (shadow-bot) replication pass
-# corrupts engine state for real client connections under Wine; native engine
-# replication carries the session instead. Windows builds are unaffected.
-WINEPREFIX="$WINE_PREFIX" WINEDLLOVERRIDES="mscoree,mshtml=" WINEDEBUG=-all PM_NO_EXTRA_REPL=1 \
+# PM_EXTRA_REPL=1: the Server DLL's extra replication pass is REQUIRED under
+# Wine. Native engine replication opens PlayerController channels but NEVER
+# PlayerState channels here, so without this pass a real client connects but
+# can never receive its PlayerState (stuck on "Connecting", no pawn spawn).
+# The pass reuses live native channels (no duplicate channel creation), which
+# fixed the earlier ActorChannelFailure/invalid-swap corruption. Set
+# PM_NO_EXTRA_REPL=1 in the environment to force it OFF for diagnostics.
+WINEPREFIX="$WINE_PREFIX" WINEDLLOVERRIDES="mscoree,mshtml=" WINEDEBUG=-all PM_EXTRA_REPL=1 \
     exec "$WINE_BIN" "$SERVEREXE" "${ARGS[@]}"

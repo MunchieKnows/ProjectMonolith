@@ -2396,22 +2396,24 @@ namespace Hooking {
         reinterpret_cast<void(*)(__int64, float)>(origNetDriverTickFlush)(NetDriver, DeltaTime);
         AbCheckHooksAlive();
 
-        // Wine compatibility: with real client connections the extra monolith
-        // replication pass corrupts engine state under Wine (native channel
-        // creation yields garbage pointers; even contained faults leave the
-        // engine half-modified and it dies later). The Linux launchers set
-        // PM_NO_EXTRA_REPL=1 to disable the pass; NATIVE engine replication
-        // (run above) carries the real session. Default stays enabled so
-        // Windows behavior is unchanged.
+        // Wine compatibility history: an early version of this pass created
+        // duplicate channels on top of live native ones, corrupting bunching
+        // (ActorChannelFailure / invalid-swap). The pass now REUSES live native
+        // OpenChannels entries, and it is REQUIRED under Wine because native
+        // engine replication opens PlayerController channels but never
+        // PlayerState channels - without the pass a real client connects but
+        // can never receive its PlayerState. The Linux launchers export
+        // PM_EXTRA_REPL=1. Default stays enabled so Windows behavior is
+        // unchanged; PM_NO_EXTRA_REPL=1 forces it OFF for diagnostics.
         static int s_extraRepl = -1;
         if (s_extraRepl < 0) {
-            // PM_EXTRA_REPL=1 forces the pass ON even when PM_NO_EXTRA_REPL is set
-            // (used to test whether the Wine breakage that motivated PM_NO_EXTRA_REPL
-            // was actually the OutputDebugString exception storm, now no-op'ed).
+            // PM_NO_EXTRA_REPL=1 is a hard OFF for diagnostics (wins over everything).
+            // Otherwise an explicit PM_EXTRA_REPL=<n> decides, and the default is ON.
             const char* force = getenv("PM_EXTRA_REPL");
             const char* e = getenv("PM_NO_EXTRA_REPL");
-            if (force && *force && atoi(force) != 0) s_extraRepl = 1;
-            else s_extraRepl = (e && *e && atoi(e) != 0) ? 0 : 1;
+            if (e && *e && atoi(e) != 0) s_extraRepl = 0;
+            else if (force && *force) s_extraRepl = atoi(force) ? 1 : 0;
+            else s_extraRepl = 1;
         }
         if (!s_extraRepl) return;
 
